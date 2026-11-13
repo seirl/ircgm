@@ -1,0 +1,9 @@
+pub mod alpha_wolf;
+pub mod aura_seer;
+pub mod curator;
+pub mod dream_wolf;
+pub mod paranormal_investigator;
+pub mod revealer;
+pub mod sentinel;
+pub mod village_idiot;
+pub mod witch;

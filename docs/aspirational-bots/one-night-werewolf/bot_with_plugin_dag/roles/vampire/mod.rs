@@ -1,0 +1,9 @@
+pub mod assassin;
+pub mod copycat;
+pub mod count;
+pub mod cupid;
+pub mod diseased;
+pub mod marksman;
+pub mod pickpocket;
+pub mod priest;
+pub mod vampire;
