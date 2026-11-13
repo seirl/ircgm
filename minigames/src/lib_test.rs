@@ -20,12 +20,10 @@ async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_shor
         let lobby = lobby.clone();
         async move { recruit_players(&lobby, "TestGame", 2, Duration::from_secs(15)).await }
     });
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
 
     srv.chat("Alice", "#lobby", "!join");
-    srv.send_line(":Alice!~Alice@test.host NICK :Alicia\r\n");
+    srv.rename_user("Alice", "Alicia");
     srv.chat("Alicia", "#lobby", "!join");
     srv.chat("Bob", "#lobby", "!join");
 
@@ -38,9 +36,7 @@ async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_shor
     let short_task = tokio::spawn(async move {
         recruit_players(&lobby, "TestGame", 3, Duration::from_secs(10)).await
     });
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
     tokio::time::advance(Duration::from_secs(10)).await;
     assert!(short_task.await.unwrap().unwrap().is_none());
 }
@@ -72,42 +68,27 @@ async fn external_supervisor_cancels_running_minigame_and_tears_down_breakout_on
             let admin_stop = bot
                 .inbox_all()
                 .into_wait_for(|m| m.account.as_deref() == Some("staff") && m.is_cmd("!stop"))
-                .ok_or_pending()
-                .map_output(|_| ExternalStop::AdminStop);
+                .map_ok(|_| ExternalStop::AdminStop);
 
             let starter_abort = alice
                 .inbox()
                 .into_wait_cmd("!abort")
-                .ok_or_pending()
-                .map_output(|_| ExternalStop::StarterAbort);
+                .map_ok(|_| ExternalStop::StarterAbort);
 
             run_heist(&bot, &lobby, &alice, &bob, Wire::Red)
                 .until(bot.shutdown_requested().map_output(|()| ExternalStop::Shutdown))
-                .or_until(admin_stop)
-                .or_until(starter_abort)
+                .or_until_ok(admin_stop)
+                .or_until_ok(starter_abort)
                 .await
         }
     });
 
-    // Wait for `run_heist` to open `#vault-xxxxxx` and invite Alice & Bob inside:
-    let vault = loop {
-        if let Some(Command::JOIN(chan, _, _)) = srv.recv_sent().await {
-            if chan.starts_with("#vault-") {
-                srv.complete_join(&chan, &[]);
-                break chan;
-            }
-        }
-    };
+    // Wait for `run_heist` to open `#lobby-vault-xxxxxx` and invite Alice & Bob inside:
+    let vault = srv.accept_breakout("#lobby-vault", &[]).await;
+    assert!(vault.starts_with("#lobby-vault-"));
+    srv.join_user("Alice", &vault);
+    srv.join_user("Bob", &vault);
     srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    srv.send_line(&format!(":Alice!~Alice@test.host JOIN {vault}\r\n"));
-    srv.send_line(&format!(":Bob!~Bob@test.host JOIN {vault}\r\n"));
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Mid-heist, an authenticated staff member DMs `!stop` to the bot:
     srv.send_line("@account=staff :Mod!~Mod@test.host PRIVMSG GM :!stop\r\n");

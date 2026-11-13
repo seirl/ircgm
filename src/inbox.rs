@@ -66,8 +66,8 @@ pub(crate) enum Filter {
     All,
     AllDms,
     UserDm(Arc<UserTrack>),
-    UserInRoom {
-        track: Arc<UserTrack>,
+    UsersInRoom {
+        tracks: Vec<Arc<UserTrack>>,
         channel_name: String,
     },
     Scoped {
@@ -82,10 +82,16 @@ impl Filter {
             Filter::All => "bot".into(),
             Filter::AllDms => "dm".into(),
             Filter::UserDm(track) => format!("user {}", track.nick()),
-            Filter::UserInRoom {
-                track,
+            Filter::UsersInRoom {
+                tracks,
                 channel_name,
-            } => format!("user {} in {}", track.nick(), channel_name),
+            } => match tracks.as_slice() {
+                [track] => format!("user {} in {}", track.nick(), channel_name),
+                ts => {
+                    let names: Vec<String> = ts.iter().map(|t| t.nick()).collect();
+                    format!("users [{}] in {}", names.join(", "), channel_name)
+                }
+            },
             Filter::Scoped { rooms, dm_users } => match (rooms.as_slice(), dm_users.as_slice()) {
                 ([r], []) => format!("room {r}"),
                 ([], [u]) => format!("user {}", u.nick()),
@@ -122,44 +128,42 @@ impl Filter {
                 WireKind::Quit { user, .. } | WireKind::NickChanged { user, .. } => {
                     user.track_id() == track.id
                 }
-                WireKind::SendError {
-                    target,
-                    target_user_id,
-                    ..
-                } => {
-                    !is_channel_target
-                        && (*target_user_id == Some(track.id) || cm.str_eq(target, &track.nick()))
+                WireKind::SendError { target_user_id, .. } => {
+                    !is_channel_target && *target_user_id == Some(track.id)
                 }
                 _ => false,
             },
-            Filter::UserInRoom {
-                track,
+            Filter::UsersInRoom {
+                tracks,
                 channel_name,
-            } => match &ev.kind {
-                WireKind::Chat(m) => {
-                    m.sender.track_id() == track.id
-                        && matches!(&m.target, Target::Channel(ch) if cm.str_eq(ch, channel_name))
+            } => {
+                let has_user = |uid: u64| tracks.iter().any(|t| t.id == uid);
+                match &ev.kind {
+                    WireKind::Chat(m) => {
+                        has_user(m.sender.track_id())
+                            && matches!(&m.target, Target::Channel(ch) if cm.str_eq(ch, channel_name))
+                    }
+                    WireKind::Notice {
+                        sender: Some(u),
+                        target: Target::Channel(ch),
+                        ..
+                    } => has_user(u.track_id()) && cm.str_eq(ch, channel_name),
+                    WireKind::Joined { channel, user, .. }
+                    | WireKind::Parted { channel, user, .. }
+                    | WireKind::Kicked { channel, user, .. } => {
+                        has_user(user.track_id()) && cm.str_eq(channel, channel_name)
+                    }
+                    WireKind::Quit { user, .. } | WireKind::NickChanged { user, .. } => {
+                        has_user(user.track_id())
+                    }
+                    WireKind::SendError { target, .. } => {
+                        is_channel_target && cm.str_eq(target, channel_name)
+                    }
+                    WireKind::BotLeftRoom { channel, .. } => cm.str_eq(channel, channel_name),
+                    WireKind::RawOnly => is_channel_target,
+                    _ => false,
                 }
-                WireKind::Notice {
-                    sender: Some(u),
-                    target: Target::Channel(ch),
-                    ..
-                } => u.track_id() == track.id && cm.str_eq(ch, channel_name),
-                WireKind::Joined { channel, user, .. }
-                | WireKind::Parted { channel, user, .. }
-                | WireKind::Kicked { channel, user, .. } => {
-                    user.track_id() == track.id && cm.str_eq(channel, channel_name)
-                }
-                WireKind::Quit { user, .. } | WireKind::NickChanged { user, .. } => {
-                    user.track_id() == track.id
-                }
-                WireKind::SendError { target, .. } => {
-                    is_channel_target && cm.str_eq(target, channel_name)
-                }
-                WireKind::BotLeftRoom { channel, .. } => cm.str_eq(channel, channel_name),
-                WireKind::RawOnly => is_channel_target,
-                _ => false,
-            },
+            }
             Filter::Scoped { rooms, dm_users } => {
                 let has_room = |ch: &str| rooms.iter().any(|r| cm.str_eq(r, ch));
                 let has_user = |uid: u64| dm_users.iter().any(|t| t.id == uid);
@@ -188,7 +192,6 @@ impl Filter {
                             has_room(target)
                         } else {
                             target_user_id.is_some_and(has_user)
-                                || dm_users.iter().any(|t| cm.str_eq(target, &t.nick()))
                         }
                     }
                     WireKind::BotLeftRoom { channel, .. } => has_room(channel),
@@ -258,8 +261,8 @@ impl InboxRegistry {
                     Filter::UserDm(track) => {
                         inner.by_user.entry(track.id).or_default().push(slot_id);
                     }
-                    Filter::UserInRoom {
-                        track,
+                    Filter::UsersInRoom {
+                        tracks,
                         channel_name,
                     } => {
                         inner
@@ -267,7 +270,12 @@ impl InboxRegistry {
                             .entry(casemap.fold(channel_name))
                             .or_default()
                             .push(slot_id);
-                        inner.by_user.entry(track.id).or_default().push(slot_id);
+                        for track in tracks {
+                            let list = inner.by_user.entry(track.id).or_default();
+                            if !list.contains(&slot_id) {
+                                list.push(slot_id);
+                            }
+                        }
                     }
                     Filter::Scoped { rooms, dm_users } => {
                         for r in rooms {
@@ -311,6 +319,7 @@ impl InboxRegistry {
             ignore_commands: false,
             accept_notices: false,
             latched_departure: None,
+            last_user_departure: None,
         }
     }
 
@@ -330,11 +339,13 @@ impl InboxRegistry {
                     }
                 }
             }
-            Filter::UserInRoom { track, .. } => {
-                if let Some(vec) = inner.by_user.get_mut(&track.id) {
-                    vec.retain(|&id| id != slot_id);
-                    if vec.is_empty() {
-                        inner.by_user.remove(&track.id);
+            Filter::UsersInRoom { tracks, .. } => {
+                for track in tracks {
+                    if let Some(vec) = inner.by_user.get_mut(&track.id) {
+                        vec.retain(|&id| id != slot_id);
+                        if vec.is_empty() {
+                            inner.by_user.remove(&track.id);
+                        }
                     }
                 }
                 inner.by_channel.retain(|_, vec| {
@@ -375,7 +386,7 @@ impl InboxRegistry {
         let mut rebuilt: HashMap<FoldedStr, Vec<u64>> = HashMap::new();
         for (&slot_id, slot) in &inner.slots {
             match &slot.filter {
-                Filter::UserInRoom { channel_name, .. } => {
+                Filter::UsersInRoom { channel_name, .. } => {
                     rebuilt
                         .entry(new_map.fold(channel_name))
                         .or_default()
@@ -562,6 +573,7 @@ pub struct Inbox {
     ignore_commands: bool,
     accept_notices: bool,
     latched_departure: Option<Error>,
+    last_user_departure: Option<(String, Option<String>)>,
 }
 
 impl Drop for Inbox {
@@ -594,6 +606,7 @@ impl Inbox {
             ignore_commands: false,
             accept_notices: false,
             latched_departure: None,
+            last_user_departure: None,
         }
     }
 
@@ -754,6 +767,7 @@ impl Inbox {
         self.next_event().await
     }
 
+    /// Waits for and transforms the next matching high-level [`Event`] in this inbox.
     pub async fn wait_event_map<F, T>(&mut self, mut f: F) -> Result<T>
     where
         F: FnMut(&Event) -> Option<T>,
@@ -772,6 +786,43 @@ impl Inbox {
             }
         })
         .await
+    }
+
+    /// Waits for the next high-level [`Event`] in this inbox matching `pred`.
+    pub async fn wait_event_for<P>(&mut self, mut pred: P) -> Result<Event>
+    where
+        P: FnMut(&Event) -> bool,
+    {
+        poll_fn(|cx| loop {
+            match self.poll_next_wire(cx) {
+                Poll::Ready(Ok(wire)) => {
+                    if let Some(ev) = wire.to_public_event() {
+                        if pred(&ev) {
+                            return Poll::Ready(Ok(ev));
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::wait_event_map`].
+    pub async fn into_wait_event_map<F, T>(mut self, f: F) -> Result<T>
+    where
+        F: FnMut(&Event) -> Option<T>,
+    {
+        self.wait_event_map(f).await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::wait_event_for`].
+    pub async fn into_wait_event_for<P>(mut self, pred: P) -> Result<Event>
+    where
+        P: FnMut(&Event) -> bool,
+    {
+        self.wait_event_for(pred).await
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
@@ -898,44 +949,69 @@ impl Inbox {
                     }
                 }
             }
-            Filter::UserInRoom {
-                track,
+            Filter::UsersInRoom {
+                tracks,
                 channel_name,
-            } => match &wire.kind {
-                WireKind::BotLeftRoom { channel, reason } if cm.str_eq(channel, channel_name) => {
-                    self.latched_departure = Some(Error::BotLeftRoom {
-                        channel: channel.clone(),
-                        reason: reason.clone(),
-                    });
+            } => {
+                let has_user = |uid: u64| tracks.iter().any(|t| t.id == uid);
+                let record_departure = |nick: &str, reason: &Option<String>| {
+                    let info = (nick.to_owned(), reason.clone());
+                    if tracks.len() == 1 {
+                        (
+                            Some(Error::UserLeft {
+                                nick: info.0,
+                                reason: info.1,
+                            }),
+                            None,
+                        )
+                    } else {
+                        (None, Some(info))
+                    }
+                };
+                match &wire.kind {
+                    WireKind::BotLeftRoom { channel, reason }
+                        if cm.str_eq(channel, channel_name) =>
+                    {
+                        self.latched_departure = Some(Error::BotLeftRoom {
+                            channel: channel.clone(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    WireKind::Parted {
+                        channel,
+                        user,
+                        nick,
+                        reason,
+                    }
+                    | WireKind::Kicked {
+                        channel,
+                        user,
+                        nick,
+                        reason,
+                        ..
+                    } if has_user(user.track_id()) && cm.str_eq(channel, channel_name) => {
+                        let (latched, last) = record_departure(nick, reason);
+                        if let Some(err) = latched {
+                            self.latched_departure = Some(err);
+                        }
+                        if let Some(info) = last {
+                            self.last_user_departure = Some(info);
+                        }
+                    }
+                    WireKind::Quit {
+                        user, nick, reason, ..
+                    } if has_user(user.track_id()) => {
+                        let (latched, last) = record_departure(nick, reason);
+                        if let Some(err) = latched {
+                            self.latched_departure = Some(err);
+                        }
+                        if let Some(info) = last {
+                            self.last_user_departure = Some(info);
+                        }
+                    }
+                    _ => {}
                 }
-                WireKind::Parted {
-                    channel,
-                    user,
-                    nick,
-                    reason,
-                }
-                | WireKind::Kicked {
-                    channel,
-                    user,
-                    nick,
-                    reason,
-                    ..
-                } if user.track_id() == track.id && cm.str_eq(channel, channel_name) => {
-                    self.latched_departure = Some(Error::UserLeft {
-                        nick: nick.clone(),
-                        reason: reason.clone(),
-                    });
-                }
-                WireKind::Quit {
-                    user, nick, reason, ..
-                } if user.track_id() == track.id => {
-                    self.latched_departure = Some(Error::UserLeft {
-                        nick: nick.clone(),
-                        reason: reason.clone(),
-                    });
-                }
-                _ => {}
-            },
+            }
             Filter::All | Filter::AllDms | Filter::Scoped { .. } => {}
         }
     }
@@ -952,10 +1028,16 @@ impl Inbox {
                 UserStatus::Online => None,
                 UserStatus::Quit { nick, reason, .. } => Some(Error::UserLeft { nick, reason }),
             },
-            Filter::UserInRoom {
-                track,
+            Filter::UsersInRoom {
+                tracks,
                 channel_name,
             } => {
+                if tracks.is_empty() {
+                    return Some(Error::UserLeft {
+                        nick: String::new(),
+                        reason: None,
+                    });
+                }
                 let ws = core.state.read().unwrap();
                 let chan_key = ws.casemap.fold(channel_name);
                 if let Some(lost) = ws.lost_channels.get(&chan_key) {
@@ -964,20 +1046,33 @@ impl Inbox {
                         reason: lost.reason.clone(),
                     });
                 }
-                if let UserStatus::Quit { nick, reason, .. } = track.status() {
-                    return Some(Error::UserLeft { nick, reason });
-                }
-                if let Some(chan) = ws.channels.get(&chan_key) {
-                    if chan.names_synced
-                        && !chan.members.values().any(|occ| occ.track.id == track.id)
-                    {
-                        return Some(Error::UserLeft {
-                            nick: track.nick(),
-                            reason: None,
-                        });
+                let chan = ws.channels.get(&chan_key);
+                let mut live_tracks = 0usize;
+                let mut fallback_left: Option<(String, Option<String>)> = None;
+                for track in tracks {
+                    if let UserStatus::Quit { nick, reason, .. } = track.status() {
+                        fallback_left = Some((nick, reason));
+                        continue;
                     }
+                    if let Some(c) = chan {
+                        if c.names_synced && !c.members.contains_key(&track.id) {
+                            if fallback_left.is_none() {
+                                fallback_left = Some((track.nick(), None));
+                            }
+                            continue;
+                        }
+                    }
+                    live_tracks += 1;
                 }
-                None
+                if live_tracks > 0 {
+                    return None;
+                }
+                let (nick, reason) = self
+                    .last_user_departure
+                    .clone()
+                    .or(fallback_left)
+                    .unwrap_or_else(|| (String::new(), None));
+                Some(Error::UserLeft { nick, reason })
             }
             Filter::Scoped { rooms, dm_users } => {
                 if rooms.is_empty() && dm_users.is_empty() {

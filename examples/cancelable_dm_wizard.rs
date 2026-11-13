@@ -24,7 +24,7 @@ pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>
     .with_timeout(Duration::from_secs(60));
 
     match flow
-        .until(player.inbox().into_wait_cmd("!cancel").ok_or_pending())
+        .until_ok(player.inbox().into_wait_cmd("!cancel"))
         .await
     {
         Outcome::Completed(res) => res.map(Some),

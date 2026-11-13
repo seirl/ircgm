@@ -69,14 +69,62 @@ fn netsplit_detection_and_account_transitions() {
     let u = reg.get_or_create("Alice");
     assert_eq!(u.account(), None);
 
-    reg.update_account("alice", "alice_acct", false);
+    reg.update_account("alice", "alice_acct");
     assert_eq!(u.account().as_deref(), Some("alice_acct"));
 
-    reg.update_account("ALICE", "*", false);
+    reg.update_account("ALICE", "*");
     assert_eq!(u.account(), None);
 
-    reg.update_account("ALICE", "0", false);
+    reg.update_account("ALICE", "0");
     assert_eq!(u.account(), None);
+}
+
+#[test]
+fn former_tracks_correlate_inflight_bounces_until_evicted_by_new_claimant() {
+    let reg = UserRegistry::new(CaseMap::Rfc1459);
+    let alice = reg.get_or_create("[Alice]");
+
+    // Chained rename `[Alice]` -> `Alicia` -> `Ally` preserves both former nicks:
+    reg.rename("[Alice]", "Alicia");
+    reg.rename("Alicia", "Ally");
+
+    // 401 on former nick resolves `alice.id` WITHOUT marking `Ally` offline:
+    assert_eq!(
+        reg.resolve_send_error("{alice}", 401, 10, "No such nick"),
+        (Some(alice.id), None)
+    );
+    assert_eq!(
+        reg.resolve_send_error("alicia", 716, 11, "callerid"),
+        (Some(alice.id), None)
+    );
+    assert!(alice.is_online());
+    assert_eq!(alice.nick(), "Ally");
+
+    // Dynamic `CASEMAPPING=ascii` re-folds `[Alice]`'s former entry from `{alice}` to `[alice]`:
+    reg.rekey_casemap(CaseMap::Ascii);
+    assert_eq!(
+        reg.resolve_send_error("[alice]", 401, 12, "No such nick"),
+        (Some(alice.id), None)
+    );
+    assert_eq!(
+        reg.resolve_send_error("{alice}", 401, 13, "No such nick"),
+        (None, None)
+    );
+
+    // Another user claiming `[alice]` evicts the former entry immediately:
+    let mallory = reg.get_or_create("[alice]");
+    assert_ne!(mallory.id, alice.id);
+    assert_eq!(
+        reg.resolve_send_error("[alice]", 716, 14, "callerid"),
+        (Some(mallory.id), None)
+    );
+    // 401 on active `mallory` marks `mallory` offline and returns `quit_track_id`:
+    assert_eq!(
+        reg.resolve_send_error("[alice]", 401, 15, "No such nick"),
+        (Some(mallory.id), Some(mallory.id))
+    );
+    assert!(!mallory.is_online());
+    assert!(alice.is_online());
 }
 
 #[test]

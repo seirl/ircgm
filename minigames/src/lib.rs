@@ -35,6 +35,12 @@ pub const GAMES: &[(&str, &str)] = &[
     ("simon_says", "3p PRIVMSG + /me + NOTICE + /nick + Bunker Rush"),
 ];
 
+/// Builds a lobby-namespaced breakout room prefix (`"{lobby}-{kind}"`, e.g.
+/// `#ircgm-minigames` -> `#ircgm-minigames-vault`, `##ircgm-minigames` -> `##ircgm-minigames-vault`).
+pub(crate) fn breakout_slug(lobby: &Room, kind: &str) -> String {
+    format!("{}-{kind}", lobby.name())
+}
+
 /// Shared lobby recruitment helper: collects `exact_count` distinct players via `!join`
 /// within `join_window` (deduplicating via [`UserId`] even across `/nick` changes).
 ///

@@ -281,3 +281,124 @@ async fn breakout_invite_and_wait_vs_invite_available_and_room_invite() {
     let (close_res, ()) = tokio::join!(close_fut, ack_part);
     close_res.unwrap();
 }
+
+#[tokio::test]
+async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#lobby", &["Alice", "Cara", "Dan", "Eve"]);
+    server.settle().await;
+
+    let dan = bot.user("Dan").unwrap();
+    let eve = bot.user("Eve").unwrap();
+
+    let vault_task = tokio::spawn({
+        let bot = bot.clone();
+        async move {
+            bot.breakout_with(BreakoutOptions::exact("#vault").modes(None::<&str>))
+                .await
+        }
+    });
+    assert_eq!(
+        server.recv_sent().await.unwrap(),
+        Command::JOIN("#vault".into(), None, None)
+    );
+    server.complete_join("#vault", &[]);
+    let vault = vault_task.await.unwrap().unwrap();
+
+    // 1. String targets (`"Alice"` in `#lobby` + `"UntrackedBob"` not in `#lobby`) rename between INVITE and JOIN:
+    let wait_renamed = vault.invite_and_wait(["Alice", "UntrackedBob"], Duration::from_secs(1));
+    let drive_renamed = async {
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Alice".into(), "#vault".into())
+        );
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("UntrackedBob".into(), "#vault".into())
+        );
+        server.rename_user("Alice", "Alicia");
+        server.rename_user("UntrackedBob", "Bobby");
+        server.join_user("Alicia", "#vault");
+        server.join_user("Bobby", "#vault");
+        server.settle().await;
+    };
+    let (res_renamed, ()) = tokio::join!(wait_renamed, drive_renamed);
+    res_renamed.unwrap();
+    assert!(vault.has_nick("Alicia"));
+    assert!(vault.has_nick("Bobby"));
+
+    // 2. String target renames then QUITs before joining -> immediate `Error::UserLeft` with new nick:
+    let wait_quit = vault.invite_and_wait(["Cara"], Duration::from_secs(5));
+    let drive_quit = async {
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Cara".into(), "#vault".into())
+        );
+        server.rename_user("Cara", "Cara_afk");
+        server.quit_user("Cara_afk", Some("dinner"));
+        server.settle().await;
+    };
+    let (res_quit, ()) = tokio::join!(wait_quit, drive_quit);
+    assert!(
+        matches!(res_quit, Err(Error::UserLeft { ref nick, ref reason }) if nick == "Cara_afk" && reason.as_deref() == Some("dinner")),
+        "expected UserLeft(Cara_afk), got {res_quit:?}"
+    );
+
+    // 3. Unknown string target receives 401 -> immediate `Error::UserLeft` (never hangs to HandshakeTimeout):
+    let wait_401 = vault.invite_and_wait(["GhostUser"], Duration::from_secs(5));
+    let drive_401 = async {
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("GhostUser".into(), "#vault".into())
+        );
+        server.send_line(":irc.srv 401 GM GhostUser :No such nick/channel\r\n");
+        server.settle().await;
+    };
+    let (res_401, ()) = tokio::join!(wait_401, drive_401);
+    assert!(
+        matches!(res_401, Err(Error::UserLeft { ref nick, .. }) if nick == "GhostUser"),
+        "expected UserLeft(GhostUser), got {res_401:?}"
+    );
+
+    // 4. Cross-in-flight rename on `invite_and_wait`: `Dan` renames to `Danny` before server sees
+    //    `INVITE Dan #vault`, causing `401 Dan` -> bot automatically re-invites `Danny`!
+    let wait_cross = vault.invite_and_wait([&dan], Duration::from_secs(5));
+    let drive_cross = async {
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Dan".into(), "#vault".into())
+        );
+        server.rename_user("Dan", "Danny");
+        server.send_line(":irc.srv 401 GM Dan :No such nick/channel\r\n");
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Danny".into(), "#vault".into())
+        );
+        server.join_user("Danny", "#vault");
+        server.settle().await;
+    };
+    let (res_cross, ()) = tokio::join!(wait_cross, drive_cross);
+    res_cross.unwrap();
+    assert!(dan.is_online());
+    assert!(vault.has_user(&dan));
+
+    // 5. Cross-in-flight rename on `invite_available`: `Eve` renames to `Evelyn`, `401 Eve` triggers
+    //    re-invite of `Evelyn`, and `Evelyn` joins cleanly:
+    let avail_cross = vault.invite_available([&eve], Duration::from_secs(5));
+    let drive_avail = async {
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Eve".into(), "#vault".into())
+        );
+        server.rename_user("Eve", "Evelyn");
+        server.send_line(":irc.srv 401 GM Eve :No such nick/channel\r\n");
+        assert_eq!(
+            server.recv_sent().await.unwrap(),
+            Command::INVITE("Evelyn".into(), "#vault".into())
+        );
+        server.join_user("Evelyn", "#vault");
+        server.settle().await;
+    };
+    let (joined_avail, ()) = tokio::join!(avail_cross, drive_avail);
+    assert_eq!(joined_avail.unwrap(), vec![eve.clone()]);
+}

@@ -4,26 +4,50 @@ use super::*;
 use crate::testing::test_harness;
 
 #[test]
-fn breakout_naming_generates_six_char_lowercase_alnum_or_exact() {
-    let random = BreakoutNaming::RandomSuffix {
-        prefix: "heist".into(),
+fn breakout_naming_requires_explicit_channel_sigil_and_supports_single_or_double_hash() {
+    let single = BreakoutNaming::RandomSuffix {
+        prefix: "#heist".into(),
     }
-    .generate_channel_name();
-    assert!(random.starts_with("#heist-"));
-    let suffix = random.strip_prefix("#heist-").unwrap();
+    .generate_channel_name()
+    .unwrap();
+    assert!(single.starts_with("#heist-"));
+    let suffix = single.strip_prefix("#heist-").unwrap();
     assert_eq!(suffix.len(), 6);
     assert!(suffix
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
 
-    let already_prefixed = BreakoutNaming::RandomSuffix {
+    let double = BreakoutNaming::RandomSuffix {
+        prefix: "##ircgm-minigames-vault".into(),
+    }
+    .generate_channel_name()
+    .unwrap();
+    assert!(double.starts_with("##ircgm-minigames-vault-"));
+    assert_eq!(double.len(), "##ircgm-minigames-vault-".len() + 6);
+
+    let local = BreakoutNaming::RandomSuffix {
         prefix: "&local".into(),
     }
-    .generate_channel_name();
-    assert!(already_prefixed.starts_with("&local-"));
-    assert_eq!(already_prefixed.len(), "&local-".len() + 6);
+    .generate_channel_name()
+    .unwrap();
+    assert!(local.starts_with("&local-"));
 
-    let exact = BreakoutNaming::Exact("#mafia-wolves".into()).generate_channel_name();
+    // Missing `#`/`&` is rejected:
+    assert!(matches!(
+        BreakoutNaming::RandomSuffix {
+            prefix: "vault".into()
+        }
+        .generate_channel_name(),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        BreakoutNaming::Exact("vault".into()).generate_channel_name(),
+        Err(Error::InvalidInput(_))
+    ));
+
+    let exact = BreakoutNaming::Exact("#mafia-wolves".into())
+        .generate_channel_name()
+        .unwrap();
     assert_eq!(exact, "#mafia-wolves");
 }
 

@@ -817,7 +817,7 @@ impl Bot {
     }
 
     pub async fn breakout_with(&self, opts: BreakoutOptions) -> Result<Breakout> {
-        let chan_name = opts.naming.generate_channel_name();
+        let chan_name = opts.naming.generate_channel_name()?;
         validate_target(&chan_name, "breakout channel")?;
         let span = tracing::info_span!("ircgm::breakout", channel = %chan_name);
 
@@ -850,21 +850,30 @@ impl Bot {
         .await
     }
 
-    /// Replies to the channel if `msg` was in a channel, or directly to `msg.nick` if `msg` was a DM,
+    /// Replies to the channel if `msg` was in a channel, or directly to `msg.sender`'s live
+    /// nickname if `msg` was a DM (failing with [`Error::UserLeft`] if `msg.sender` has quit),
     /// mirroring `msg.kind` (`MessageKind::Notice` sends `NOTICE`; `Privmsg | Action` sends `PRIVMSG`).
     pub fn reply(&self, msg: &ChatMessage, text: impl Into<Text>) -> Result<()> {
         let out_kind = match msg.kind {
             MessageKind::Notice => OutboundChatKind::Notice,
             MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,
         };
-        let dest = match &msg.target {
-            Target::Channel(ch) => ch.clone(),
-            Target::Dm => msg.sender.nick(),
-        };
-        let _ = self
-            .owner
-            .core
-            .send_chat_with_receipt(out_kind, &dest, text.into())?;
+        match &msg.target {
+            Target::Channel(ch) => {
+                let _ = self
+                    .owner
+                    .core
+                    .send_chat_with_receipt(out_kind, ch, text.into())?;
+            }
+            Target::Dm => {
+                if !msg.sender.belongs_to(&self.owner.core) {
+                    return Err(Error::InvalidInput(
+                        "ChatMessage belongs to a different Bot session",
+                    ));
+                }
+                let _ = msg.sender.send_chat_with_receipt(out_kind, text.into())?;
+            }
+        }
         Ok(())
     }
 

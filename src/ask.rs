@@ -215,6 +215,11 @@ pub(crate) enum AskSource<'a> {
         user: &'a User,
         caller: &'static Location<'static>,
     },
+    RoomUsers {
+        room: &'a Room,
+        users: Vec<User>,
+        caller: &'static Location<'static>,
+    },
     UserDm {
         user: &'a User,
         caller: &'static Location<'static>,
@@ -269,7 +274,7 @@ impl<'a> EndpointSender<'a> {
             EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
                 let _ = room.say(text);
             }
-            EndpointSender::Dm { core, user } => {
+            EndpointSender::Dm { core, user, .. } => {
                 Self::send_dm(core, user, text);
             }
             EndpointSender::Huddle { sender, .. } => {
@@ -283,7 +288,7 @@ impl<'a> EndpointSender<'a> {
             EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
                 let _ = room.say(feedback);
             }
-            EndpointSender::Dm { core, user } => {
+            EndpointSender::Dm { core, user, .. } => {
                 Self::send_dm(core, user, feedback);
             }
             EndpointSender::Huddle { .. } => {
@@ -316,20 +321,18 @@ impl<'a> EndpointSender<'a> {
                     code,
                     message: message.to_owned(),
                 }),
-            EndpointSender::Dm { user, .. } => {
-                (target_user_id == Some(user.track_id()) || user.eq_nick(target)).then(|| {
-                    Error::DeliveryFailed {
-                        target: target.to_owned(),
-                        code,
-                        message: message.to_owned(),
-                    }
-                })
-            }
+            EndpointSender::Dm { user, .. } => (target_user_id == Some(user.track_id())).then(|| {
+                Error::DeliveryFailed {
+                    target: target.to_owned(),
+                    code,
+                    message: message.to_owned(),
+                }
+            }),
             EndpointSender::Huddle {
                 sender,
                 bounced_users,
             } => {
-                if let Some(uid) = sender.find_matching_user_id(target, target_user_id) {
+                if let Some(uid) = sender.find_matching_user_id(target_user_id) {
                     let mut bounced = bounced_users.lock().unwrap();
                     bounced.insert(uid);
                     if !sender.any_reachable_online(&bounced) {
@@ -359,8 +362,8 @@ enum AskState<'a, F, O> {
     Done,
 }
 
-/// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`User::ask`],
-/// [`ExclusiveDm::ask`], and [`Huddle::ask`].
+/// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`Room::ask_users`],
+/// [`User::ask`], [`ExclusiveDm::ask`], and [`Huddle::ask`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Ask<'a, F, R: IntoVerdict> {
     state: AskState<'a, F, R::Output>,
@@ -470,12 +473,14 @@ fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
         TimeLimit::Deadline(_) | TimeLimit::None => None,
     };
     match source {
-        AskSource::RoomOpen { room, .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = room.name(),
-            user = Option::<&str>::None,
-            timeout_ms = timeout_ms
-        ),
+        AskSource::RoomOpen { room, .. } | AskSource::RoomUsers { room, .. } => {
+            tracing::debug_span!(
+                "ircgm::ask",
+                target = room.name(),
+                user = Option::<&str>::None,
+                timeout_ms = timeout_ms
+            )
+        }
         AskSource::RoomUser { room, user, .. } => tracing::debug_span!(
             "ircgm::ask",
             target = room.name(),
@@ -662,6 +667,23 @@ where
                 &cfg,
                 &mut *matcher,
                 EndpointSender::RoomUser { room, user },
+                &mut inbox,
+                receipt,
+            )
+            .await
+        }
+        AskSource::RoomUsers {
+            room,
+            users,
+            caller,
+        } => {
+            room.ensure_any_user_askable(&users)?;
+            let mut inbox = room.inbox_users_at(&users, caller);
+            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::RoomOpen { room },
                 &mut inbox,
                 receipt,
             )

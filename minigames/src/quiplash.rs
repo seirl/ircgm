@@ -196,8 +196,7 @@ pub async fn vote_on_quips(
             }
         }
     };
-    let _: Option<std::convert::Infallible> =
-        collect.with_timeout(Duration::from_secs(20)).optional().await?;
+    collect.run_for(Duration::from_secs(20)).await?;
 
     let mut counts = vec![0usize; submissions.len()];
     for &idx in ballots.values() {

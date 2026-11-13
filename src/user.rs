@@ -122,7 +122,12 @@ impl UserTrack {
 #[derive(Default)]
 struct RegistryState {
     tracks: HashMap<FoldedStr, Weak<UserTrack>>,
+    /// Vacated pre-rename nicks (`folded -> (raw_old_nick, Weak<UserTrack>)`) so in-flight
+    /// bounces (`401`, `486`, `716`, etc.) crossing with `NICK` still resolve `target_user_id`.
+    /// Evicted immediately if another user claims that nick.
+    former_tracks: HashMap<FoldedStr, (String, Weak<UserTrack>)>,
     last_live_count: usize,
+    last_former_count: usize,
 }
 
 impl RegistryState {
@@ -133,6 +138,12 @@ impl RegistryState {
         if self.tracks.len() > threshold {
             self.tracks.retain(|_, weak| weak.strong_count() > 0);
             self.last_live_count = self.tracks.len();
+        }
+        let former_threshold = 2 * self.last_former_count.max(32);
+        if self.former_tracks.len() > former_threshold {
+            self.former_tracks
+                .retain(|_, (_, weak)| weak.upgrade().is_some_and(|t| t.is_online()));
+            self.last_former_count = self.former_tracks.len();
         }
     }
 }
@@ -182,6 +193,7 @@ impl UserRegistry {
             return existing;
         }
 
+        state.former_tracks.remove(&folded);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let track = Arc::new(UserTrack::new(id, nick.to_owned(), Arc::clone(&self.casemap)));
         state.tracks.insert(folded, Arc::downgrade(&track));
@@ -212,23 +224,20 @@ impl UserRegistry {
         };
 
         track.set_nick(new_nick.to_owned());
+        state.former_tracks.remove(&new_folded);
+        if old_folded != new_folded {
+            state
+                .former_tracks
+                .insert(old_folded, (old_nick.to_owned(), Arc::downgrade(&track)));
+        }
         state.tracks.insert(new_folded, Arc::downgrade(&track));
         track
     }
 
-    /// Updates `account` if `nick` is currently tracked (or creates track if `create_if_missing`).
-    pub(crate) fn update_account(
-        &self,
-        nick: &str,
-        raw_account: &str,
-        create_if_missing: bool,
-    ) -> Option<Arc<UserTrack>> {
+    /// Updates `account` if `nick` is currently tracked.
+    pub(crate) fn update_account(&self, nick: &str, raw_account: &str) -> Option<Arc<UserTrack>> {
         let acct = normalize_account(raw_account);
-        let track = if create_if_missing {
-            Some(self.get_or_create(nick))
-        } else {
-            self.get_existing(nick)
-        }?;
+        let track = self.get_existing(nick)?;
         track.set_account(acct);
         Some(track)
     }
@@ -265,6 +274,68 @@ impl UserRegistry {
         Some((track, netsplit))
     }
 
+    /// Resolves a non-channel send-refusal / PM-block target (`401`, `486`, `716`, etc.) to
+    /// `(target_user_id, quit_track_id)`.
+    ///
+    /// On `401 ERR_NOSUCHNICK`, only an *active* entry in `tracks` is marked `Quit`; if `target`
+    /// was vacated by a recent `NICK` (`former_tracks`), the online user keeps their new nick and
+    /// `Online` status while still receiving `target_user_id = Some(track.id)`.
+    pub(crate) fn resolve_send_error(
+        &self,
+        target: &str,
+        code: u16,
+        at_seq: u64,
+        message: &str,
+    ) -> (Option<u64>, Option<u64>) {
+        let cm = self.casemap();
+        let folded = cm.fold(target);
+        if code == 401 {
+            let (active, former_id) = {
+                let mut state = self.state.lock().unwrap();
+                state.maybe_sweep();
+                if let Some(track) = state.tracks.remove(&folded).and_then(|w| w.upgrade()) {
+                    (Some(track), None)
+                } else {
+                    let fid = state
+                        .former_tracks
+                        .get(&folded)
+                        .and_then(|(_, w)| w.upgrade())
+                        .filter(|t| t.is_online())
+                        .map(|t| t.id);
+                    (None, fid)
+                }
+            };
+            if let Some(track) = active {
+                let live_nick = track.nick();
+                let _ = track.status_tx.send_replace(UserStatus::Quit {
+                    at_seq,
+                    nick: live_nick,
+                    reason: Some(message.to_owned()),
+                    netsplit: false,
+                });
+                (Some(track.id), Some(track.id))
+            } else {
+                (former_id, None)
+            }
+        } else {
+            let mut state = self.state.lock().unwrap();
+            state.maybe_sweep();
+            let id = state
+                .tracks
+                .get(&folded)
+                .and_then(Weak::upgrade)
+                .or_else(|| {
+                    state
+                        .former_tracks
+                        .get(&folded)
+                        .and_then(|(_, w)| w.upgrade())
+                        .filter(|t| t.is_online())
+                })
+                .map(|t| t.id);
+            (id, None)
+        }
+    }
+
     /// Rebuilds all `FoldedStr` keys when `005 CASEMAPPING` changes dynamically.
     pub(crate) fn rekey_casemap(&self, new_map: CaseMap) {
         self.casemap.store(new_map.to_u8(), Ordering::Relaxed);
@@ -277,14 +348,28 @@ impl UserRegistry {
                 rebuilt.insert(folded, weak);
             }
         }
+        let old_former = std::mem::take(&mut state.former_tracks);
+        let mut rebuilt_former = HashMap::with_capacity(old_former.len());
+        for (_, (raw_old, weak)) in old_former {
+            if weak.upgrade().is_some_and(|t| t.is_online()) {
+                let folded = new_map.fold(&raw_old);
+                if !rebuilt.contains_key(&folded) {
+                    rebuilt_former.insert(folded, (raw_old, weak));
+                }
+            }
+        }
         state.last_live_count = rebuilt.len();
+        state.last_former_count = rebuilt_former.len();
         state.tracks = rebuilt;
+        state.former_tracks = rebuilt_former;
     }
 
     pub(crate) fn clear(&self) {
         let mut state = self.state.lock().unwrap();
         state.tracks.clear();
+        state.former_tracks.clear();
         state.last_live_count = 0;
+        state.last_former_count = 0;
     }
 
     pub(crate) fn tracked_map_len(&self) -> usize {
@@ -492,8 +577,8 @@ impl User {
     }
 
     pub(crate) fn inbox_in_at(&self, room: &Room, caller: &'static Location<'static>) -> Inbox {
-        let filter = Filter::UserInRoom {
-            track: Arc::clone(&self.track),
+        let filter = Filter::UsersInRoom {
+            tracks: vec![Arc::clone(&self.track)],
             channel_name: room.name().to_owned(),
         };
         match self.core.upgrade() {

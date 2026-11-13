@@ -183,7 +183,7 @@ pub async fn run_auction(
         }
     };
 
-    let _: Option<std::convert::Infallible> = collect.with_deadline(deadline).optional().await?;
+    collect.run_until_deadline(deadline).await?;
 
     match high_bid {
         Some((winner, winning_bid)) => {

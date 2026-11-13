@@ -63,3 +63,34 @@ async fn shutdown_requested_resolves_before_and_after_request_shutdown() {
     // Subsequent calls resolve immediately:
     bot.shutdown_requested().await;
 }
+
+#[tokio::test]
+async fn bot_reply_tracks_sender_rename_and_refuses_impostor_after_quit() {
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#lobby", &["alice", "mallory"]);
+    server.settle().await;
+
+    let mut dms = bot.inbox_dms();
+    server.dm("alice", "secret question");
+    server.settle().await;
+    let dm_msg = dms.next_chat().await.unwrap();
+
+    // Alice renames -> `bot.reply` targets her new live nickname:
+    server.rename_user("alice", "alicia");
+    server.settle().await;
+    bot.reply(&dm_msg, "secret answer").unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::PRIVMSG("alicia".into(), "secret answer".into()))
+    );
+
+    // Alicia quits and Mallory steals `"alicia"` -> `bot.reply` refuses with `UserLeft`:
+    server.quit_user("alicia", Some("gone"));
+    server.rename_user("mallory", "alicia");
+    server.settle().await;
+    assert!(matches!(
+        bot.reply(&dm_msg, "do not leak"),
+        Err(Error::UserLeft { ref nick, .. }) if nick == "alicia"
+    ));
+    assert!(server.try_recv_sent().is_none());
+}

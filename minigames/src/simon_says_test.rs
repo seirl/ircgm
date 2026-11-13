@@ -1,20 +1,9 @@
 use std::time::Duration;
 
 use irc::proto::Command;
-use ircgm::testing::{test_harness, TestServer};
+use ircgm::testing::test_harness;
 
 use super::{run_simon_says, Directive, Medium};
-
-async fn accept_next_bunker_join(srv: &mut TestServer) -> String {
-    loop {
-        if let Some(Command::JOIN(chan, _, _)) = srv.recv_sent().await {
-            if chan.starts_with("#bunker-") {
-                srv.complete_join(&chan, &[]);
-                return chan;
-            }
-        }
-    }
-}
 
 #[tokio::test(start_paused = true)]
 async fn simon_says_runs_hud_notice_action_notice_rename_fakeout_and_bunker_rush_finale() {
@@ -60,9 +49,7 @@ async fn simon_says_runs_hud_notice_action_notice_rename_fakeout_and_bunker_rush
         async move { run_simon_says(&bot, &lobby, &players, &directives, Duration::from_secs(5)).await }
     });
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
 
     // Verify outbound CTCP `/me` stage direction and inline HUD `NOTICE` went out:
     let mut saw_hud_notice = false;
@@ -83,52 +70,42 @@ async fn simon_says_runs_hud_notice_action_notice_rename_fakeout_and_bunker_rush
     assert!(saw_hud_notice && saw_stage_action);
 
     // Round 1 (`Action`): Alice, Bob, Cara, Eve do `/me salutes`; Dan sends plain text (eliminated!):
-    srv.send_line(":Alice!~Alice@test.host PRIVMSG #lobby :\x01ACTION salutes\x01\r\n");
-    srv.send_line(":Bob!~Bob@test.host PRIVMSG #lobby :\x01ACTION salutes\x01\r\n");
-    srv.send_line(":Cara!~Cara@test.host PRIVMSG #lobby :\x01ACTION salutes\x01\r\n");
-    srv.send_line(":Eve!~Eve@test.host PRIVMSG #lobby :\x01ACTION salutes\x01\r\n");
+    for nick in ["Alice", "Bob", "Cara", "Eve"] {
+        srv.action(nick, "#lobby", "salutes");
+    }
     srv.chat("Dan", "#lobby", "salutes");
     tokio::time::advance(Duration::from_secs(5)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
 
     // Round 2 (`Notice`): Alice, Bob, Cara, Eve all send channel NOTICE -> advances early!
-    srv.send_line(":Alice!~Alice@test.host NOTICE #lobby :ready\r\n");
-    srv.send_line(":Bob!~Bob@test.host NOTICE #lobby :ready\r\n");
-    srv.send_line(":Cara!~Cara@test.host NOTICE #lobby :ready\r\n");
-    srv.send_line(":Eve!~Eve@test.host NOTICE #lobby :ready\r\n");
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
+    for nick in ["Alice", "Bob", "Cara", "Eve"] {
+        srv.notice(nick, "#lobby", "ready");
     }
+    srv.settle().await;
 
     // Round 3 (`NickPrefix`): All 4 rename to `spy_*`:
-    srv.send_line(":Alice!~Alice@test.host NICK :spy_alice\r\n");
-    srv.send_line(":Bob!~Bob@test.host NICK :spy_bob\r\n");
-    srv.send_line(":Cara!~Cara@test.host NICK :spy_cara\r\n");
-    srv.send_line(":Eve!~Eve@test.host NICK :spy_eve\r\n");
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
+    for (old, new) in [
+        ("Alice", "spy_alice"),
+        ("Bob", "spy_bob"),
+        ("Cara", "spy_cara"),
+        ("Eve", "spy_eve"),
+    ] {
+        srv.rename_user(old, new);
     }
+    srv.settle().await;
 
     // Round 4 (Fakeout without "Simon says"): `spy_eve` speaks and is eliminated! (`3` remain!)
     srv.chat("spy_eve", "#lobby", "oops");
     tokio::time::advance(Duration::from_secs(5)).await;
 
     // Round 5 (`BunkerRush`, 3 survivors -> 2 seats!):
-    let bunker = accept_next_bunker_join(&mut srv).await;
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    let bunker = srv.accept_breakout("#lobby-bunker", &[]).await;
 
     // `spy_bob` joins (1/2) then foolishly PARTs (0/2); `spy_alice` and `spy_cara` claim the 2 seats!
-    srv.send_line(&format!(":spy_bob!~Bob@test.host JOIN {bunker}\r\n"));
-    srv.send_line(&format!(":spy_bob!~Bob@test.host PART {bunker} :wait\r\n"));
-    srv.send_line(&format!(":spy_alice!~Alice@test.host JOIN {bunker}\r\n"));
-    srv.send_line(&format!(":spy_cara!~Cara@test.host JOIN {bunker}\r\n"));
+    srv.join_user("spy_bob", &bunker);
+    srv.part_user("spy_bob", &bunker, Some("wait"));
+    srv.join_user("spy_alice", &bunker);
+    srv.join_user("spy_cara", &bunker);
 
     let survivors = game.await.unwrap().unwrap();
     assert_eq!(survivors.len(), 2);

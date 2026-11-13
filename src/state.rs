@@ -38,16 +38,8 @@ impl Default for ChanModes {
 #[derive(Clone, Debug)]
 pub(crate) struct Occupant {
     pub(crate) track: Arc<UserTrack>,
-    pub(crate) nick: String,
     /// Ordered highest-to-lowest according to `WorldState::status_prefixes` (e.g. `['@', '+']`).
     pub(crate) prefixes: Vec<char>,
-}
-
-#[derive(Clone, Debug)]
-struct StagedName {
-    track: Arc<UserTrack>,
-    nick: String,
-    prefixes: Vec<char>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,9 +47,8 @@ pub(crate) struct ChannelState {
     pub(crate) name: String,
     pub(crate) topic: Option<String>,
     pub(crate) names_synced: bool,
-    pub(crate) members: HashMap<FoldedStr, Occupant>,
-    staging_names: Vec<StagedName>,
-    has_staged_batch: bool,
+    pub(crate) members: HashMap<u64, Occupant>,
+    staging_names: Option<HashMap<u64, Occupant>>,
 }
 
 impl ChannelState {
@@ -67,8 +58,20 @@ impl ChannelState {
             topic: None,
             names_synced: false,
             members: HashMap::new(),
-            staging_names: Vec::new(),
-            has_staged_batch: false,
+            staging_names: None,
+        }
+    }
+
+    pub(crate) fn member_by_nick(&self, nick: &str, casemap: CaseMap) -> Option<&Occupant> {
+        self.members
+            .values()
+            .find(|occ| casemap.str_eq(&occ.track.nick(), nick))
+    }
+
+    fn for_each_map_mut(&mut self, mut f: impl FnMut(&mut HashMap<u64, Occupant>)) {
+        f(&mut self.members);
+        if let Some(staged) = &mut self.staging_names {
+            f(staged);
         }
     }
 }
@@ -316,18 +319,13 @@ impl WorldState {
         changed_casemap
     }
 
-    /// Rebuilds all `channels` and occupant `FoldedStr` keys under `new_map`.
+    /// Rebuilds all `channels` and `lost_channels` `FoldedStr` keys under `new_map`
+    /// (`ChannelState::members` is keyed by immutable `UserTrack::id`, so no member re-keying is needed).
     pub(crate) fn rekey_casemap(&mut self, new_map: CaseMap) {
         self.casemap = new_map;
         let old_channels = std::mem::take(&mut self.channels);
         let mut new_channels = HashMap::with_capacity(old_channels.len());
-        for (_, mut chan) in old_channels {
-            let old_members = std::mem::take(&mut chan.members);
-            let mut new_members = HashMap::with_capacity(old_members.len());
-            for (_, occ) in old_members {
-                new_members.insert(new_map.fold(&occ.nick), occ);
-            }
-            chan.members = new_members;
+        for (_, chan) in old_channels {
             new_channels.insert(new_map.fold(&chan.name), chan);
         }
         self.channels = new_channels;
@@ -396,31 +394,32 @@ impl WorldState {
                 .entry(chan_key)
                 .or_insert_with(|| ChannelState::new(channel.to_owned()));
             chan.name = channel.to_owned();
-            let user_key = self.casemap.fold(nick);
-            chan.members.entry(user_key).or_insert(Occupant {
-                track,
-                nick: nick.to_owned(),
-                prefixes: Vec::new(),
+            chan.for_each_map_mut(|map| {
+                map.entry(track.id).or_insert_with(|| Occupant {
+                    track: Arc::clone(&track),
+                    prefixes: Vec::new(),
+                });
             });
         } else if let Some(chan) = self.channels.get_mut(&chan_key) {
-            let user_key = self.casemap.fold(nick);
-            chan.members.insert(
-                user_key,
-                Occupant {
-                    track,
-                    nick: nick.to_owned(),
-                    prefixes: Vec::new(),
-                },
-            );
+            chan.for_each_map_mut(|map| {
+                map.insert(
+                    track.id,
+                    Occupant {
+                        track: Arc::clone(&track),
+                        prefixes: Vec::new(),
+                    },
+                );
+            });
         }
     }
 
-    /// Removes `nick` from `channel` (or removes the entire `ChannelState` if `nick` is the bot).
+    /// Removes `track_id` from `channel` (or removes the entire `ChannelState` if `nick` is the bot).
     /// Returns `true` if the bot itself left the channel.
     pub(crate) fn handle_part_or_kick(
         &mut self,
         channel: &str,
         nick: &str,
+        track_id: u64,
         reason: Option<String>,
     ) -> bool {
         let chan_key = self.casemap.fold(channel);
@@ -440,32 +439,23 @@ impl WorldState {
             true
         } else {
             if let Some(chan) = self.channels.get_mut(&chan_key) {
-                let user_key = self.casemap.fold(nick);
-                chan.members.remove(&user_key);
+                chan.for_each_map_mut(|map| {
+                    map.remove(&track_id);
+                });
             }
             false
         }
     }
 
-    /// Returns the list of channel names `nick` currently occupies in `WorldState`.
-    pub(crate) fn channels_for_nick(&self, nick: &str) -> Vec<String> {
-        let user_key = self.casemap.fold(nick);
-        let mut out: Vec<String> = self
-            .channels
-            .values()
-            .filter(|c| c.members.contains_key(&user_key))
-            .map(|c| c.name.clone())
-            .collect();
-        out.sort();
-        out
-    }
-
-    /// Removes `nick` from all joined channels and returns the channels they occupied.
-    pub(crate) fn handle_quit(&mut self, nick: &str) -> Vec<String> {
-        let user_key = self.casemap.fold(nick);
+    /// Removes `track_id` from all joined channels and returns the channels they occupied.
+    pub(crate) fn handle_quit(&mut self, track_id: u64) -> Vec<String> {
         let mut occupied = Vec::new();
         for chan in self.channels.values_mut() {
-            if chan.members.remove(&user_key).is_some() {
+            let mut removed = false;
+            chan.for_each_map_mut(|map| {
+                removed |= map.remove(&track_id).is_some();
+            });
+            if removed {
                 occupied.push(chan.name.clone());
             }
         }
@@ -473,10 +463,12 @@ impl WorldState {
         occupied
     }
 
-    /// Updates `old_nick -> new_nick` across `current_nick` and all joined channels, returning
-    /// the list of channels `old_nick` occupied.
+    /// Updates `current_nick` if the bot itself renamed, and returns the list of channels
+    /// `track_id` currently occupies (`Occupant` reads live `UserTrack::nick()`, so no map
+    /// mutations are needed).
     pub(crate) fn handle_nick(
         &mut self,
+        track_id: u64,
         old_nick: &str,
         new_nick: &str,
         prefix: Option<&Prefix>,
@@ -485,14 +477,15 @@ impl WorldState {
         if self.casemap.str_eq(old_nick, &self.current_nick) {
             self.current_nick = new_nick.to_owned();
         }
-        let old_key = self.casemap.fold(old_nick);
-        let new_key = self.casemap.fold(new_nick);
         let mut occupied = Vec::new();
-        for chan in self.channels.values_mut() {
-            if let Some(mut occ) = chan.members.remove(&old_key) {
-                occ.nick = new_nick.to_owned();
+        for chan in self.channels.values() {
+            if chan.members.contains_key(&track_id)
+                || chan
+                    .staging_names
+                    .as_ref()
+                    .is_some_and(|s| s.contains_key(&track_id))
+            {
                 occupied.push(chan.name.clone());
-                chan.members.insert(new_key.clone(), occ);
             }
         }
         occupied.sort();
@@ -555,16 +548,14 @@ impl WorldState {
             }
 
             let track = users.get_or_create(nick);
-            parsed.push(StagedName {
-                track,
-                nick: nick.to_owned(),
-                prefixes,
-            });
+            parsed.push(Occupant { track, prefixes });
         }
 
         if let Some(chan) = self.channels.get_mut(&chan_key) {
-            chan.has_staged_batch = true;
-            chan.staging_names.extend(parsed);
+            let staged = chan.staging_names.get_or_insert_with(HashMap::new);
+            for occ in parsed {
+                staged.insert(occ.track.id, occ);
+            }
         }
     }
 
@@ -577,24 +568,10 @@ impl WorldState {
             args.first()?
         };
         let chan_key = self.casemap.fold(channel);
-        let casemap = self.casemap;
         let chan = self.channels.get_mut(&chan_key)?;
 
-        if chan.has_staged_batch {
-            let staged = std::mem::take(&mut chan.staging_names);
-            chan.has_staged_batch = false;
-            let mut new_members = HashMap::with_capacity(staged.len());
-            for item in staged {
-                new_members.insert(
-                    casemap.fold(&item.nick),
-                    Occupant {
-                        track: item.track,
-                        nick: item.nick,
-                        prefixes: item.prefixes,
-                    },
-                );
-            }
-            chan.members = new_members;
+        if let Some(staged) = chan.staging_names.take() {
+            chan.members = staged;
         }
         chan.names_synced = true;
         Some(chan.name.clone())
@@ -608,7 +585,7 @@ impl WorldState {
             return;
         }
 
-        let mut updates: Vec<(FoldedStr, bool, char)> = Vec::new();
+        let mut updates: Vec<(&str, bool, char)> = Vec::new();
         let mut idx = 0;
         while idx < tokens.len() {
             let mode_word = tokens[idx].as_ref();
@@ -626,7 +603,7 @@ impl WorldState {
                             if idx < tokens.len() {
                                 let target_nick = tokens[idx].as_ref();
                                 idx += 1;
-                                updates.push((self.casemap.fold(target_nick), adding, sym));
+                                updates.push((target_nick, adding, sym));
                             }
                         } else if self.chan_modes.list_a.contains(ch)
                             || self.chan_modes.param_always_b.contains(ch)
@@ -646,26 +623,27 @@ impl WorldState {
             }
         }
 
-        for (target_key, adding, sym) in updates {
-            if let Some(chan) = self.channels.get_mut(&chan_key) {
-                if let Some(occ) = chan.members.get_mut(&target_key) {
-                    if adding {
-                        if !occ.prefixes.contains(&sym) {
-                            occ.prefixes.push(sym);
+        let casemap = self.casemap;
+        let order: Vec<char> = self.status_prefixes.iter().map(|&(_, s)| s).collect();
+        if let Some(chan) = self.channels.get_mut(&chan_key) {
+            for (target_nick, adding, sym) in updates {
+                chan.for_each_map_mut(|map| {
+                    if let Some(occ) = map
+                        .values_mut()
+                        .find(|occ| casemap.str_eq(&occ.track.nick(), target_nick))
+                    {
+                        if adding {
+                            if !occ.prefixes.contains(&sym) {
+                                occ.prefixes.push(sym);
+                            }
+                        } else {
+                            occ.prefixes.retain(|&s| s != sym);
                         }
-                    } else {
-                        occ.prefixes.retain(|&s| s != sym);
+                        occ.prefixes.sort_by_key(|&s| {
+                            order.iter().position(|&x| x == s).unwrap_or(usize::MAX)
+                        });
                     }
-                }
-            }
-            // Keep prefixes sorted by `status_prefixes` privilege rank:
-            let order: Vec<char> = self.status_prefixes.iter().map(|&(_, s)| s).collect();
-            if let Some(chan) = self.channels.get_mut(&chan_key) {
-                if let Some(occ) = chan.members.get_mut(&target_key) {
-                    occ.prefixes.sort_by_key(|&s| {
-                        order.iter().position(|&x| x == s).unwrap_or(usize::MAX)
-                    });
-                }
+                });
             }
         }
     }

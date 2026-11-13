@@ -18,10 +18,13 @@
 //! ## Library Mechanics Showcased
 //! - **Inline HUD [`User::notice`] & stage [`Room::action`]:** Sends private `NOTICE` HUD lines
 //!   and outbound `\x01ACTION ...\x01` narration.
-//! - **Unified protocol event loop ([`Inbox::next_event`]):** Matches [`Event::Chat`]
-//!   ([`MessageKind::Privmsg`] vs [`MessageKind::Action`] via [`ChatMessage::is_action`]),
+//! - **Unified protocol event loop ([`Inbox::wait_event_map`] & [`Inbox::next_event`]):** Matches
+//!   [`Event::Chat`] ([`MessageKind::Privmsg`] vs [`MessageKind::Action`] via [`ChatMessage::is_action`]),
 //!   [`Event::Notice`], and [`Event::NickChanged`] on one [`Inbox`], tracking survivors across
 //!   `/nick` changes via [`UserId`].
+//! - **Zero-ceremony timed loops ([`ircgm::GameFutureExt::run_for`] & [`ircgm::GameFutureExt::run_until_deadline`]):**
+//!   Runs both early-exiting (`Ok(())`) and infinite (`loop { ... }`) phase blocks without
+//!   `Infallible` or `Ok::<_, Error>(())` turbofish annotations.
 //! - **Unlocked [`ircgm::BreakoutOptions`] + [`Event::Joined`] / [`Event::Parted`] seat rush:**
 //!   Creates `#bunker-xxxxxx` with `modes(None)` so players can self-join, counts live occupancy
 //!   from `JOIN` / `PART` / `QUIT` events, locks the door with [`Room::set_mode`] (`"+i"`), and
@@ -163,7 +166,7 @@ async fn run_bunker_rush_round(
     let seats = living.len().saturating_sub(1).max(1);
     let bunker = bot
         .breakout_with(
-            BreakoutOptions::new("bunker")
+            BreakoutOptions::new(crate::breakout_slug(lobby, "bunker"))
                 .modes(None::<&str>)
                 .kick_reason("All clear — back to #lobby!"),
         )
@@ -194,22 +197,26 @@ async fn run_bunker_rush_round(
                     _ => {}
                 }
             }
-            Ok::<_, Error>(())
+            Ok(())
         };
-        let _ = fill.with_timeout(window).optional().await?;
+        fill.run_for(window).await?;
         let _ = bunker.set_mode("+i", &[]);
         living.retain(|u| inside.contains(&u.id()));
     } else {
         let trap = async {
             loop {
-                if let Event::Joined { user, .. } = ev_in.next_event().await? {
-                    if living_ids.contains(&user.id()) {
-                        inside.insert(user.id());
-                    }
+                let uid = ev_in
+                    .wait_event_map(|ev| match ev {
+                        Event::Joined { user, .. } => Some(user.id()),
+                        _ => None,
+                    })
+                    .await?;
+                if living_ids.contains(&uid) {
+                    inside.insert(uid);
                 }
             }
         };
-        let _: Option<std::convert::Infallible> = trap.with_timeout(window).optional().await?;
+        trap.run_for(window).await?;
         living.retain(|u| !inside.contains(&u.id()));
     }
     Ok(())
@@ -250,31 +257,28 @@ pub async fn run_simon_says(
             let mut completed: HashSet<UserId> = HashSet::new();
             let collect = async {
                 while completed.len() < living_ids.len() {
-                    let ev = inbox.next_event().await?;
-                    if let Some(uid) = directive.matches_event(&ev) {
-                        if living_ids.contains(&uid) {
-                            completed.insert(uid);
-                        }
+                    let uid = inbox
+                        .wait_event_map(|ev| directive.matches_event(ev))
+                        .await?;
+                    if living_ids.contains(&uid) {
+                        completed.insert(uid);
                     }
                 }
-                Ok::<_, Error>(())
+                Ok(())
             };
-            let _ = collect.with_deadline(deadline).optional().await?;
+            collect.run_until_deadline(deadline).await?;
             living.retain(|u| completed.contains(&u.id()));
         } else {
             let mut tricked: HashSet<UserId> = HashSet::new();
             let collect = async {
                 loop {
-                    let ev = inbox.next_event().await?;
-                    if let Some(uid) = any_player_activity(&ev) {
-                        if living_ids.contains(&uid) {
-                            tricked.insert(uid);
-                        }
+                    let uid = inbox.wait_event_map(any_player_activity).await?;
+                    if living_ids.contains(&uid) {
+                        tricked.insert(uid);
                     }
                 }
             };
-            let _: Option<std::convert::Infallible> =
-                collect.with_deadline(deadline).optional().await?;
+            collect.run_until_deadline(deadline).await?;
             living.retain(|u| !tricked.contains(&u.id()));
         }
     }

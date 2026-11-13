@@ -33,9 +33,7 @@ async fn mixed_channel_bids_and_secret_dm_appraise_and_proxy_resolve_in_wire_ord
         }
     });
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
 
     // 1. Alice secretly appraises via DM while Bob opens bidding in #lobby;
     //    Cara registers a secret `!proxy 60` in DM right *before* Bob raises to 50 in the same burst!
@@ -44,10 +42,6 @@ async fn mixed_channel_bids_and_secret_dm_appraise_and_proxy_resolve_in_wire_ord
     srv.dm("Cara", "!proxy 60");
     srv.chat("Bob", "#lobby", "!bid 50");
     srv.settle().await;
-
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Alice received her secret appraisal DM:
     assert!(srv

@@ -150,7 +150,7 @@ pub async fn ambassador_exchange_or_cancel(
     .with_timeout(Duration::from_secs(30));
 
     match wizard
-        .until(player.inbox().into_wait_cmd("!cancel").ok_or_pending())
+        .until_ok(player.inbox().into_wait_cmd("!cancel"))
         .await
     {
         Outcome::Completed(res) => res.map(Some),

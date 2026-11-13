@@ -28,9 +28,7 @@ async fn concurrent_steal_queues_behind_ambassador_exchange_without_interleaving
         }
     });
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
 
     // Only the Ambassador Exchange prompt was sent to Alice; Bob's steal DM is queued on ExclusiveDm!
     let initial_alice_dms = srv.take_messages_to("Alice");
@@ -48,9 +46,6 @@ async fn concurrent_steal_queues_behind_ambassador_exchange_without_interleaving
     srv.dm("Alice", "Captain");
     srv.dm("Alice", "Ambassador");
     srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Now that Ambassador Exchange released ExclusiveDm, the queued Steal prompt arrives!
     let next_alice_dms = srv.take_messages_to("Alice");
@@ -94,18 +89,13 @@ async fn canceling_ambassador_exchange_releases_dm_lock_immediately_for_queued_s
         }
     });
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    srv.flush().await;
     let _ = srv.take_messages_to("Alice");
 
-    // Alice sends `!cancel`: `.with_ignore_commands()` skips `next_chat()` and trips `.until(...)`,
+    // Alice sends `!cancel`: `.with_ignore_commands()` skips `next_chat()` and trips `.until_ok(...)`,
     // dropping `ExclusiveDm` so Bob's queued steal prompt is sent immediately!
     srv.dm("Alice", "!cancel");
     srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     let alice_dms = srv.take_messages_to("Alice");
     assert!(alice_dms

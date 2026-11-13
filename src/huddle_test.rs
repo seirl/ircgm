@@ -50,12 +50,20 @@ async fn huddle_sender_tracks_bounced_and_offline_members() {
     let pack = bot.huddle([&w1, &w2]).await.unwrap();
     let sender = pack.sender_view();
 
-    assert_eq!(sender.find_matching_user_id("WOLF1", None), Some(w1.id()));
+    let outsider = bot.user("outsider").unwrap();
     assert_eq!(
-        sender.find_matching_user_id("unknown", Some(w2.id().as_u64())),
+        sender.find_matching_user_id(Some(w1.id().as_u64())),
+        Some(w1.id())
+    );
+    assert_eq!(
+        sender.find_matching_user_id(Some(w2.id().as_u64())),
         Some(w2.id())
     );
-    assert_eq!(sender.find_matching_user_id("nobody", None), None);
+    assert_eq!(
+        sender.find_matching_user_id(Some(outsider.id().as_u64())),
+        None
+    );
+    assert_eq!(sender.find_matching_user_id(None), None);
 
     let mut bounced = HashSet::new();
     assert!(sender.any_reachable_online(&bounced));

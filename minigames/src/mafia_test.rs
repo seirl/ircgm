@@ -1,20 +1,9 @@
 use std::time::Duration;
 
 use irc::proto::Command;
-use ircgm::testing::{test_harness, TestServer};
+use ircgm::testing::test_harness;
 
 use super::*;
-
-async fn accept_graveyard_breakout(srv: &mut TestServer) -> String {
-    loop {
-        if let Some(Command::JOIN(chan, _, _)) = srv.recv_sent().await {
-            if chan.starts_with("#graveyard-") {
-                srv.complete_join(&chan, &[]);
-                return chan;
-            }
-        }
-    }
-}
 
 #[tokio::test(start_paused = true)]
 async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vote() {
@@ -37,11 +26,7 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
         async move { run_mafia_round(&bot, &room, &wolves, &[], &villagers).await }
     });
 
-    let _graveyard = accept_graveyard_breakout(&mut server).await;
-    server.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
 
     // Nightfall moderation commands:
     let mut saw_topic = false;
@@ -61,9 +46,6 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     }
     assert!(saw_topic && saw_plus_m);
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
     let _ = server.take_messages_to("Wolf1");
     let _ = server.take_messages_to("Wolf2");
 
@@ -72,9 +54,6 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     server.dm("Wolf1", "!kill Wolf2"); // Invalid -> private reject to Wolf1
     server.dm("Wolf2", "!kill Villager1");
     server.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     assert!(server
         .take_messages_to("Wolf1")
@@ -87,13 +66,9 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
 
     // 5s bodyguard window (`0` guards) + 3s AFK `#graveyard` `invite_available` window:
     tokio::time::advance(Duration::from_secs(5)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    server.flush().await;
     tokio::time::advance(Duration::from_secs(3)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    server.flush().await;
 
     // Day vote among survivors (Wolf1, Wolf2, Villager2):
     server.dm("Villager2", "!vote Wolf2");
@@ -137,23 +112,13 @@ async fn offline_bodyguard_skipped_by_available_and_online_bodyguard_saves_wolf_
         async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
     });
 
-    let _graveyard = accept_graveyard_breakout(&mut server).await;
-    server.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
 
     // Wolf1 bites Villager1, and online Guard2 DMs `!protect Villager1` within 5s!
     server.dm("Wolf1", "!kill Villager1");
     server.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
     server.dm("Guard2", "!protect Villager1");
     server.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Both Guard2 and saved Villager1 vote out Wolf1!
     server.dm("Guard2", "!vote Wolf1");

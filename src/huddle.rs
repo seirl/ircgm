@@ -38,13 +38,12 @@ impl HuddleSender<'_> {
             }
         }
 
-        match last_receipt {
-            Some(r) => Ok(r),
-            None => Err(last_offline_err.unwrap_or(Error::UserLeft {
+        last_receipt.ok_or_else(|| {
+            last_offline_err.unwrap_or(Error::UserLeft {
                 nick: String::new(),
                 reason: None,
-            })),
-        }
+            })
+        })
     }
 
     pub(crate) fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
@@ -81,22 +80,9 @@ impl HuddleSender<'_> {
         Ok(())
     }
 
-    pub(crate) fn find_matching_user_id(
-        &self,
-        target: &str,
-        target_user_id: Option<u64>,
-    ) -> Option<UserId> {
-        if let Some(raw_id) = target_user_id {
-            let uid = UserId(raw_id);
-            if self.guards.iter().any(|g| g.user().id() == uid) {
-                return Some(uid);
-            }
-        }
-        self.guards
-            .iter()
-            .map(ExclusiveDm::user)
-            .find(|u| u.eq_nick(target))
-            .map(User::id)
+    pub(crate) fn find_matching_user_id(&self, target_user_id: Option<u64>) -> Option<UserId> {
+        let uid = UserId(target_user_id?);
+        self.guards.iter().any(|g| g.user().id() == uid).then_some(uid)
     }
 
     pub(crate) fn any_reachable_online(&self, bounced_users: &HashSet<UserId>) -> bool {

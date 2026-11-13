@@ -12,8 +12,11 @@
 //!    every surviving hand (`WIN`, `PUSH`, or `LOSE`).
 //!
 //! ## Library Mechanics Showcased
-//! - **Sequential channel turns ([`Room::ask_user`]):** Scopes each prompt to a specific [`User`]
-//!   inside a busy public channel while ignoring chatter from everyone else.
+//! - **Player-subset & single-player channel turns ([`Room::ask_users`] & [`Room::ask_user`]):**
+//!   Restricts `!deal` to seated players (ignoring spectators) and scopes each `hit`/`stand` turn
+//!   to one [`User`] inside a busy public channel.
+//! - **Timed lobby seat collection ([`ircgm::GameFutureExt::run_for`]):** Runs a `20s` join loop
+//!   that exits early at 4 players with zero `Ok::<_, Error>(())` turbofish ceremony.
 //! - **Fault-isolated player turns ([`ircgm::GameFutureExt::settled`] / [`Turn`]):** Distinguishes
 //!   [`Turn::Reply`], [`Turn::TimedOut`] (auto-stand), and [`Turn::Left`] (`PART` / `KICK` / `QUIT`
 //!   mid-hand folds cleanly without aborting the table).
@@ -69,9 +72,9 @@ pub async fn play(room: &Room) -> Result<()> {
                 room.say(msg.sender.nick().bold() + format!(" took seat #{}!", players.len()))?;
             }
         }
-        Ok::<_, Error>(())
+        Ok(())
     };
-    let _ = collect.with_timeout(Duration::from_secs(20)).optional().await?;
+    collect.run_for(Duration::from_secs(20)).await?;
 
     if players.is_empty() {
         room.say("Nobody sat down at the Blackjack table.".yellow())?;
@@ -101,9 +104,11 @@ pub async fn run_round_with_shoe(
             }),
     );
 
-    room.ask("Anyone type `!deal` to cut the deck!", |m| {
-        m.is_cmd("!deal").then_some(())
-    })
+    room.ask_users(
+        players,
+        "Seated players: anyone type `!deal` to cut the deck!",
+        |m| m.is_cmd("!deal").then_some(()),
+    )
     .await?;
 
     let mut dealer = vec![draw_card(&mut shoe), draw_card(&mut shoe)];

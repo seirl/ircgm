@@ -107,18 +107,14 @@ async fn tied_quips_trigger_wire_fair_dm_tiebreaker_race() {
         async move { vote_on_quips(&bot, &room, &submissions).await }
     });
 
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    server.flush().await;
 
     // 1-1 tie (#1 gets Bob's vote, #2 gets Carol's vote):
     server.chat("Bob", "#quip", "!pick 1");
     server.chat("Carol", "#quip", "!pick 2");
     server.settle().await;
     tokio::time::advance(Duration::from_secs(20)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    server.flush().await;
 
     // Tiebreaker fires (`17 * 6 = 102`); Dan answers before Alice in the same wire burst:
     server.dm("Dan", "102");

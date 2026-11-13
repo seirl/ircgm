@@ -147,18 +147,13 @@ impl Room {
         }
         if let Some(chan) = ws.channels.get(&key) {
             if chan.names_synced {
-                let self_key = ws.casemap.fold(&ws.current_nick);
-                if !chan.members.contains_key(&self_key) {
+                if chan.member_by_nick(&ws.current_nick, ws.casemap).is_none() {
                     return Err(Error::BotLeftRoom {
                         channel: self.channel_name.clone(),
                         reason: None,
                     });
                 }
-                if !chan
-                    .members
-                    .values()
-                    .any(|occ| occ.track.id == user.track_id())
-                {
+                if !chan.members.contains_key(&user.track_id()) {
                     return Err(Error::UserLeft {
                         nick: user.nick(),
                         reason: None,
@@ -167,6 +162,29 @@ impl Room {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn ensure_any_user_askable(&self, users: &[User]) -> Result<()> {
+        self.ensure_bot_in_room_if_tracked()?;
+        for u in users {
+            if !u.belongs_to(&self.core) {
+                return Err(Error::InvalidInput(
+                    "User handle belongs to a different Bot session",
+                ));
+            }
+        }
+        let mut last_offline_err: Option<Error> = None;
+        for u in users {
+            match self.ensure_user_askable(u) {
+                Ok(()) => return Ok(()),
+                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
+                Err(fatal) => return Err(fatal),
+            }
+        }
+        Err(last_offline_err.unwrap_or(Error::UserLeft {
+            nick: String::new(),
+            reason: None,
+        }))
     }
 
     fn ensure_can_moderate(&self) -> Result<(CaseMap, usize)> {
@@ -181,8 +199,7 @@ impl Room {
         }
         if let Some(chan) = ws.channels.get(&key) {
             if chan.names_synced {
-                let self_key = ws.casemap.fold(&ws.current_nick);
-                let Some(self_occ) = chan.members.get(&self_key) else {
+                let Some(self_occ) = chan.member_by_nick(&ws.current_nick, ws.casemap) else {
                     return Err(Error::BotLeftRoom {
                         channel: self.channel_name.clone(),
                         reason: None,
@@ -276,12 +293,15 @@ impl Room {
         let mut out: Vec<Member> = chan
             .members
             .values()
-            .map(|occ| Member {
-                user: User::from_parts(weak.clone(), Arc::clone(&occ.track)),
-                nick: occ.nick.clone(),
-                is_op: ws.occupant_is_op(occ),
-                is_voiced: ws.occupant_is_voiced(occ),
-                prefixes: occ.prefixes.clone(),
+            .map(|occ| {
+                let nick = occ.track.nick();
+                Member {
+                    user: User::from_parts(weak.clone(), Arc::clone(&occ.track)),
+                    nick,
+                    is_op: ws.occupant_is_op(occ),
+                    is_voiced: ws.occupant_is_voiced(occ),
+                    prefixes: occ.prefixes.clone(),
+                }
             })
             .collect();
         out.sort_by(|a, b| a.nick.cmp(&b.nick));
@@ -295,13 +315,10 @@ impl Room {
         let ws = self.core.state.read().unwrap();
         let key = ws.casemap.fold(&self.channel_name);
         let chan = ws.channels.get(&key)?;
-        let occ = chan
-            .members
-            .values()
-            .find(|o| o.track.id == user.track_id())?;
+        let occ = chan.members.get(&user.track_id())?;
         Some(Member {
             user: User::from_parts(Arc::downgrade(&self.core), Arc::clone(&occ.track)),
-            nick: occ.nick.clone(),
+            nick: occ.track.nick(),
             is_op: ws.occupant_is_op(occ),
             is_voiced: ws.occupant_is_voiced(occ),
             prefixes: occ.prefixes.clone(),
@@ -314,7 +331,7 @@ impl Room {
         let Some(chan) = ws.channels.get(&key) else {
             return Vec::new();
         };
-        let mut out: Vec<String> = chan.members.values().map(|o| o.nick.clone()).collect();
+        let mut out: Vec<String> = chan.members.values().map(|o| o.track.nick()).collect();
         out.sort();
         out
     }
@@ -325,20 +342,17 @@ impl Room {
         }
         let ws = self.core.state.read().unwrap();
         let key = ws.casemap.fold(&self.channel_name);
-        ws.channels.get(&key).is_some_and(|chan| {
-            chan.members
-                .values()
-                .any(|o| o.track.id == user.track_id())
-        })
+        ws.channels
+            .get(&key)
+            .is_some_and(|chan| chan.members.contains_key(&user.track_id()))
     }
 
     pub fn has_nick(&self, nick: &str) -> bool {
         let ws = self.core.state.read().unwrap();
         let chan_key = ws.casemap.fold(&self.channel_name);
-        let user_key = ws.casemap.fold(nick);
         ws.channels
             .get(&chan_key)
-            .is_some_and(|chan| chan.members.contains_key(&user_key))
+            .is_some_and(|chan| chan.member_by_nick(nick, ws.casemap).is_some())
     }
 
     pub fn bot_is_op(&self) -> bool {
@@ -347,9 +361,7 @@ impl Room {
         let Some(chan) = ws.channels.get(&chan_key) else {
             return false;
         };
-        let self_key = ws.casemap.fold(&ws.current_nick);
-        chan.members
-            .get(&self_key)
+        chan.member_by_nick(&ws.current_nick, ws.casemap)
             .is_some_and(|occ| ws.occupant_is_op(occ))
     }
 
@@ -366,6 +378,9 @@ impl Room {
             ));
         }
         let (cm, _) = self.ensure_can_moderate()?;
+        if let Some(err) = user.quit_error() {
+            return Err(err);
+        }
         let nick = user.nick();
         validate_target(&nick, "kick target")?;
         let clean = reason.map(sanitize_reason);
@@ -426,6 +441,9 @@ impl Room {
                 return Err(Error::InvalidInput(
                     "User handle belongs to a different Bot session",
                 ));
+            }
+            if !u.is_online() {
+                continue;
             }
             let nick = u.nick();
             validate_target(&nick, "mode target")?;
@@ -526,10 +544,83 @@ impl Room {
         )
     }
 
+    /// Prompts the channel and accepts replies only from `users` (ignoring spectators and
+    /// failing with [`Error::UserLeft`] only if *every* listed user leaves/quits).
+    #[track_caller]
+    pub fn ask_users<'a, I, U, F, R>(
+        &'a self,
+        users: I,
+        prompt: impl Into<Text>,
+        matcher: F,
+    ) -> Ask<'a, F, R>
+    where
+        I: IntoIterator<Item = U>,
+        U: std::borrow::Borrow<User>,
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoVerdict + 'a,
+        R::Output: Send + 'a,
+    {
+        let caller = Location::caller();
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
+        Ask::new(
+            AskSource::RoomUsers {
+                room: self,
+                users: collected,
+                caller,
+            },
+            (*self.ask_config).clone(),
+            prompt.into(),
+            matcher,
+        )
+    }
+
     #[track_caller]
     pub fn inbox(&self) -> Inbox {
         let caller = Location::caller();
         self.inbox_at(caller)
+    }
+
+    /// Opens a channel [`Inbox`] matching only messages and presence events from `users`
+    /// inside this room (ignoring spectators, and terminating with [`Error::UserLeft`] once
+    /// all listed users have left or quit).
+    #[track_caller]
+    pub fn inbox_users<I, U>(&self, users: I) -> Inbox
+    where
+        I: IntoIterator<Item = U>,
+        U: std::borrow::Borrow<User>,
+    {
+        let caller = Location::caller();
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
+        self.inbox_users_at(&collected, caller)
+    }
+
+    pub(crate) fn inbox_users_at(
+        &self,
+        users: &[User],
+        caller: &'static Location<'static>,
+    ) -> Inbox {
+        let mut tracks: Vec<Arc<crate::user::UserTrack>> = Vec::with_capacity(users.len());
+        let mut all_belong = true;
+        for u in users {
+            if !u.belongs_to(&self.core) {
+                all_belong = false;
+            }
+            let track = u.track_arc();
+            if !tracks.iter().any(|t| t.id == track.id) {
+                tracks.push(track);
+            }
+        }
+        let filter = Filter::UsersInRoom {
+            tracks,
+            channel_name: self.channel_name.clone(),
+        };
+        if !all_belong {
+            return Inbox::disconnected_bot_dropped(filter, caller);
+        }
+        let cm = self.core.casemap();
+        self.core
+            .inboxes
+            .subscribe(Arc::clone(&self.core), filter, caller, cm)
     }
 
     pub(crate) fn inbox_at(&self, caller: &'static Location<'static>) -> Inbox {

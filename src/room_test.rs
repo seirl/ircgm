@@ -93,3 +93,100 @@ async fn room_queries_and_moderation_batching_respect_world_state() {
         Err(Error::NotChannelOp { .. })
     ));
 }
+
+#[tokio::test]
+async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_players_leave() {
+    let (bot, mut server) = test_harness("gm");
+    let join_task = tokio::spawn({
+        let bot = bot.clone();
+        async move { bot.join("#table").await }
+    });
+    let _ = server
+        .accept_breakout("#table", &["alice", "bob", "spectator"])
+        .await;
+    let room = join_task.await.unwrap().unwrap();
+
+    let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+
+    // `ask_users` ignores spectator chatter and survives one listed player parting:
+    let ask_task = tokio::spawn({
+        let room = room.clone();
+        let players = vec![alice.clone(), bob.clone()];
+        async move {
+            room.ask_users(&players, "Type !deal", |m| {
+                m.is_cmd("!deal").then(|| m.sender.nick())
+            })
+            .await
+        }
+    });
+    server.flush().await;
+    assert_eq!(server.take_messages_to("#table"), vec!["Type !deal"]);
+
+    server.chat("spectator", "#table", "!deal");
+    server.part_user("alice", "#table", Some("out"));
+    server.chat("bob", "#table", "!deal");
+
+    let dealer = ask_task.await.unwrap().unwrap();
+    assert_eq!(dealer, "bob");
+
+    // Once `bob` also parts, `inbox_users` and `ask_users` fail with `Error::UserLeft`:
+    let mut sub_inbox = room.inbox_users([&alice, &bob]);
+    server.part_user("bob", "#table", Some("cashout"));
+    match sub_inbox.next_chat().await {
+        Err(Error::UserLeft { nick, reason }) => {
+            assert_eq!(nick, "bob");
+            assert_eq!(reason.as_deref(), Some("cashout"));
+        }
+        other => panic!("expected UserLeft(bob, cashout), got {other:?}"),
+    }
+
+    assert!(matches!(
+        room.ask_users([&alice, &bob], "Anyone left?", |m| Some(m.text.clone()))
+            .await,
+        Err(Error::UserLeft { .. })
+    ));
+}
+
+#[tokio::test]
+async fn room_moderation_tracks_renames_and_never_hits_nick_stealer_after_quit() {
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#arena", &["alice", "bob", "mallory"]);
+    server.settle().await;
+
+    let room = bot.room("#arena").unwrap();
+    let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+
+    // Rename before moderation uses new nick:
+    server.rename_user("alice", "alicia");
+    server.settle().await;
+    room.voice(&alice).unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::Raw(
+            "MODE".into(),
+            vec!["#arena".into(), "+v".into(), "alicia".into()]
+        ))
+    );
+
+    // Quit + nick steal: `kick(&alice)` fails with `UserLeft` and `voice_many` skips `alice`:
+    server.quit_user("alicia", Some("bye"));
+    server.rename_user("mallory", "alicia");
+    server.settle().await;
+
+    assert!(matches!(
+        room.kick(&alice, Some("out")),
+        Err(Error::UserLeft { ref nick, .. }) if nick == "alicia"
+    ));
+    assert!(server.try_recv_sent().is_none());
+
+    room.voice_many([&alice, &bob]).unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::Raw(
+            "MODE".into(),
+            vec!["#arena".into(), "+v".into(), "bob".into()]
+        ))
+    );
+}

@@ -139,7 +139,7 @@ pub async fn run_heist(
     safe_wire: Wire,
 ) -> Result<HeistOutcome> {
     let vault = bot
-        .breakout("vault")
+        .breakout(&crate::breakout_slug(lobby, "vault"))
         .await?
         .with_ask_config(
             &AskConfig::new()
@@ -197,25 +197,22 @@ pub async fn run_heist(
     let (rate_tx, mut rate_rx) = watch::channel(1.0_f64);
     let dual_keys = async {
         tokio::try_join!(
-            vault
-                .inbox()
-                .into_wait_for(|m| m.sender.id() == hacker.id() && m.cmd_args("!turn") == Some("alpha")),
-            vault
-                .inbox()
-                .into_wait_for(|m| m.sender.id() == safecracker.id() && m.cmd_args("!turn") == Some("omega")),
+            hacker
+                .inbox_in(&vault)
+                .into_wait_for(|m| m.cmd_args("!turn") == Some("alpha")),
+            safecracker
+                .inbox_in(&vault)
+                .into_wait_for(|m| m.cmd_args("!turn") == Some("omega")),
         )?;
         Ok::<HeistOutcome, Error>(HeistOutcome::ExtractedDualKeys)
     };
 
     let alarm_tamper = async {
-        let mut inbox = vault.inbox();
+        let mut inbox = vault.inbox_users([hacker, safecracker]);
         let mut current_rate = 1.0_f64;
         let mut cooled = false;
         loop {
             let msg = inbox.next_chat().await?;
-            if msg.sender.id() != hacker.id() && msg.sender.id() != safecracker.id() {
-                continue;
-            }
             if msg.is_cmd("!cool") && !cooled {
                 cooled = true;
                 current_rate *= 0.5;

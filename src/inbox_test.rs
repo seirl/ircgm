@@ -32,12 +32,20 @@ async fn filter_scope_labels_format_cleanly() {
         "user alice"
     );
     assert_eq!(
-        Filter::UserInRoom {
-            track: alice.track_arc(),
+        Filter::UsersInRoom {
+            tracks: vec![alice.track_arc()],
             channel_name: "#quiz".into(),
         }
         .scope_label(),
         "user alice in #quiz"
+    );
+    assert_eq!(
+        Filter::UsersInRoom {
+            tracks: vec![alice.track_arc(), bob.track_arc()],
+            channel_name: "#quiz".into(),
+        }
+        .scope_label(),
+        "users [alice, bob] in #quiz"
     );
     assert_eq!(
         Filter::Scoped {
@@ -118,6 +126,8 @@ async fn registry_tracks_channel_interest_and_deduplicates_multi_match_events() 
 #[tokio::test]
 async fn consuming_into_combinators_resolve_and_unsubscribe_on_completion() {
     let (bot, server) = test_harness("gm");
+    server.complete_join("#lobby", &["alice", "bob", "carol"]);
+    server.settle().await;
     let room = bot.room("#lobby").unwrap();
 
     let wait_cmd_fut = room.inbox().into_wait_cmd("!go");
@@ -137,4 +147,32 @@ async fn consuming_into_combinators_resolve_and_unsubscribe_on_completion() {
     let next_chat_fut = room.inbox().into_next_chat();
     server.chat("carol", "#lobby", "hello");
     assert_eq!(next_chat_fut.await.unwrap().text, "hello");
+
+    let mut ev_inbox = room.inbox();
+    server.chat("carol", "#lobby", "noise");
+    server.join_user("dave", "#lobby");
+    let joined = ev_inbox
+        .wait_event_for(|ev| matches!(ev, Event::Joined { .. }))
+        .await
+        .unwrap();
+    assert!(matches!(joined, Event::Joined { ref user, .. } if user.nick() == "dave"));
+
+    let into_ev_map = room.inbox().into_wait_event_map(|ev| match ev {
+        Event::Parted { user, reason, .. } => Some((user.nick(), reason.clone())),
+        _ => None,
+    });
+    server.part_user("dave", "#lobby", Some("dinner"));
+    assert_eq!(
+        into_ev_map.await.unwrap(),
+        ("dave".into(), Some("dinner".into()))
+    );
+
+    let into_ev_for = room
+        .inbox()
+        .into_wait_event_for(|ev| matches!(ev, Event::NickChanged { .. }));
+    server.rename_user("carol", "caroline");
+    assert!(matches!(
+        into_ev_for.await.unwrap(),
+        Event::NickChanged { new_nick, .. } if new_nick == "caroline"
+    ));
 }

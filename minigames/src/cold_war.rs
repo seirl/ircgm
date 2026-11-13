@@ -61,8 +61,8 @@ pub async fn run_cold_war(
     usa_premier: &User,
     ussr_premier: &User,
 ) -> Result<ColdWarOutcome> {
-    let usa = bot.breakout("usa").await?;
-    let ussr = bot.breakout("ussr").await?;
+    let usa = bot.breakout(&crate::breakout_slug(lobby, "usa")).await?;
+    let ussr = bot.breakout(&crate::breakout_slug(lobby, "ussr")).await?;
 
     lobby.say(
         "☎️ ".bold()
@@ -112,9 +112,9 @@ pub async fn run_cold_war(
                     )?;
                 }
             }
-            Ok::<_, Error>(())
+            Ok(())
         };
-        let _ = negotiate.with_timeout(Duration::from_secs(20)).optional().await?;
+        negotiate.run_for(Duration::from_secs(20)).await?;
     }
 
     // Phase 2: Simultaneous secret orders in each private war room:

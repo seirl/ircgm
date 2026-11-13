@@ -113,11 +113,55 @@ impl TestServer {
         self.send_line(&format!(":{nick}!~{nick}@test.host PRIVMSG {channel} :{text}\r\n"));
     }
 
+    /// Convenience helper: injects a CTCP `/me` action (`\x01ACTION <action_text>\x01`) to `target`.
+    pub fn action(&self, nick: &str, target: &str, action_text: &str) {
+        self.send_line(&format!(
+            ":{nick}!~{nick}@test.host PRIVMSG {target} :\x01ACTION {action_text}\x01\r\n"
+        ));
+    }
+
+    /// Convenience helper: injects `:<nick>!~<nick>@test.host NOTICE <target> :<text>\r\n`.
+    pub fn notice(&self, nick: &str, target: &str, text: &str) {
+        self.send_line(&format!(
+            ":{nick}!~{nick}@test.host NOTICE {target} :{text}\r\n"
+        ));
+    }
+
     /// Convenience helper: injects `:<nick>!~<nick>@test.host PRIVMSG <bot_nick> :<text>\r\n`.
     pub fn dm(&self, nick: &str, text: &str) {
         let (bot_nick, _) = self.current_nick_and_casemap();
         self.send_line(&format!(
             ":{nick}!~{nick}@test.host PRIVMSG {bot_nick} :{text}\r\n"
+        ));
+    }
+
+    /// Convenience helper: injects `:<nick>!~<nick>@test.host NOTICE <bot_nick> :<text>\r\n`.
+    pub fn dm_notice(&self, nick: &str, text: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.send_line(&format!(
+            ":{nick}!~{nick}@test.host NOTICE {bot_nick} :{text}\r\n"
+        ));
+    }
+
+    /// Convenience helper: injects `:<nick>!~<nick>@test.host JOIN <channel>\r\n`.
+    pub fn join_user(&self, nick: &str, channel: &str) {
+        self.send_line(&format!(":{nick}!~{nick}@test.host JOIN {channel}\r\n"));
+    }
+
+    /// Convenience helper: injects `:<nick>!~<nick>@test.host PART <channel> [:<reason>]\r\n`.
+    pub fn part_user(&self, nick: &str, channel: &str, reason: Option<&str>) {
+        match reason {
+            Some(r) => self.send_line(&format!(
+                ":{nick}!~{nick}@test.host PART {channel} :{r}\r\n"
+            )),
+            None => self.send_line(&format!(":{nick}!~{nick}@test.host PART {channel}\r\n")),
+        }
+    }
+
+    /// Convenience helper: injects `:<old_nick>!~<old_nick>@test.host NICK <new_nick>\r\n`.
+    pub fn rename_user(&self, old_nick: &str, new_nick: &str) {
+        self.send_line(&format!(
+            ":{old_nick}!~{old_nick}@test.host NICK {new_nick}\r\n"
         ));
     }
 
@@ -168,13 +212,69 @@ impl TestServer {
         }
     }
 
-    /// Awaits an in-band barrier confirming the pump has processed every line injected prior to this call.
+    /// Yields enough cooperative scheduler turns for woken tasks and `OutboundSink` to flush
+    /// ready outbound commands without requiring an inbound wire line.
+    pub async fn flush(&self) {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Awaits an in-band barrier confirming the pump has processed every line injected prior to
+    /// this call, then flushes ready task reactions and `OutboundSink` writes.
     pub async fn settle(&self) {
         let (tx, rx) = oneshot::channel();
         if self.inbound_tx.send(PumpInput::Settle(tx)).is_ok() {
             let _ = rx.await;
         }
-        tokio::task::yield_now().await;
+        self.flush().await;
+    }
+
+    /// Waits for an outbound `JOIN` whose channel starts with `prefix` (must explicitly start with
+    /// `'#'` or `'&'`, e.g. `"#vault"` or `"##lobby-vault"`), preserves all other outbound commands
+    /// in `recv_sent` order, completes `JOIN` + `NAMES` with `names`, settles the pump/outbound
+    /// tasks, and returns the joined channel name.
+    pub async fn accept_breakout(&mut self, prefix: &str, names: &[&str]) -> String {
+        assert!(
+            prefix.starts_with(['#', '&']),
+            "TestServer::accept_breakout prefix {prefix:?} must start with '#' or '&'"
+        );
+        let expected_prefix = prefix;
+
+        let ch = loop {
+            while let Ok(cmd) = self.outbound_rx.try_recv() {
+                self.pending_cmds.push_back(cmd);
+            }
+            let (_, cm) = self.current_nick_and_casemap();
+            if let Some(idx) = self.pending_cmds.iter().position(|cmd| {
+                matches!(
+                    cmd,
+                    Command::JOIN(chan, _, _)
+                        if chan.len() >= expected_prefix.len()
+                            && chan.is_char_boundary(expected_prefix.len())
+                            && cm.str_eq(&chan[..expected_prefix.len()], expected_prefix)
+                )
+            }) {
+                let Some(Command::JOIN(chan, _, _)) = self.pending_cmds.remove(idx) else {
+                    unreachable!()
+                };
+                break chan;
+            }
+
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound_rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("TestServer::accept_breakout timed out waiting for JOIN {expected_prefix}*")
+                })
+                .unwrap_or_else(|| {
+                    panic!("TestServer::accept_breakout saw outbound channel close before JOIN {expected_prefix}*")
+                });
+            self.pending_cmds.push_back(next);
+        };
+
+        self.complete_join(&ch, names);
+        self.settle().await;
+        ch
     }
 
     /// Simulates socket EOF / server disconnect (`Error::Disconnected(DisconnectReason::Eof)`).

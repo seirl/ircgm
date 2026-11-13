@@ -59,23 +59,23 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(chan.names_synced);
     assert_eq!(chan.members.len(), 4);
 
-    let alice = &chan.members[&ws.casemap.fold("Alice")];
+    let alice = chan.member_by_nick("Alice", ws.casemap).unwrap();
     assert_eq!(alice.prefixes, vec!['@', '+']);
     assert!(ws.occupant_is_op(alice));
     assert!(ws.occupant_is_voiced(alice));
 
-    let carol = &chan.members[&ws.casemap.fold("Carol")];
+    let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
     assert!(!ws.occupant_is_op(carol));
 
     let mode_msg = parse_msg(":Bot!~bot@initial.host MODE #c +klo secret 50 Carol -v Bob\r\n");
     ws.apply_mode_message(&mode_msg);
 
     let chan = &ws.channels[&ws.casemap.fold("#c")];
-    let carol = &chan.members[&ws.casemap.fold("Carol")];
+    let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
     assert!(ws.occupant_is_op(carol));
     assert_eq!(carol.prefixes, vec!['@']);
 
-    let bob = &chan.members[&ws.casemap.fold("Bob")];
+    let bob = chan.member_by_nick("Bob", ws.casemap).unwrap();
     assert!(!ws.occupant_is_voiced(bob));
     assert!(bob.prefixes.is_empty());
 
@@ -85,7 +85,9 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     }
     let custom_mode = parse_msg(":Bot!~bot@initial.host MODE #c +fo 5:2 Bob\r\n");
     ws.apply_mode_message(&custom_mode);
-    let bob = &ws.channels[&ws.casemap.fold("#c")].members[&ws.casemap.fold("Bob")];
+    let bob = ws.channels[&ws.casemap.fold("#c")]
+        .member_by_nick("Bob", ws.casemap)
+        .unwrap();
     assert!(ws.occupant_is_op(bob));
 }
 
@@ -110,7 +112,7 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
     let bt = users.get_or_create("Bot");
     let at = users.get_or_create("[Alice]");
     ws.handle_join("#[Room]", "Bot", bt.clone(), None);
-    ws.handle_join("#[Room]", "[Alice]", at, None);
+    ws.handle_join("#[Room]", "[Alice]", at.clone(), None);
     ws.handle_topic("#[Room]", Some("Welcome!".into()));
     assert_eq!(
         ws.channels[&ws.casemap.fold("#{room}")].topic.as_deref(),
@@ -122,16 +124,80 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
     let iso = parse_msg(":srv 005 Bot CASEMAPPING=ascii :are supported\r\n");
     if let Command::Response(Response::RPL_ISUPPORT, args) = &iso.command {
         assert_eq!(ws.apply_isupport(args), Some(CaseMap::Ascii));
+        users.rekey_casemap(CaseMap::Ascii);
     }
     assert!(ws.channels.contains_key(&CaseMap::Ascii.fold("#[room]")));
     assert!(!ws.channels.contains_key(&CaseMap::Ascii.fold("#{room}")));
     let ch = &ws.channels[&CaseMap::Ascii.fold("#[room]")];
-    assert!(ch.members.contains_key(&CaseMap::Ascii.fold("[alice]")));
+    assert!(ch.members.contains_key(&at.id));
+    assert!(ch.member_by_nick("[alice]", CaseMap::Ascii).is_some());
+    assert!(ch.member_by_nick("{alice}", CaseMap::Ascii).is_none());
 
     // Self-leave records `lost_channels`:
-    assert!(ws.handle_part_or_kick("#[Room]", "Bot", Some("kicked".into())));
+    assert!(ws.handle_part_or_kick("#[Room]", "Bot", bt.id, Some("kicked".into())));
     assert!(ws.lost_channels.contains_key(&CaseMap::Ascii.fold("#[room]")));
     // Rejoin clears `lost_channels`:
     ws.handle_join("#[Room]", "Bot", bt, None);
     assert!(!ws.lost_channels.contains_key(&CaseMap::Ascii.fold("#[room]")));
+}
+
+#[test]
+fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
+    let users = UserRegistry::default();
+    let mut ws = WorldState::new("Bot");
+
+    let bot_track = users.get_or_create("Bot");
+    let j = parse_msg(":Bot!~bot@h JOIN #c\r\n");
+    ws.handle_join("#c", "Bot", Arc::clone(&bot_track), j.prefix.as_ref());
+
+    // First 353 batch stages Bot (@), Alice, Bob, Carol:
+    let n1 = parse_msg(":srv 353 Bot = #c :@Bot Alice Bob Carol\r\n");
+    if let Command::Response(Response::RPL_NAMREPLY, args) = &n1.command {
+        ws.handle_namreply(args, &users);
+    }
+    let bob_track = users.get_or_create("Bob");
+    let carol_track = users.get_or_create("Carol");
+
+    // Before 366 arrives:
+    // - Alice renames to Alicia
+    // - Bot itself renames to Bot2
+    // - Bob parts #c, Carol quits IRC
+    // - Eve joins #c
+    // - Alicia receives +v
+    let alice_track = users.rename("Alice", "Alicia");
+    assert_eq!(
+        ws.handle_nick(alice_track.id, "Alice", "Alicia", None),
+        vec!["#c".to_owned()]
+    );
+    users.rename("Bot", "Bot2");
+    ws.handle_nick(bot_track.id, "Bot", "Bot2", None);
+    assert!(!ws.handle_part_or_kick("#c", "Bob", bob_track.id, None));
+    assert_eq!(ws.handle_quit(carol_track.id), vec!["#c".to_owned()]);
+    let eve_track = users.get_or_create("Eve");
+    ws.handle_join("#c", "Eve", Arc::clone(&eve_track), None);
+    let mode_msg = parse_msg(":Bot2!~bot@h MODE #c +v Alicia\r\n");
+    ws.apply_mode_message(&mode_msg);
+
+    // Commit on 366:
+    let end = parse_msg(":srv 366 Bot2 #c :End of /NAMES list.\r\n");
+    if let Command::Response(Response::RPL_ENDOFNAMES, args) = &end.command {
+        assert_eq!(ws.handle_endofnames(args).as_deref(), Some("#c"));
+    }
+
+    let chan = &ws.channels[&ws.casemap.fold("#c")];
+    assert!(chan.names_synced);
+    assert!(chan.member_by_nick("Alice", ws.casemap).is_none());
+    assert!(!chan.members.contains_key(&bob_track.id));
+    assert!(!chan.members.contains_key(&carol_track.id));
+
+    let bot_occ = &chan.members[&bot_track.id];
+    assert_eq!(bot_occ.track.nick(), "Bot2");
+    assert!(ws.occupant_is_op(bot_occ));
+
+    let alicia_occ = &chan.members[&alice_track.id];
+    assert_eq!(alicia_occ.track.nick(), "Alicia");
+    assert!(ws.occupant_is_voiced(alicia_occ));
+
+    let eve_occ = &chan.members[&eve_track.id];
+    assert_eq!(eve_occ.track.id, eve_track.id);
 }

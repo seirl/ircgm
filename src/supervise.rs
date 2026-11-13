@@ -138,6 +138,16 @@ impl<G: Future, S: Future> Until<G, S> {
             }),
         }
     }
+
+    /// Chains a `Result`-returning stop trigger (such as [`crate::Inbox::into_wait_cmd`]),
+    /// triggering stop on `Ok(val)` and parking `Pending` on `Err(_)` so a disconnecting user
+    /// never triggers a false stop.
+    pub fn or_until_ok<S2>(self, next_stop: S2) -> Until<G, OrUntil<S, OkOrPending<S2>>>
+    where
+        S2: Future<Output = Result<S::Output>>,
+    {
+        self.or_until(next_stop.ok_or_pending())
+    }
 }
 
 impl<G: Future, S: Future> Future for Until<G, S> {
@@ -331,11 +341,104 @@ where
     }
 }
 
+/// Future returned by [`GameFutureExt::map_ok`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct MapOk<F, M> {
+    fut: Pin<Box<F>>,
+    mapper: Option<M>,
+}
+
+impl<F, T, U, M> Future for MapOk<F, M>
+where
+    F: Future<Output = Result<T>>,
+    M: FnOnce(T) -> U + Unpin,
+{
+    type Output = Result<U>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        match this.fut.as_mut().poll(cx) {
+            Poll::Ready(res) => {
+                let mapper = this
+                    .mapper
+                    .take()
+                    .expect("MapOk polled after completion");
+                Poll::Ready(res.map(mapper))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future returned by [`GameFutureExt::run_for`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RunFor<F> {
+    fut: Pin<Box<F>>,
+    duration: Duration,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl<F> Future for RunFor<F>
+where
+    F: Future<Output = Result<()>>,
+{
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let sleep = this
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.duration)));
+
+        match this.fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) | Poll::Ready(Err(Error::TimedOut)) => return Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {}
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    }
+}
+
+/// Future returned by [`GameFutureExt::run_until_deadline`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RunUntilDeadline<F> {
+    fut: Pin<Box<F>>,
+    deadline: Instant,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl<F> Future for RunUntilDeadline<F>
+where
+    F: Future<Output = Result<()>>,
+{
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let sleep = this
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(this.deadline)));
+
+        match this.fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) | Poll::Ready(Err(Error::TimedOut)) => return Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {}
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    }
+}
+
 /// Supervision and pure result-mapping combinators for game futures.
 ///
 /// Named `GameFutureExt` so importing it never collides with `futures::FutureExt`.
-/// All timeout and result-mapping combinators (`with_timeout`, `with_deadline`, `optional`,
-/// `settled`) are **pure wrappers** that never alter `Ask` messaging.
+/// All timeout and result-mapping combinators (`with_timeout`, `with_deadline`, `run_for`,
+/// `run_until_deadline`, `optional`, `settled`) are **pure wrappers** that never alter `Ask` messaging.
 pub trait GameFutureExt: Future + Sized {
     /// Races `self` against `stop` using `biased` selection (`stop` wins ties); chain
     /// `.or_until(...)` on the returned [`Until`] to attach arbitrarily many stop triggers.
@@ -346,10 +449,33 @@ pub trait GameFutureExt: Future + Sized {
         }
     }
 
+    /// Races `self` against a `Result`-returning stop trigger (such as
+    /// [`crate::Inbox::into_wait_cmd`]), stopping on `Ok(val)` and parking `Pending` on `Err(_)`
+    /// so a disconnecting user never triggers a false stop.
+    fn until_ok<S, U>(self, stop: S) -> Until<Self, OkOrPending<S>>
+    where
+        S: Future<Output = Result<U>>,
+    {
+        self.until(stop.ok_or_pending())
+    }
+
     /// Lightweight output mapper (`Future<Output = A> -> Future<Output = U>`), handy for tagging
     /// heterogeneous stop futures into a flat stop enum.
     fn map_output<U, F: FnOnce(Self::Output) -> U + Unpin>(self, f: F) -> MapOutput<Self, F> {
         MapOutput {
+            fut: Box::pin(self),
+            mapper: Some(f),
+        }
+    }
+
+    /// Maps the `Ok(T)` value of a `Future<Output = Result<T>>` to `Result<U>` without needing
+    /// an extra `.await.map(...)` step (ideal with [`GameFutureExt::until_ok`] / [`Until::or_until_ok`]).
+    fn map_ok<T, U, F>(self, f: F) -> MapOk<Self, F>
+    where
+        Self: Future<Output = Result<T>>,
+        F: FnOnce(T) -> U + Unpin,
+    {
+        MapOk {
             fut: Box::pin(self),
             mapper: Some(f),
         }
@@ -385,6 +511,33 @@ pub trait GameFutureExt: Future + Sized {
         Self: Future<Output = Result<T>>,
     {
         WithDeadline {
+            fut: Box::pin(self),
+            deadline,
+            sleep: None,
+        }
+    }
+
+    /// Runs a `Result<()>` collection/phase loop for at most `duration`, returning `Ok(())` both
+    /// on early `Ok(())` completion and when `duration` elapses (while still propagating fatal
+    /// `Err`s). Fixing `Output = Result<()>` lets diverging `loop { ... }` blocks compile with
+    /// zero `Infallible` or turbofish annotations.
+    fn run_for(self, duration: Duration) -> RunFor<Self>
+    where
+        Self: Future<Output = Result<()>>,
+    {
+        RunFor {
+            fut: Box::pin(self),
+            duration,
+            sleep: None,
+        }
+    }
+
+    /// Absolute-deadline counterpart to [`GameFutureExt::run_for`].
+    fn run_until_deadline(self, deadline: Instant) -> RunUntilDeadline<Self>
+    where
+        Self: Future<Output = Result<()>>,
+    {
+        RunUntilDeadline {
             fut: Box::pin(self),
             deadline,
             sleep: None,

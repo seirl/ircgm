@@ -154,3 +154,59 @@ async fn optional_and_settled_mappings() {
     let res_lag = async { Err::<u32, Error>(err_lag) }.settled().await;
     assert!(matches!(res_lag, Err(Error::Lagged { skipped: 5, .. })));
 }
+
+#[tokio::test(start_paused = true)]
+async fn run_for_and_run_until_deadline_infer_diverging_and_early_exit_loops() {
+    // 1. Diverging `loop { ... }` compiles with zero `Infallible` or `Ok::<_, Error>` annotations!
+    let mut ticks = 0usize;
+    async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            ticks += 1;
+        }
+    }
+    .run_for(Duration::from_secs(10))
+    .await
+    .unwrap();
+    assert_eq!(ticks, 3);
+
+    // 2. Early-exiting block infers plain `Ok(())` without turbofish:
+    let deadline = Instant::now() + Duration::from_secs(20);
+    async {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        Ok(())
+    }
+    .run_until_deadline(deadline)
+    .await
+    .unwrap();
+    assert!(Instant::now() < deadline);
+
+    // 3. Fatal errors still propagate instead of being swallowed:
+    let fatal = async { Err(Error::Disconnected(DisconnectReason::Eof)) }
+        .run_for(Duration::from_secs(5))
+        .await;
+    assert!(matches!(
+        fatal,
+        Err(Error::Disconnected(DisconnectReason::Eof))
+    ));
+}
+
+#[tokio::test]
+async fn until_ok_or_until_ok_and_map_ok_ignore_err_and_trigger_on_ok() {
+    let failing = async {
+        Err::<&str, Error>(Error::UserLeft {
+            nick: "Alice".into(),
+            reason: None,
+        })
+    };
+    let succeeding = async { Ok::<u32, Error>(7) }.map_ok(|n| if n == 7 { "stopped" } else { "?" });
+
+    let out = (async {
+        tokio::task::yield_now().await;
+        "completed"
+    })
+    .until_ok(failing)
+    .or_until_ok(succeeding)
+    .await;
+    assert_eq!(out, Outcome::Stopped("stopped"));
+}

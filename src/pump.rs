@@ -341,7 +341,7 @@ fn handle_privmsg(
 
     if is_self {
         if let Some(ref raw_acct) = tags.raw_account {
-            core.users.update_account(nick, raw_acct, false);
+            core.users.update_account(nick, raw_acct);
         }
         let wire = Arc::new(WireEvent {
             seq,
@@ -356,7 +356,7 @@ fn handle_privmsg(
     if is_chan && !chan_in_ws && !core.inboxes.has_interest_in_channel(&cm.fold(target)) {
         // Early unwatched-channel skip: zero `UserTrack` / `ChatMessage` allocations!
         if let Some(ref raw_acct) = tags.raw_account {
-            core.users.update_account(nick, raw_acct, false);
+            core.users.update_account(nick, raw_acct);
         }
         return;
     }
@@ -449,7 +449,7 @@ fn handle_notice(
     if is_chan && !chan_in_ws && !core.inboxes.has_interest_in_channel(&cm.fold(target)) {
         if let Some(Prefix::Nickname(nick, _, _)) = &msg.prefix {
             if let Some(ref raw_acct) = tags.raw_account {
-                core.users.update_account(nick, raw_acct, false);
+                core.users.update_account(nick, raw_acct);
             }
         }
         return;
@@ -570,7 +570,7 @@ fn handle_part(
     let (cm, self_left) = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(msg.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, nick, reason.clone());
+        let left = ws.handle_part_or_kick(channel, nick, track.id, reason.clone());
         (ws.casemap, left)
     };
 
@@ -614,7 +614,7 @@ fn handle_kick(
     let (cm, self_left) = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(msg.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, target_nick, reason.clone());
+        let left = ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone());
         (ws.casemap, left)
     };
 
@@ -660,7 +660,7 @@ fn handle_quit(
 
     let (cm, channels) = {
         let mut ws = core.state.write().unwrap();
-        let chans = ws.handle_quit(nick);
+        let chans = ws.handle_quit(ensured_track.id);
         (ws.casemap, chans)
     };
 
@@ -701,7 +701,7 @@ fn handle_nick(
 
     let (cm, channels) = {
         let mut ws = core.state.write().unwrap();
-        let chans = ws.handle_nick(old_nick, new_nick, msg.prefix.as_ref());
+        let chans = ws.handle_nick(track.id, old_nick, new_nick, msg.prefix.as_ref());
         (ws.casemap, chans)
     };
 
@@ -722,11 +722,8 @@ fn handle_account(core: &Arc<BotCore>, msg: &Message, acct: &str, seq: u64) {
     let Some(Prefix::Nickname(nick, _, _)) = &msg.prefix else {
         return;
     };
-    let (cm, in_any_channel) = {
-        let ws = core.state.read().unwrap();
-        (ws.casemap, !ws.channels_for_nick(nick).is_empty())
-    };
-    core.users.update_account(nick, acct, in_any_channel);
+    core.users.update_account(nick, acct);
+    let cm = core.casemap();
 
     let wire = Arc::new(WireEvent {
         seq,
@@ -874,25 +871,19 @@ fn handle_numeric(
                 .cloned()
                 .unwrap_or_else(|| format!("IRC error {code}"));
 
-            let (cm, is_chan) = {
-                let mut ws = core.state.write().unwrap();
-                let is_c = ws.is_channel_name(&target);
-                if code == 401 && !is_c {
-                    ws.handle_quit(&target);
-                }
-                (ws.casemap, is_c)
+            let is_chan = core.state.read().unwrap().is_channel_name(&target);
+            let (target_user_id, quit_track_id) = if !is_chan {
+                core.users.resolve_send_error(&target, code, seq, &message)
+            } else {
+                (None, None)
             };
 
-            let target_user_id = if !is_chan {
-                if code == 401 {
-                    core.users
-                        .mark_quit(&target, seq, Some(message.clone()), false)
-                        .map(|(t, _)| t.id)
-                } else {
-                    core.users.get_existing(&target).map(|t| t.id)
-                }
+            let cm = if let Some(qid) = quit_track_id {
+                let mut ws = core.state.write().unwrap();
+                ws.handle_quit(qid);
+                ws.casemap
             } else {
-                None
+                core.casemap()
             };
 
             let wire = Arc::new(WireEvent {

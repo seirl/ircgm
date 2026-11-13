@@ -12,7 +12,7 @@ fn hand_value_softens_aces_cleanly() {
 #[tokio::test(start_paused = true)]
 async fn blackjack_round_handles_hit_stand_timeout_dealer_settlement_and_mid_hand_part() {
     let (bot, mut server) = test_harness("GM");
-    server.complete_join("#bj", &["Alice", "Bob", "Carol"]);
+    server.complete_join("#bj", &["Alice", "Bob", "Carol", "Spectator"]);
     server.settle().await;
 
     let room = bot.room("#bj").unwrap();
@@ -33,28 +33,27 @@ async fn blackjack_round_handles_hit_stand_timeout_dealer_settlement_and_mid_han
         let room = room.clone();
         async move { run_round_with_shoe(&room, &players, shoe).await }
     });
-    tokio::task::yield_now().await;
+    server.flush().await;
 
+    // Spectator `!deal` is ignored by `room.ask_users(&players, ...)`:
+    server.chat("Spectator", "#bj", "!deal");
     server.chat("Bob", "#bj", "!deal");
     server.settle().await;
-    tokio::task::yield_now().await;
 
     // Alice hits (draws 4 -> 20), then stands:
     server.chat("Alice", "#bj", "hit");
     server.settle().await;
-    tokio::task::yield_now().await;
     server.chat("Alice", "#bj", "stand");
     server.settle().await;
-    tokio::task::yield_now().await;
 
     // Bob renames to Bobby, then times out after 30s -> auto-stands at 18:
-    server.send_line(":Bob!~Bob@test.host NICK :Bobby\r\n");
+    server.rename_user("Bob", "Bobby");
     server.settle().await;
     tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::task::yield_now().await;
+    server.flush().await;
 
     // Carol parts mid-hand -> folds cleanly:
-    server.send_line(":Carol!~Carol@test.host PART #bj :dinner\r\n");
+    server.part_user("Carol", "#bj", Some("dinner"));
     server.settle().await;
 
     game.await.unwrap().unwrap();

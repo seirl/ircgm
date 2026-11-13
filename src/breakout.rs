@@ -9,6 +9,7 @@ use irc::proto::Command;
 use irc_colors::Text;
 
 use crate::ask::AskConfig;
+use crate::casemap::CaseMap;
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
 use crate::message::WireKind;
@@ -17,31 +18,63 @@ pub use crate::room::InviteTarget;
 use crate::room::Room;
 use crate::user::{User, UserStatus, UserTrack};
 
+struct PendingInvite {
+    track: Arc<UserTrack>,
+    retries: u8,
+}
+
+impl PendingInvite {
+    /// Returns `Some(new_nick)` if this `401` bounced an outdated pre-rename nick while
+    /// `self.track` is still online under `new_nick` (and retry budget remains).
+    fn next_reinvite_nick(&mut self, bounced_target: &str, cm: CaseMap) -> Option<String> {
+        let cur_nick = self.track.nick();
+        if self.track.is_online()
+            && !cur_nick.is_empty()
+            && !cm.str_eq(&cur_nick, bounced_target)
+            && self.retries < 3
+        {
+            self.retries += 1;
+            Some(cur_nick)
+        } else {
+            None
+        }
+    }
+}
+
 /// Channel naming strategy for [`BreakoutOptions`].
 #[derive(Clone, Debug)]
 pub enum BreakoutNaming {
-    /// Generates `#<prefix>-<6 lowercase alphanumeric>` (default).
+    /// Generates `<prefix>-<6 lowercase alphanumeric>` (`prefix` must start with `'#'` or `'&'`,
+    /// e.g. `"#vault"` or `"##vault"`).
     RandomSuffix { prefix: String },
-    /// Uses the exact channel name provided.
+    /// Uses the exact channel name provided (must start with `'#'` or `'&'`).
     Exact(String),
 }
 
 impl BreakoutNaming {
-    pub(crate) fn generate_channel_name(&self) -> String {
+    pub(crate) fn generate_channel_name(&self) -> Result<String> {
         match self {
-            BreakoutNaming::Exact(exact) => exact.clone(),
+            BreakoutNaming::Exact(exact) => {
+                if !exact.starts_with(['#', '&']) {
+                    return Err(Error::InvalidInput(
+                        "exact breakout channel name must start with '#' or '&'",
+                    ));
+                }
+                Ok(exact.clone())
+            }
             BreakoutNaming::RandomSuffix { prefix } => {
+                if !prefix.starts_with(['#', '&']) {
+                    return Err(Error::InvalidInput(
+                        "breakout prefix must explicitly start with '#' or '&'",
+                    ));
+                }
                 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
                 let mut suffix = String::with_capacity(6);
                 for _ in 0..6 {
                     let idx = fastrand::usize(..ALPHABET.len());
                     suffix.push(ALPHABET[idx] as char);
                 }
-                if prefix.starts_with(['#', '&']) {
-                    format!("{prefix}-{suffix}")
-                } else {
-                    format!("#{prefix}-{suffix}")
-                }
+                Ok(format!("{prefix}-{suffix}"))
             }
         }
     }
@@ -172,8 +205,8 @@ impl Breakout {
                 let mut targets: Vec<String> = chan
                     .members
                     .values()
-                    .filter(|occ| !cm.str_eq(&occ.nick, &ws.current_nick))
-                    .map(|occ| occ.nick.clone())
+                    .map(|occ| occ.track.nick())
+                    .filter(|nick| !cm.str_eq(nick, &ws.current_nick))
                     .collect();
                 targets.sort();
 
@@ -226,58 +259,47 @@ impl Breakout {
         self.room.ensure_bot_in_room_if_tracked()?;
         let core = self.room.core();
 
-        enum PendingTarget {
-            Tracked(Arc<UserTrack>),
-            Nick(String),
-        }
-
-        let mut resolved: Vec<(String, Option<Arc<UserTrack>>)> = Vec::new();
+        let mut tracked_users: Vec<Arc<UserTrack>> = Vec::new();
         for t in targets {
-            resolved.push(crate::room::resolve_invite_target(t, core)?);
+            let (nick, track_opt) = crate::room::resolve_invite_target(t, core)?;
+            let track = track_opt.unwrap_or_else(|| core.users.get_or_create(&nick));
+            if !tracked_users.iter().any(|existing| existing.id == track.id) {
+                tracked_users.push(track);
+            }
         }
-        if resolved.is_empty() {
+        if tracked_users.is_empty() {
             return Ok(());
         }
 
-        let tracked_users: Vec<Arc<UserTrack>> = resolved
-            .iter()
-            .filter_map(|(_, tr)| tr.clone())
-            .collect();
         let cm = core.casemap();
         let mut inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
                 rooms: vec![self.room.name().to_owned()],
-                dm_users: tracked_users,
+                dm_users: tracked_users.clone(),
             },
             Location::caller(),
             cm,
         );
 
-        let mut pending: Vec<PendingTarget> = Vec::new();
+        let mut pending: Vec<PendingInvite> = Vec::new();
         let mut invite_cmds: Vec<Command> = Vec::new();
-        for (nick, track_opt) in resolved {
-            match track_opt {
-                Some(track) => {
-                    let already_in = {
-                        let ws = core.state.read().unwrap();
-                        let ckey = ws.casemap.fold(self.room.name());
-                        ws.channels.get(&ckey).is_some_and(|c| {
-                            c.members.values().any(|o| o.track.id == track.id)
-                        })
-                    };
-                    if !already_in && !pending.iter().any(|p| matches!(p, PendingTarget::Tracked(t) if t.id == track.id)) {
-                        invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
-                        pending.push(PendingTarget::Tracked(track));
-                    }
-                }
-                None => {
-                    if !self.room.has_nick(&nick)
-                        && !pending.iter().any(|p| matches!(p, PendingTarget::Nick(n) if cm.str_eq(n, &nick)))
-                    {
-                        invite_cmds.push(Command::INVITE(nick.clone(), self.room.name().to_owned()));
-                        pending.push(PendingTarget::Nick(nick));
-                    }
+        for track in tracked_users {
+            if let UserStatus::Quit { nick, reason, .. } = track.status() {
+                return Err(Error::UserLeft { nick, reason });
+            }
+            let already_in = {
+                let ws = core.state.read().unwrap();
+                let ckey = ws.casemap.fold(self.room.name());
+                ws.channels
+                    .get(&ckey)
+                    .is_some_and(|c| c.members.contains_key(&track.id))
+            };
+            if !already_in {
+                let nick = track.nick();
+                if !nick.is_empty() {
+                    invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
+                    pending.push(PendingInvite { track, retries: 0 });
                 }
             }
         }
@@ -307,16 +329,10 @@ impl Breakout {
             let live_cm = core.casemap();
 
             match &wire.kind {
-                WireKind::Joined {
-                    channel,
-                    user,
-                    nick,
-                    ..
-                } if live_cm.str_eq(channel, self.room.name()) => {
-                    pending.retain(|p| match p {
-                        PendingTarget::Tracked(t) => t.id != user.track_id(),
-                        PendingTarget::Nick(n) => !live_cm.str_eq(n, nick),
-                    });
+                WireKind::Joined { channel, user, .. }
+                    if live_cm.str_eq(channel, self.room.name()) =>
+                {
+                    pending.retain(|p| p.track.id != user.track_id());
                     if pending.is_empty() {
                         return Ok(());
                     }
@@ -324,11 +340,7 @@ impl Breakout {
                 WireKind::Quit {
                     user, nick, reason, ..
                 } => {
-                    let matched = pending.iter().any(|p| match p {
-                        PendingTarget::Tracked(t) => t.id == user.track_id(),
-                        PendingTarget::Nick(n) => live_cm.str_eq(n, nick),
-                    });
-                    if matched {
+                    if pending.iter().any(|p| p.track.id == user.track_id()) {
                         return Err(Error::UserLeft {
                             nick: nick.clone(),
                             reason: reason.clone(),
@@ -337,21 +349,23 @@ impl Breakout {
                 }
                 WireKind::SendError {
                     target,
-                    target_user_id,
+                    target_user_id: Some(uid),
                     code: 401,
                     message,
                 } => {
-                    let matched = pending.iter().any(|p| match p {
-                        PendingTarget::Tracked(t) => {
-                            Some(t.id) == *target_user_id || live_cm.str_eq(&t.nick(), target)
+                    if let Some(p) = pending.iter_mut().find(|p| p.track.id == *uid) {
+                        if let Some(new_nick) = p.next_reinvite_nick(target, live_cm) {
+                            let _ = core.outbound.enqueue_one(
+                                Priority::Interactive,
+                                Command::INVITE(new_nick, self.room.name().to_owned()),
+                                live_cm,
+                            );
+                        } else {
+                            return Err(Error::UserLeft {
+                                nick: target.clone(),
+                                reason: Some(message.clone()),
+                            });
                         }
-                        PendingTarget::Nick(n) => live_cm.str_eq(n, target),
-                    });
-                    if matched {
-                        return Err(Error::UserLeft {
-                            nick: target.clone(),
-                            reason: Some(message.clone()),
-                        });
                     }
                 }
                 WireKind::BotLeftRoom { channel, reason }
@@ -367,10 +381,8 @@ impl Breakout {
 
             // Also double-check tracked statuses in case a `Quit` updated `UserTrack` directly:
             for p in &pending {
-                if let PendingTarget::Tracked(t) = p {
-                    if let UserStatus::Quit { nick, reason, .. } = t.status() {
-                        return Err(Error::UserLeft { nick, reason });
-                    }
+                if let UserStatus::Quit { nick, reason, .. } = p.track.status() {
+                    return Err(Error::UserLeft { nick, reason });
                 }
             }
         }
@@ -417,6 +429,7 @@ impl Breakout {
 
         let mut joined_ids: HashSet<u64> = HashSet::new();
         let mut gone_ids: HashSet<u64> = HashSet::new();
+        let mut pending: Vec<PendingInvite> = Vec::new();
         let mut invite_cmds: Vec<Command> = Vec::new();
 
         for u in &online_users {
@@ -426,6 +439,10 @@ impl Breakout {
                 let nick = u.nick();
                 if !nick.is_empty() {
                     invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
+                    pending.push(PendingInvite {
+                        track: u.track_arc(),
+                        retries: 0,
+                    });
                 }
             } else {
                 gone_ids.insert(u.track_id());
@@ -481,12 +498,23 @@ impl Breakout {
                             gone_ids.insert(user.track_id());
                         }
                         WireKind::SendError {
+                            target,
                             target_user_id: Some(uid),
                             code: 401,
                             ..
                         } => {
-                            if seen_ids.contains(uid) && !joined_ids.contains(uid) {
-                                gone_ids.insert(*uid);
+                            if let Some(p) = pending.iter_mut().find(|p| p.track.id == *uid) {
+                                if !joined_ids.contains(&p.track.id) {
+                                    if let Some(new_nick) = p.next_reinvite_nick(target, live_cm) {
+                                        let _ = core.outbound.enqueue_one(
+                                            Priority::Interactive,
+                                            Command::INVITE(new_nick, self.room.name().to_owned()),
+                                            live_cm,
+                                        );
+                                    } else {
+                                        gone_ids.insert(p.track.id);
+                                    }
+                                }
                             }
                         }
                         WireKind::BotLeftRoom { channel, reason }

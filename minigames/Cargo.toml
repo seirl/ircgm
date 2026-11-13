@@ -14,3 +14,5 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 [dev-dependencies]
 irc = { version = "1.1", default-features = false }
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

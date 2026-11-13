@@ -6,21 +6,12 @@ use ircgm::testing::{test_harness, TestServer};
 use super::{run_heist, HeistOutcome, Wire};
 
 async fn accept_vault_and_join_crew(srv: &mut TestServer, crew: &[&str]) -> String {
-    let vault = loop {
-        if let Some(Command::JOIN(chan, _, _)) = srv.recv_sent().await {
-            if chan.starts_with("#vault-") {
-                srv.complete_join(&chan, &[]);
-                break chan;
-            }
-        }
-    };
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
+    let vault = srv.accept_breakout("#lobby-vault", &[]).await;
+    assert!(vault.starts_with("#lobby-vault-"));
     for nick in crew {
-        srv.send_line(&format!(":{nick}!~{nick}@test.host JOIN {vault}\r\n"));
+        srv.join_user(nick, &vault);
     }
+    srv.settle().await;
     vault
 }
 
@@ -43,10 +34,6 @@ async fn hacker_breach_cool_nitrogen_and_synced_keys_succeed_and_teardown_vault(
     });
 
     let vault = accept_vault_and_join_crew(&mut srv, &["Alice", "Bob"]).await;
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Hacker (`Alice`) gets a reject hint on wrong hex, then solves `42` + `override`:
     srv.dm("Alice", "99");
@@ -60,9 +47,6 @@ async fn hacker_breach_cool_nitrogen_and_synced_keys_succeed_and_teardown_vault(
     srv.settle().await;
     srv.dm("Alice", "override");
     srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Phase 2: Bob sprays `!cool` (`0.5x` -> 40s real wall time!), so crew survives past 25s!
     srv.chat("Bob", &vault, "!cool");
@@ -106,27 +90,17 @@ async fn safecracker_breach_and_wrong_wire_doubles_alarm_rate_to_catch_crew() {
     });
 
     let vault = accept_vault_and_join_crew(&mut srv, &["Alice", "Bob"]).await;
-    srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     // Safecracker (`Bob`) picks all 3 pins in `#vault`:
     for cmd in ["!tension", "!rake", "!set"] {
         srv.chat("Bob", &vault, cmd);
         srv.settle().await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
     }
 
     // 4s virtual pass (16s virtual left), then Alice cuts the wrong wire (`red`) -> 2.0x rate (8s real left)!
     tokio::time::advance(Duration::from_secs(4)).await;
     srv.chat("Alice", &vault, "!cut red");
     srv.settle().await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
 
     tokio::time::advance(Duration::from_secs(7)).await;
     assert!(!game.is_finished());

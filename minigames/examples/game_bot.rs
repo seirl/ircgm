@@ -43,19 +43,17 @@ async fn game_lobby_loop(bot: &Bot, lobby: &Room) -> Result<()> {
         let admin_stop = bot
             .inbox_all()
             .into_wait_for(|m| is_admin(m) && m.is_cmd("!stop") && (m.is_dm() || m.is_in(lobby)))
-            .ok_or_pending()
-            .map_output(|m| StopReason::Admin(Box::new(m)));
+            .map_ok(|m| StopReason::Admin(Box::new(m)));
 
         let starter_abort = starter
             .inbox()
             .into_wait_cmd("!abort")
-            .ok_or_pending()
-            .map_output(|_| StopReason::StarterAbort);
+            .map_ok(|_| StopReason::StarterAbort);
 
         match play_by_name(slug, bot, lobby)
             .until(bot.shutdown_requested().map_output(|()| StopReason::Shutdown))
-            .or_until(admin_stop)
-            .or_until(starter_abort)
+            .or_until_ok(admin_stop)
+            .or_until_ok(starter_abort)
             .await
         {
             Outcome::Completed(Ok(true)) => {}

@@ -80,8 +80,8 @@ pub mod fmt {
 
 pub mod future {
     pub use crate::supervise::{
-        MapOutput, OkOrPending, Optional, OrUntil, RaceAll, Settled, Until, WithDeadline,
-        WithTimeout,
+        MapOk, MapOutput, OkOrPending, Optional, OrUntil, RaceAll, RunFor, RunUntilDeadline,
+        Settled, Until, WithDeadline, WithTimeout,
     };
 }
 

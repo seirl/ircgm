@@ -169,7 +169,7 @@ pub async fn run_mafia_round(
     let townsfolk: Vec<User> = guards.iter().chain(villagers.iter()).cloned().collect();
     let mut alive: Vec<User> = wolves.iter().chain(townsfolk.iter()).cloned().collect();
     let mut dead: Vec<User> = Vec::new();
-    let graveyard = bot.breakout("graveyard").await?;
+    let graveyard = bot.breakout(&crate::breakout_slug(room, "graveyard")).await?;
 
     if room.bot_is_op() {
         start_mafia_night(room, &alive, &dead, 1)?;
