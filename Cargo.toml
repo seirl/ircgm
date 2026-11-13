@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "minigames"]
+default-members = [".", "minigames"]
+
 [package]
 name = "ircgm"
 version = "0.1.0"

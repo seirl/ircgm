@@ -1,0 +1,481 @@
+use std::time::Duration;
+
+use futures::future::try_join_all;
+use irc::proto::Command;
+use ircgm::prelude::*;
+use ircgm::testing::{test_harness, test_harness_with};
+use ircgm::DisconnectReason;
+
+#[tokio::test(start_paused = true)]
+async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#lobby", &["Alice"]);
+    server.settle().await;
+
+    let alice = bot.user("Alice").unwrap();
+
+    let base_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(20))
+        .warn_remaining(Duration::from_secs(10), "10s inherited warn")
+        .ignore_commands()
+        .timeout_message("Time expired!");
+
+    let alice_c = alice.clone();
+    let cfg_c = base_cfg.clone();
+    let ask_task = tokio::spawn(async move {
+        alice_c
+            .ask("Pick 1..=3:", |m| match m.text.trim().parse::<u8>() {
+                Ok(n @ 1..=3) => Verdict::Accept(n),
+                _ => Verdict::reject("Invalid! Pick 1, 2, or 3."),
+            })
+            .config(&cfg_c)
+            .clear_warnings()
+            .warn_remaining(Duration::from_secs(5), "5s left!")
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["Pick 1..=3:"]);
+
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+    assert!(server.take_messages_to("Alice").is_empty());
+
+    server.dm("Alice", "!help");
+    server.dm("Alice", "99");
+    server.settle().await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        server.take_messages_to("Alice"),
+        vec!["Invalid! Pick 1, 2, or 3."]
+    );
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["5s left!"]);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let err = ask_task.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::TimedOut));
+    assert_eq!(server.take_messages_to("Alice"), vec!["Time expired!"]);
+
+    let alice_c2 = alice.clone();
+    let opt_task = tokio::spawn(async move {
+        alice_c2
+            .ask("yes or no?", |m| match m.text.trim() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            })
+            .config(&base_cfg)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["yes or no?"]);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["10s inherited warn"]);
+    server.dm("Alice", "yes");
+    server.settle().await;
+    assert!(opt_task.await.unwrap().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_receipt_pacing_single_timer_and_combinator_table() {
+    let cfg = BotConfig {
+        outbound_burst: 2,
+        outbound_window: Duration::from_secs(8),
+        ..BotConfig::default()
+    };
+    let (bot, mut server) = test_harness_with("GM", cfg);
+    server.complete_join("#r", &["P1", "P2", "P3", "P4"]);
+    server.settle().await;
+
+    let p1 = bot.user("P1").unwrap();
+    let p2 = bot.user("P2").unwrap();
+    let p3 = bot.user("P3").unwrap();
+    let p4 = bot.user("P4").unwrap();
+
+    let spawn_ask = |u: User, label: &'static str| {
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let res = u
+                .ask(label, |m| (m.text == "ok").then_some(()))
+                .reply_timeout(Duration::from_secs(10))
+                .await;
+            (res, start.elapsed())
+        })
+    };
+
+    let t1 = spawn_ask(p1, "Prompt 1");
+    let t2 = spawn_ask(p2, "Prompt 2");
+    let t3 = spawn_ask(p3, "Prompt 3");
+    let t4 = spawn_ask(p4, "Prompt 4");
+    tokio::task::yield_now().await;
+
+    assert_eq!(server.take_messages_to("P1"), vec!["Prompt 1"]);
+    assert_eq!(server.take_messages_to("P2"), vec!["Prompt 2"]);
+    assert!(server.take_messages_to("P3").is_empty());
+    assert!(server.take_messages_to("P4").is_empty());
+
+    tokio::time::advance(Duration::from_secs(8)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("P3"), vec!["Prompt 3"]);
+    assert_eq!(server.take_messages_to("P4"), vec!["Prompt 4"]);
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    let (r1, e1) = t1.await.unwrap();
+    let (r2, e2) = t2.await.unwrap();
+    assert!(matches!(r1, Err(Error::TimedOut)));
+    assert!(matches!(r2, Err(Error::TimedOut)));
+    assert_eq!(e1, Duration::from_secs(10));
+    assert_eq!(e2, Duration::from_secs(10));
+    assert!(
+        !t3.is_finished(),
+        "Ask #3 expired prematurely before t=18s!"
+    );
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    server.dm("P4", "ok");
+    server.settle().await;
+    let (r4, e4) = t4.await.unwrap();
+    assert!(r4.is_ok());
+    assert_eq!(e4, Duration::from_secs(15));
+    assert!(!t3.is_finished());
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let (r3, e3) = t3.await.unwrap();
+    assert!(matches!(r3, Err(Error::TimedOut)));
+    assert_eq!(e3, Duration::from_secs(18));
+
+    // Single-timer override on `ExclusiveDm::ask`:
+    let (bot2, server2) = test_harness("GM");
+    server2.complete_join("#r", &["Alice"]);
+    server2.settle().await;
+    let alice = bot2.user("Alice").unwrap();
+    let mut dm = alice
+        .exclusive()
+        .await
+        .unwrap()
+        .with_ask_config(&AskConfig::new().reply_timeout(Duration::from_secs(30)));
+
+    let alice_s2 = server2;
+    let answer_later = async {
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        alice_s2.dm("Alice", "after_90s");
+        alice_s2.settle().await;
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        alice_s2.dm("Alice", "after_400s");
+        alice_s2.settle().await;
+    };
+    let asks = async {
+        let a1 = dm
+            .ask("120s prompt", |m| Some(m.text.clone()))
+            .reply_timeout(Duration::from_secs(120))
+            .await?;
+        let a2 = dm
+            .ask("unbounded prompt", |m| Some(m.text.clone()))
+            .no_reply_timeout()
+            .await?;
+        Ok::<_, Error>((a1, a2))
+    };
+    let (_, asks_res) = tokio::join!(answer_later, asks);
+    let (a1, a2) = asks_res.unwrap();
+    assert_eq!(a1, "after_90s");
+    assert_eq!(a2, "after_400s");
+    drop(dm);
+
+    // Combinator table: `optional()`, `settled()`, and `with_timeout()`
+    let (bot3, mut server3) = test_harness("GM");
+    server3.complete_join("#tab", &["Alice"]);
+    server3.settle().await;
+    let room_msg = bot3.room("#tab").unwrap().with_ask_config(
+        &AskConfig::new()
+            .reply_timeout(Duration::from_secs(10))
+            .timeout_message("Timeout fired!"),
+    );
+    let room_silent = bot3.room("#tab").unwrap().with_ask_config(
+        &AskConfig::new()
+            .reply_timeout(Duration::from_secs(10))
+            .no_timeout_message(),
+    );
+
+    let r = room_msg
+        .ask("Q1", |_| Option::<()>::None)
+        .optional()
+        .await
+        .unwrap();
+    assert_eq!(r, None);
+    assert_eq!(
+        server3.take_messages_to("#tab"),
+        vec!["Q1", "Timeout fired!"]
+    );
+
+    let r = room_msg
+        .ask("Q2", |_| Option::<()>::None)
+        .settled()
+        .await
+        .unwrap();
+    assert_eq!(r, Turn::TimedOut);
+    assert_eq!(
+        server3.take_messages_to("#tab"),
+        vec!["Q2", "Timeout fired!"]
+    );
+
+    let r = room_msg
+        .ask("Q3", |_| Option::<()>::None)
+        .no_timeout_message()
+        .optional()
+        .await
+        .unwrap();
+    assert_eq!(r, None);
+    assert_eq!(server3.take_messages_to("#tab"), vec!["Q3"]);
+
+    let r = room_msg
+        .ask("Q4", |_| Option::<()>::None)
+        .with_timeout(Duration::from_secs(3))
+        .optional()
+        .await
+        .unwrap();
+    assert_eq!(r, None);
+    assert_eq!(server3.take_messages_to("#tab"), vec!["Q4"]);
+
+    let r = room_silent
+        .ask("Q5", |_| Option::<()>::None)
+        .settled()
+        .await
+        .unwrap();
+    assert_eq!(r, Turn::TimedOut);
+    assert_eq!(server3.take_messages_to("#tab"), vec!["Q5"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#r", &["Alice", "Bob", "Cara"]);
+    server.settle().await;
+
+    let alice = bot.user("Alice").unwrap();
+    let cara = bot.user("Cara").unwrap();
+
+    let room = bot.room("#r").unwrap().with_ask_config(
+        &AskConfig::new()
+            .reply_timeout(Duration::from_secs(30))
+            .timeout_message_fn(|ctx| {
+                assert_eq!(ctx.configured_timeout, Some(Duration::from_secs(30)));
+                assert_eq!(ctx.target, &Target::Channel("#r".into()));
+                let u = ctx.user.expect("room.ask_user sets TimeoutCtx::user");
+                format!("{} took too long (30s)!", u.nick())
+            }),
+    );
+
+    let r_turn = room.clone();
+    let a_turn = alice.clone();
+    let turn_task = tokio::spawn(async move {
+        r_turn
+            .ask_user(&a_turn, "Alice: hit or stand?", |m| {
+                (m.text.trim() == "hit").then_some(())
+            })
+            .settled()
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(server.take_messages_to("#r"), vec!["Alice: hit or stand?"]);
+
+    server.chat("Bob", "#r", "hit");
+    server.send_line(":Alice!~Alice@test.host NICK :Alice2\r\n");
+    server.settle().await;
+    assert!(!turn_task.is_finished());
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let outcome = turn_task.await.unwrap().unwrap();
+    assert_eq!(outcome, Turn::TimedOut);
+    assert_eq!(
+        server.take_messages_to("#r"),
+        vec!["Alice2 took too long (30s)!"]
+    );
+
+    let r_part = room.clone();
+    let a_part = alice.clone();
+    let part_task = tokio::spawn(async move {
+        r_part
+            .ask_user(&a_part, "Again?", |m| Some(m.text.clone()))
+            .settled()
+            .await
+    });
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("#r");
+
+    server.send_line(":Alice2!~Alice@test.host PART #r :gotta go\r\n");
+    server.settle().await;
+    let part_out = part_task.await.unwrap().unwrap();
+    assert_eq!(
+        part_out,
+        Turn::Left {
+            nick: "Alice2".into(),
+            reason: Some("gotta go".into()),
+        }
+    );
+
+    let r_kick = room.clone();
+    let c_kick = cara.clone();
+    let kick_task = tokio::spawn(async move {
+        r_kick
+            .ask_user(&c_kick, "Cara?", |m| Some(m.text.clone()))
+            .settled()
+            .await
+    });
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("#r");
+
+    server.send_line(":Op!~op@test.host KICK #r Cara :removed\r\n");
+    server.settle().await;
+    let kick_out = kick_task.await.unwrap().unwrap();
+    assert_eq!(
+        kick_out,
+        Turn::Left {
+            nick: "Cara".into(),
+            reason: Some("removed".into()),
+        }
+    );
+}
+
+#[tokio::test]
+async fn settled_unreachable_pm_block_and_fatal_disconnect_propagation() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#game", &["P1", "P2", "P3"]);
+    server.settle().await;
+
+    let p1 = bot.user("P1").unwrap();
+    let p2 = bot.user("P2").unwrap();
+    let p3 = bot.user("P3").unwrap();
+
+    let players = vec![p1.clone(), p2.clone(), p3.clone()];
+    let all_turns = tokio::spawn(async move {
+        try_join_all(players.into_iter().map(|p| async move {
+            let t = p
+                .ask("Secret prompt!", |m| Some(m.text.clone()))
+                .settled()
+                .await?;
+            Ok::<_, Error>((p.nick(), t))
+        }))
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("P1");
+    let _ = server.take_messages_to("P2");
+    let _ = server.take_messages_to("P3");
+
+    server.dm("P1", "my quip");
+    server.send_line(":irc.srv 486 GM P2 :You must log in with services to message this user\r\n");
+    server.send_line(":irc.srv 716 GM P3 :is in +g mode (server-side ignore)\r\n");
+    server.settle().await;
+
+    let results = all_turns.await.unwrap().unwrap();
+    assert_eq!(results[0], ("P1".into(), Turn::Reply("my quip".into())));
+    assert!(matches!(
+        results[1].1,
+        Turn::Unreachable { ref target, code: 486, .. } if target == "P2"
+    ));
+    assert!(matches!(
+        results[2].1,
+        Turn::Unreachable { ref target, code: 716, .. } if target == "P3"
+    ));
+
+    let p1_disc = p1.clone();
+    let disc_task = tokio::spawn(async move {
+        p1_disc
+            .ask("Still connected?", |m| Some(m.text.clone()))
+            .settled()
+            .await
+    });
+    tokio::task::yield_now().await;
+    server.disconnect();
+
+    let err = disc_task.await.unwrap().unwrap_err();
+    assert!(err.is_fatal());
+    assert!(matches!(err, Error::Disconnected(DisconnectReason::Eof)));
+}
+
+#[tokio::test]
+async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#room", &["Alice"]);
+    server.complete_join("#other", &["Bob"]);
+    server.settle().await;
+
+    let room = bot.room("#room").unwrap();
+    let alice = bot.user("Alice").unwrap();
+    let bob = bot.user("Bob").unwrap();
+
+    let absent_err = room
+        .ask_user(&bob, "Bob are you here?", |_| Some(()))
+        .await
+        .unwrap_err();
+    assert!(matches!(absent_err, Error::UserLeft { ref nick, .. } if nick == "Bob"));
+    assert!(server.try_recv_sent().is_none());
+
+    let mut raw_in = room.inbox();
+    let mut cmd_in = room.inbox();
+    server.send_line(":GM!b@h PRIVMSG #room :!join\r\n");
+    server.chat("Alice", "#room", "!join");
+    server.settle().await;
+
+    let m = cmd_in.wait_cmd("!join").await.unwrap();
+    assert_eq!(m.nick, "Alice");
+    let first_raw = raw_in.next_raw().await.unwrap();
+    assert!(
+        matches!(&first_raw.command, Command::PRIVMSG(ch, txt) if ch == "#room" && txt == "!join")
+    );
+
+    let r_404 = room.clone();
+    let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).await });
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("#room");
+    server.send_line(":irc.srv 404 GM #room :Cannot send to channel (+m)\r\n");
+    server.settle().await;
+    let err_404 = ask_404.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err_404, Error::DeliveryFailed { ref target, code: 404, .. } if target == "#room")
+    );
+
+    let mut dms_events = bot.inbox_dms();
+    alice.say("Your secret role is Seer!").unwrap();
+    let _ = server.take_messages_to("Alice");
+    server.send_line(":irc.srv 716 GM Alice :is in +g mode (callerid)\r\n");
+    server.settle().await;
+
+    let ev = dms_events.next_event().await.unwrap();
+    assert!(
+        matches!(ev, Event::DeliveryFailed { ref target, code: 716, .. } if target == "Alice")
+    );
+
+    for code in [486u16, 492, 531, 716] {
+        let a = alice.clone();
+        let t = tokio::spawn(async move { a.ask("Ping?", |_| Some(())).settled().await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let _ = server.take_messages_to("Alice");
+        server.send_line(&format!(":irc.srv {code} GM Alice :blocked ({code})\r\n"));
+        server.settle().await;
+        let out = t.await.unwrap().unwrap();
+        assert!(
+            matches!(out, Turn::Unreachable { ref target, code: c, .. } if target == "Alice" && c == code),
+            "expected Unreachable({code}), got {out:?}"
+        );
+    }
+
+    let r_kick = room.clone();
+    let ask_kicked = tokio::spawn(async move { r_kick.ask("Anyone?", |_| Some(())).await });
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("#room");
+    server.send_line(":Op!~op@h KICK #room GM :bots out\r\n");
+    server.settle().await;
+    let err_left = ask_kicked.await.unwrap().unwrap_err();
+    assert!(matches!(
+        err_left,
+        Error::BotLeftRoom { ref channel, ref reason } if channel == "#room" && reason.as_deref() == Some("bots out")
+    ));
+}

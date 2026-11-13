@@ -1039,3 +1039,8 @@ impl Stream for Inbox {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "inbox_test.rs"]
+mod test;
+

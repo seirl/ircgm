@@ -271,3 +271,8 @@ impl Huddle {
         &mut self.inbox
     }
 }
+
+#[cfg(test)]
+#[path = "huddle_test.rs"]
+mod test;
+

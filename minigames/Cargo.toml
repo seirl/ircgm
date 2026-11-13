@@ -1,0 +1,16 @@
+[package]
+name = "minigames"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Playable IRC minigames built on ircgm"
+
+[dependencies]
+fastrand = "2"
+futures = "0.3"
+ircgm = { path = ".." }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+[dev-dependencies]
+irc = { version = "1.1", default-features = false }
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }

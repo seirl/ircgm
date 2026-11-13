@@ -929,3 +929,8 @@ fn dispatch_raw(
     });
     core.inboxes.dispatch(&wire, chan_hint, cm);
 }
+
+#[cfg(test)]
+#[path = "pump_test.rs"]
+mod test;
+

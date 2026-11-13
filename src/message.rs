@@ -347,3 +347,8 @@ pub(crate) fn parse_privmsg_body(body: &str) -> (MessageKind, String) {
     }
     (MessageKind::Privmsg, body.to_owned())
 }
+
+#[cfg(test)]
+#[path = "message_test.rs"]
+mod test;
+

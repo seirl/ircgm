@@ -543,3 +543,8 @@ impl Room {
             .subscribe(Arc::clone(&self.core), filter, caller, cm)
     }
 }
+
+#[cfg(test)]
+#[path = "room_test.rs"]
+mod test;
+

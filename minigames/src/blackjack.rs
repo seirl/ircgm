@@ -1,0 +1,186 @@
+//! # Channel Blackjack (1–4 Players)
+//!
+//! ## How to Play
+//! 1. Up to 4 players `!join` at the table (or a pre-selected slice is passed to [`run_round`]),
+//!    then anyone in the channel types `!deal` to cut the shoe and deal opening 2-card hands.
+//! 2. Going around the table in order, the bot asks each player in the channel to `hit` or
+//!    `stand` (`30s` per decision):
+//!    - Aces count as `11` or `1` automatically to avoid busting when possible.
+//!    - Exceeding `21` busts immediately; taking longer than `30s` auto-stands (calling out the
+//!      player's live `/nick` via [`ircgm::TimeoutCtx`]); leaving or getting kicked mid-hand folds cleanly.
+//! 3. Once all players finish, the dealer reveals its hole card, hits until `17+`, and settles
+//!    every surviving hand (`WIN`, `PUSH`, or `LOSE`).
+//!
+//! ## Library Mechanics Showcased
+//! - **Sequential channel turns ([`Room::ask_user`]):** Scopes each prompt to a specific [`User`]
+//!   inside a busy public channel while ignoring chatter from everyone else.
+//! - **Fault-isolated player turns ([`ircgm::GameFutureExt::settled`] / [`Turn`]):** Distinguishes
+//!   [`Turn::Reply`], [`Turn::TimedOut`] (auto-stand), and [`Turn::Left`] (`PART` / `KICK` / `QUIT`
+//!   mid-hand folds cleanly without aborting the table).
+//! - **Live `/nick`-aware timeout messages ([`ircgm::TimeoutCtx`]):** Renders each player's *current*
+//!   nickname if they renamed mid-turn before their `30s` clock expired.
+
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use ircgm::prelude::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    Hit,
+    Stand,
+}
+
+fn draw_card(shoe: &mut VecDeque<u8>) -> u8 {
+    shoe.pop_front().unwrap_or_else(|| {
+        const CARDS: &[u8] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11];
+        CARDS[fastrand::usize(..CARDS.len())]
+    })
+}
+
+/// Computes the best Blackjack total (`<= 21` if possible) adjusting Aces (`11 -> 1`).
+pub fn hand_value(cards: &[u8]) -> u8 {
+    let mut sum: u16 = cards.iter().map(|&c| u16::from(c)).sum();
+    let mut aces = cards.iter().filter(|&&c| c == 11).count();
+    while sum > 21 && aces > 0 {
+        sum -= 10;
+        aces -= 1;
+    }
+    sum as u8
+}
+
+/// Recruits 1–4 players via `!join` (`20s` window once the first player joins) and runs a round.
+pub async fn play(room: &Room) -> Result<()> {
+    room.say(
+        "🃏 ".bold()
+            + "Blackjack".bold().cyan()
+            + " — type "
+            + "!join".bold().green()
+            + " to take a seat (up to 4 players, 20s)!",
+    )?;
+
+    let mut inbox = room.inbox();
+    let mut players: Vec<User> = Vec::new();
+    let collect = async {
+        while players.len() < 4 {
+            let msg = inbox.wait_cmd("!join").await?;
+            if !players.iter().any(|u| u.id() == msg.sender.id()) {
+                players.push(msg.sender.clone());
+                room.say(msg.sender.nick().bold() + format!(" took seat #{}!", players.len()))?;
+            }
+        }
+        Ok::<_, Error>(())
+    };
+    let _ = collect.with_timeout(Duration::from_secs(20)).optional().await?;
+
+    if players.is_empty() {
+        room.say("Nobody sat down at the Blackjack table.".yellow())?;
+        return Ok(());
+    }
+
+    run_round(room, &players).await
+}
+
+/// Runs a Blackjack round with random draws.
+pub async fn run_round(room: &Room, players: &[User]) -> Result<()> {
+    run_round_with_shoe(room, players, VecDeque::new()).await
+}
+
+/// Runs a Blackjack round pulling from `shoe` first (falling back to random draws once empty).
+pub async fn run_round_with_shoe(
+    room: &Room,
+    players: &[User],
+    mut shoe: VecDeque<u8>,
+) -> Result<()> {
+    let room = room.with_ask_config(
+        &AskConfig::new()
+            .reply_timeout(Duration::from_secs(30))
+            .timeout_message_fn(|ctx| match ctx.user {
+                Some(u) => u.nick().bold().yellow() + ": ⏳ too slow, auto-standing!",
+                None => "⏳ Time's up!".yellow(),
+            }),
+    );
+
+    room.ask("Anyone type `!deal` to cut the deck!", |m| {
+        m.is_cmd("!deal").then_some(())
+    })
+    .await?;
+
+    let mut dealer = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
+    let mut standing_hands: Vec<(User, u8)> = Vec::new();
+
+    room.say(format!("Dealer shows [{} , ?].", dealer[0]))?;
+
+    for player in players {
+        let mut cards = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
+        loop {
+            let total = hand_value(&cards);
+            if total > 21 {
+                room.say(player.nick().bold().red() + format!(" BUSTS with {total}!"))?;
+                break;
+            }
+            if total == 21 {
+                room.say(player.nick().bold().green() + " hits 21!")?;
+                standing_hands.push((player.clone(), total));
+                break;
+            }
+
+            match room
+                .ask_user(
+                    player,
+                    player.nick().bold() + format!(" (total {total}): `hit` or `stand`?"),
+                    |m| match m.text.trim() {
+                        "hit" => Some(Move::Hit),
+                        "stand" => Some(Move::Stand),
+                        _ => None,
+                    },
+                )
+                .settled()
+                .await?
+            {
+                Turn::Reply(Move::Hit) => {
+                    let card = draw_card(&mut shoe);
+                    cards.push(card);
+                    room.say(
+                        player.nick().bold()
+                            + format!(" draws {card} (total {})!", hand_value(&cards)),
+                    )?;
+                }
+                Turn::Reply(Move::Stand) | Turn::TimedOut => {
+                    standing_hands.push((player.clone(), total));
+                    break;
+                }
+                Turn::Left { nick, .. } => {
+                    room.say(nick.bold() + " left the table—hand folded.")?;
+                    break;
+                }
+                Turn::Unreachable { .. } => break,
+            }
+        }
+    }
+
+    if !standing_hands.is_empty() {
+        while hand_value(&dealer) < 17 {
+            dealer.push(draw_card(&mut shoe));
+        }
+        let dealer_total = hand_value(&dealer);
+        room.say(format!("Dealer finishes with {dealer_total}."))?;
+
+        for (player, score) in standing_hands {
+            let outcome = if dealer_total > 21 || score > dealer_total {
+                "WINS!".green().bold()
+            } else if score == dealer_total {
+                "PUSH.".yellow().bold()
+            } else {
+                "loses.".red()
+            };
+            room.say(player.nick().bold() + format!(" ({score}) ") + outcome)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "blackjack_test.rs"]
+mod test;

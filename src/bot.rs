@@ -1017,3 +1017,8 @@ async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
     });
     crate::supervise::race_all(waiters).await
 }
+
+#[cfg(test)]
+#[path = "bot_test.rs"]
+mod test;
+

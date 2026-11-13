@@ -86,3 +86,8 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+#[path = "error_test.rs"]
+mod test;
+
