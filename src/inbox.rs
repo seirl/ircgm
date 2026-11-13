@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 
 use irc::proto::Message;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::ask::TimeLimit;
 use crate::bot::BotCore;
@@ -666,14 +667,11 @@ impl Inbox {
         }
     }
 
-    async fn next_wire_with(&mut self, limit: TimeLimit) -> Result<Arc<WireEvent>> {
+    async fn next_wire_until(&mut self, deadline: Option<Instant>) -> Result<Arc<WireEvent>> {
         let next = poll_fn(|cx| self.poll_next_wire(cx));
-        match limit {
-            TimeLimit::None => next.await,
-            TimeLimit::Duration(dur) => tokio::time::timeout(dur, next)
-                .await
-                .map_err(|_| Error::TimedOut)?,
-            TimeLimit::Deadline(dl) => tokio::time::timeout_at(dl, next)
+        match deadline {
+            None => next.await,
+            Some(dl) => tokio::time::timeout_at(dl, next)
                 .await
                 .map_err(|_| Error::TimedOut)?,
         }
@@ -707,8 +705,9 @@ impl Inbox {
         B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
+        let deadline = read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_with(read_limit).await?;
+            let wire = self.next_wire_until(deadline).await?;
             match &wire.kind {
                 WireKind::SendError {
                     target,
@@ -846,8 +845,9 @@ impl Inbox {
     where
         F: FnMut(&Event) -> Option<T>,
     {
+        let deadline = self.read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_with(self.read_limit).await?;
+            let wire = self.next_wire_until(deadline).await?;
             if let Some(ev) = wire.to_public_event() {
                 if let Some(val) = f(&ev) {
                     return Ok(val);
@@ -857,7 +857,8 @@ impl Inbox {
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        let wire = self.next_wire_with(self.read_limit).await?;
+        let deadline = self.read_limit.deadline_from(Instant::now());
+        let wire = self.next_wire_until(deadline).await?;
         Ok(Arc::clone(&wire.raw))
     }
 
@@ -865,8 +866,9 @@ impl Inbox {
     where
         F: FnMut(&Message) -> Option<T>,
     {
+        let deadline = self.read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_with(self.read_limit).await?;
+            let wire = self.next_wire_until(deadline).await?;
             if let Some(val) = f(&wire.raw) {
                 return Ok(val);
             }

@@ -230,6 +230,16 @@ pub(crate) enum TimeLimit {
     Deadline(Instant),
 }
 
+impl TimeLimit {
+    pub(crate) fn deadline_from(self, base: Instant) -> Option<Instant> {
+        match self {
+            Self::None => None,
+            Self::Duration(dur) => Some(crate::future::deadline_after_from(base, dur)),
+            Self::Deadline(dl) => Some(dl),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum TimeoutHandler {
     Static(Text),
@@ -699,31 +709,22 @@ fn compute_schedule(
     cfg: &AskConfig,
     write_completed_at: Instant,
 ) -> (Option<Duration>, Option<Instant>, Vec<(Instant, Text)>) {
-    match cfg.time_limit {
-        TimeLimit::None => (None, None, Vec::new()),
-        TimeLimit::Duration(dur) => {
-            let deadline = write_completed_at + dur;
-            let mut warns = Vec::new();
-            for (rem, msg) in &cfg.warnings {
-                if !rem.is_zero() && dur > *rem {
-                    warns.push((write_completed_at + (dur - *rem), msg.clone()));
-                }
-            }
-            warns.sort_by_key(|(at, _)| *at);
-            (Some(dur), Some(deadline), warns)
-        }
-        TimeLimit::Deadline(deadline) => {
-            let budget = deadline.saturating_duration_since(write_completed_at);
-            let mut warns = Vec::new();
-            for (rem, msg) in &cfg.warnings {
-                if !rem.is_zero() && budget > *rem {
-                    warns.push((deadline - *rem, msg.clone()));
-                }
-            }
-            warns.sort_by_key(|(at, _)| *at);
-            (None, Some(deadline), warns)
-        }
-    }
+    let Some(deadline) = cfg.time_limit.deadline_from(write_completed_at) else {
+        return (None, None, Vec::new());
+    };
+    let configured_timeout = match cfg.time_limit {
+        TimeLimit::Duration(dur) => Some(dur),
+        TimeLimit::None | TimeLimit::Deadline(_) => None,
+    };
+    let budget = deadline.saturating_duration_since(write_completed_at);
+    let mut warns: Vec<_> = cfg
+        .warnings
+        .iter()
+        .filter(|(rem, _)| !rem.is_zero() && budget > *rem)
+        .map(|(rem, msg)| (deadline - *rem, msg.clone()))
+        .collect();
+    warns.sort_by_key(|(at, _)| *at);
+    (configured_timeout, Some(deadline), warns)
 }
 
 async fn await_ask_loop<'a, F, R>(

@@ -318,4 +318,20 @@ async fn exclusive_dm_inbox_enforces_ask_config_read_timeout() {
         let (msg, ()) = tokio::join!(dm.inbox().next_chat(), wait_fut);
         assert_eq!(msg.unwrap().text, "back from dinner");
     }
+
+    // 3. Non-matching / ignored messages do NOT reset a `Duration` read limit inside `wait_*`:
+    {
+        let short_cfg = AskConfig::new().reply_timeout(Duration::from_secs(12));
+        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&short_cfg);
+        let start = tokio::time::Instant::now();
+        let spam = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            server.dm("BouncerUser", "unrelated chatter 1");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            server.dm("BouncerUser", "unrelated chatter 2");
+        };
+        let (res, ()) = tokio::join!(dm.inbox().wait_cmd("!confirm"), spam);
+        assert!(matches!(res, Err(Error::TimedOut)));
+        assert_eq!(start.elapsed(), Duration::from_secs(12));
+    }
 }

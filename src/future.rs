@@ -140,41 +140,39 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-enum TimerSpec {
-    Duration(Duration),
-    Deadline(Instant),
+/// Safely computes `base + duration`, saturating far in the future instead of panicking on huge
+/// durations like `Duration::MAX` (matching `tokio::time::sleep`'s far-future saturation).
+pub(crate) fn deadline_after_from(base: Instant, duration: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+    base.checked_add(duration)
+        .unwrap_or_else(|| base + FAR_FUTURE)
+}
+
+pub(crate) fn deadline_after(duration: Duration) -> Instant {
+    deadline_after_from(Instant::now(), duration)
 }
 
 struct Timed<F> {
     fut: Pin<Box<F>>,
-    spec: TimerSpec,
+    deadline: Instant,
     sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl<F: Future> Timed<F> {
-    fn new_duration(fut: F, duration: Duration) -> Self {
+    fn new(fut: F, deadline: Instant) -> Self {
         Self {
             fut: Box::pin(fut),
-            spec: TimerSpec::Duration(duration),
+            deadline,
             sleep: None,
         }
     }
 
-    fn new_deadline(fut: F, deadline: Instant) -> Self {
-        Self {
-            fut: Box::pin(fut),
-            spec: TimerSpec::Deadline(deadline),
-            sleep: None,
-        }
-    }
-
-    /// Polls `self.fut` first; if pending, polls the lazy timer (`Ok(val)` from `fut`, `Err(())` on expiry).
+    /// Polls `self.fut` first; if pending, polls the deadline timer (`Ok(val)` from `fut`, `Err(())` on expiry).
     fn poll_timed(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<F::Output, ()>> {
-        let sleep = self.sleep.get_or_insert_with(|| match self.spec {
-            TimerSpec::Duration(d) => Box::pin(tokio::time::sleep(d)),
-            TimerSpec::Deadline(dl) => Box::pin(tokio::time::sleep_until(dl)),
-        });
+        let deadline = self.deadline;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
 
         if let Poll::Ready(res) = self.fut.as_mut().poll(cx) {
             return Poll::Ready(Ok(res));
@@ -258,9 +256,7 @@ pub trait GameFutureExt: Future + Sized {
     where
         Self: Future<Output = Result<T>>,
     {
-        WithTimeout {
-            inner: Timed::new_duration(self, duration),
-        }
+        self.with_deadline(deadline_after(duration))
     }
 
     /// Outer absolute-deadline timeout: enforces a fixed phase end-time across loops.
@@ -269,7 +265,7 @@ pub trait GameFutureExt: Future + Sized {
         Self: Future<Output = Result<T>>,
     {
         WithTimeout {
-            inner: Timed::new_deadline(self, deadline),
+            inner: Timed::new(self, deadline),
         }
     }
 
@@ -282,9 +278,7 @@ pub trait GameFutureExt: Future + Sized {
     where
         Self: Future<Output = Result<()>>,
     {
-        RunFor {
-            inner: Timed::new_duration(self, duration),
-        }
+        self.run_until_deadline(deadline_after(duration))
     }
 
     /// Absolute-deadline counterpart to [`GameFutureExt::run_for`].
@@ -293,7 +287,7 @@ pub trait GameFutureExt: Future + Sized {
         Self: Future<Output = Result<()>>,
     {
         RunFor {
-            inner: Timed::new_deadline(self, deadline),
+            inner: Timed::new(self, deadline),
         }
     }
 }
