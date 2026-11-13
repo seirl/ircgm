@@ -87,13 +87,13 @@ async fn cancel_during_exclusive_dm_and_ignore_commands() {
         assert_eq!(dm.inbox().next_chat().await.unwrap().text, "!cancel");
     }
 
-    // 2. With `with_ignore_commands()`, `!cancel` cancels the flow, drops `dm`, and unblocks a queued `alice.ask`!
+    // 2. With `ignore_commands()`, `!cancel` cancels the flow, drops `dm`, and unblocks a queued `alice.ask`!
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let alice_flow = alice.clone();
     let flow_task = tokio::spawn(async move {
         let cancel_sig = alice_flow.inbox().on_cmd("!cancel");
         let body = async {
-            let mut dm = alice_flow.exclusive().await?.with_ignore_commands();
+            let mut dm = alice_flow.exclusive().await?.ignore_commands();
             let _ = ready_tx.send(());
             let first = dm.inbox().next_chat().await?.text;
             let second = dm.inbox().next_chat().await?.text;

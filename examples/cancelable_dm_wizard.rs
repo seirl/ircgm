@@ -1,7 +1,7 @@
 //! Demonstrates two advanced per-user `ExclusiveDm` patterns:
 //!
 //! 1. `pick_loadout_or_cancel`: A multi-step free-text DM wizard using
-//!    `.with_ignore_commands()` so `!cancel` skips the free-text reader and trips
+//!    `.ignore_commands()` so `!cancel` skips the free-text reader and trips
 //!    the outer `.until(...)` supervisor, immediately dropping the `ExclusiveDm` lock.
 //! 2. `resolve_simultaneous_triggers`: Two concurrent `user.ask(...)` futures run
 //!    inside `tokio::try_join!` — `ExclusiveDm` serializes them on the wire and
@@ -14,7 +14,7 @@ use ircgm::prelude::*;
 
 pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>> {
     let flow = async {
-        let mut dm = player.exclusive().await?.with_ignore_commands();
+        let mut dm = player.exclusive().await?.ignore_commands();
         dm.say("Name 3 items to bring into the vault (send 3 messages, or `!cancel`):")?;
         Ok::<_, Error>([
             dm.inbox().next_chat().await?.text,

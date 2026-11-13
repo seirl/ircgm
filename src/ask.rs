@@ -336,8 +336,8 @@ impl AskConfig {
     }
 
     pub(crate) fn apply_to_inbox(&self, inbox: &mut Inbox) {
-        inbox.set_ignore_commands(self.ignore_commands);
-        inbox.set_accept_notices(self.accept_notices);
+        inbox.ignore_commands = self.ignore_commands;
+        inbox.accept_notices = self.accept_notices;
     }
 }
 

@@ -96,7 +96,7 @@ async fn canceling_ambassador_exchange_releases_dm_lock_immediately_for_queued_s
     srv.flush().await;
     let _ = srv.take_messages_to("Alice");
 
-    // Alice sends `!cancel`: `.with_ignore_commands()` skips `next_chat()` and trips `.until_ok(...)`,
+    // Alice sends `!cancel`: `.ignore_commands()` skips `next_chat()` and trips `.until(...)`,
     // dropping `ExclusiveDm` so Bob's queued steal prompt is sent immediately!
     srv.dm("Alice", "!cancel");
     srv.settle().await;

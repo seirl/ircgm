@@ -21,7 +21,7 @@ pub struct ExclusiveDm {
     core: Arc<BotCore>,
     user: User,
     inbox: Inbox,
-    ask_config: Arc<AskConfig>,
+    ask_config: AskConfig,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -71,17 +71,19 @@ impl ExclusiveDm {
     }
 
     pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.ask_config = Arc::new(cfg.clone());
+        self.ask_config = cfg.clone();
         cfg.apply_to_inbox(&mut self.inbox);
     }
 
-    pub fn with_ignore_commands(mut self) -> Self {
-        self.inbox.set_ignore_commands(true);
+    pub fn ignore_commands(mut self) -> Self {
+        self.ask_config.ignore_commands = true;
+        self.inbox.ignore_commands = true;
         self
     }
 
-    pub fn with_accept_notices(mut self) -> Self {
-        self.inbox.set_accept_notices(true);
+    pub fn accept_notices(mut self) -> Self {
+        self.ask_config.accept_notices = true;
+        self.inbox.accept_notices = true;
         self
     }
 
@@ -106,8 +108,7 @@ impl ExclusiveDm {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let mut base_cfg = (*self.ask_config).clone();
-        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
+        let base_cfg = self.ask_config.clone();
         Ask::new(
             AskSource::BorrowedDm { dm: self },
             base_cfg,
@@ -188,7 +189,7 @@ pub(crate) async fn acquire_single_dm_guard(
         cm,
     );
     inbox.idle_timeout = Some(Duration::from_secs(300));
-    let ask_config = Arc::clone(&core.ask_config);
+    let ask_config = (*core.ask_config).clone();
     ask_config.apply_to_inbox(&mut inbox);
 
     Ok(ExclusiveDm {

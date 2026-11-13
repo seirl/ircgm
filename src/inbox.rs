@@ -10,7 +10,6 @@ use std::time::Duration;
 use irc::proto::Message;
 use tokio::sync::mpsc;
 
-use crate::ask::AskConfig;
 use crate::bot::BotCore;
 use crate::casemap::{CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
@@ -637,27 +636,14 @@ impl Inbox {
         inbox
     }
 
-    pub(crate) fn sync_flags_to_ask_config(&self, cfg: &mut AskConfig) {
-        cfg.ignore_commands = self.ignore_commands;
-        cfg.accept_notices = self.accept_notices;
-    }
-
     pub fn ignore_commands(mut self) -> Self {
         self.ignore_commands = true;
         self
     }
 
-    pub fn set_ignore_commands(&mut self, enabled: bool) {
-        self.ignore_commands = enabled;
-    }
-
     pub fn accept_notices(mut self) -> Self {
         self.accept_notices = true;
         self
-    }
-
-    pub fn set_accept_notices(&mut self, enabled: bool) {
-        self.accept_notices = enabled;
     }
 
     pub fn lossy(mut self) -> Self {

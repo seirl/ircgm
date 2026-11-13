@@ -516,7 +516,7 @@ impl Bot {
             guards,
             initial_offline,
             inbox,
-            Arc::clone(&core.ask_config),
+            (*core.ask_config).clone(),
         )
     }
 

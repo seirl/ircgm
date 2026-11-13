@@ -112,7 +112,7 @@ pub struct Huddle {
     guards: Vec<ExclusiveDm>,
     initial_offline: Option<(String, Option<String>)>,
     inbox: Inbox,
-    ask_config: Arc<AskConfig>,
+    ask_config: AskConfig,
     relay_prefix: Option<Text>,
     relay_commands: bool,
 }
@@ -123,7 +123,7 @@ impl Huddle {
         guards: Vec<ExclusiveDm>,
         initial_offline: Option<(String, Option<String>)>,
         mut inbox: Inbox,
-        ask_config: Arc<AskConfig>,
+        ask_config: AskConfig,
     ) -> Self {
         inbox.idle_timeout = Some(std::time::Duration::from_secs(300));
         ask_config.apply_to_inbox(&mut inbox);
@@ -204,17 +204,19 @@ impl Huddle {
     }
 
     pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.ask_config = Arc::new(cfg.clone());
+        self.ask_config = cfg.clone();
         cfg.apply_to_inbox(&mut self.inbox);
     }
 
-    pub fn with_ignore_commands(mut self) -> Self {
-        self.inbox.set_ignore_commands(true);
+    pub fn ignore_commands(mut self) -> Self {
+        self.ask_config.ignore_commands = true;
+        self.inbox.ignore_commands = true;
         self
     }
 
-    pub fn with_accept_notices(mut self) -> Self {
-        self.inbox.set_accept_notices(true);
+    pub fn accept_notices(mut self) -> Self {
+        self.ask_config.accept_notices = true;
+        self.inbox.accept_notices = true;
         self
     }
 
@@ -272,8 +274,7 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let mut base_cfg = (*self.ask_config).clone();
-        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
+        let base_cfg = self.ask_config.clone();
         Ask::new(
             AskSource::BorrowedHuddle { huddle: self },
             base_cfg,
@@ -295,8 +296,7 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let mut base_cfg = (*self.ask_config).clone();
-        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
+        let base_cfg = self.ask_config.clone();
         let source = if !user.belongs_to(&self.core) {
             AskSource::ImmediateErr(Error::InvalidInput(
                 "User handle belongs to a different Bot session",

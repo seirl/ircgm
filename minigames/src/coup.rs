@@ -15,7 +15,7 @@
 //! - **Automatic [`ExclusiveDm`] prompt serialization:** Firing a concurrent `target.ask(...)` while
 //!   `target.exclusive()` is already held in another branch of `tokio::try_join!` queues the second
 //!   prompt on [`ExclusiveDm`] so the player never receives interleaved DM questions or crossed answers.
-//! - **Cancelable multi-step free-text DM wizard:** [`ExclusiveDm::with_ignore_commands`] lets free-text
+//! - **Cancelable multi-step free-text DM wizard:** [`ExclusiveDm::ignore_commands`] lets free-text
 //!   card names flow into `dm.inbox().next_chat()` while `!cancel` bypasses the wizard and trips the
 //!   outer `.until(...)` supervisor, immediately dropping the DM lock and unblocking the queued Steal prompt.
 
@@ -135,7 +135,7 @@ pub async fn ambassador_exchange_or_cancel(
 ) -> Result<Option<[Role; 2]>> {
     let wizard = async {
         let mut pool = vec![hand[0], hand[1], drawn[0], drawn[1]];
-        let mut dm = player.exclusive().await?.with_ignore_commands();
+        let mut dm = player.exclusive().await?.ignore_commands();
         let pool_names: Vec<&str> = pool.iter().map(|r| r.label()).collect();
         dm.say(format_args!(
             "🃏 Ambassador Exchange — pool: [{}]. Send 2 messages naming the 2 cards to keep (or `!cancel`):",
