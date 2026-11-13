@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::collections::HashSet;
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
@@ -18,6 +17,7 @@ use crate::ask::AskConfig;
 use crate::breakout::{Breakout, BreakoutOptions};
 use crate::casemap::CaseMap;
 use crate::error::{DisconnectReason, Error, Result};
+use crate::exclusive_dm::{acquire_available_dm_guards, acquire_many_dm_guards, ExclusiveDm};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox, InboxRegistry, InboxScope};
 use crate::outbound::{
@@ -27,7 +27,7 @@ use crate::outbound::{
 use crate::pump::{extract_numeric, run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
 use crate::state::WorldState;
-use crate::user::{acquire_single_dm_guard, ExclusiveDm, User, UserRegistry, UserStatus, UserTrack};
+use crate::user::{User, UserRegistry, UserTrack};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -463,70 +463,7 @@ impl Bot {
     {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
-        self.exclusive_many_at(collected, caller)
-    }
-
-    async fn exclusive_many_at(
-        &self,
-        users: Vec<User>,
-        caller: &'static Location<'static>,
-    ) -> Result<Vec<ExclusiveDm>> {
-        let core = &self.owner.core;
-        core.check_connected()?;
-
-        let mut seen = HashSet::with_capacity(users.len());
-        let mut indexed: Vec<(usize, User)> = Vec::with_capacity(users.len());
-        for (idx, u) in users.into_iter().enumerate() {
-            if !u.belongs_to(core) {
-                return Err(Error::InvalidInput(
-                    "User handle belongs to a different Bot session",
-                ));
-            }
-            if !seen.insert(u.track_id()) {
-                return Err(Error::InvalidInput("duplicate User in exclusive_many"));
-            }
-            indexed.push((idx, u));
-        }
-
-        if indexed.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        for (_, u) in &indexed {
-            if let Some(err) = u.quit_error() {
-                return Err(err);
-            }
-        }
-
-        // Canonical lock acquisition order (`UserTrack::id` ascending):
-        indexed.sort_by_key(|(_, u)| u.track_id());
-
-        let all_tracks: Vec<Arc<UserTrack>> = indexed.iter().map(|(_, u)| u.track_arc()).collect();
-        let mut acquired: Vec<(usize, ExclusiveDm)> = Vec::with_capacity(indexed.len());
-
-        for (orig_idx, u) in indexed {
-            // Watch ALL remaining/acquired members so any member quitting aborts immediately
-            // even while waiting on an earlier member's contested mutex!
-            let acquire_fut = acquire_single_dm_guard(Arc::clone(core), u, caller);
-            let other_quit_fut = wait_any_track_quit(&all_tracks);
-
-            let guard = tokio::select! {
-                biased;
-                err = other_quit_fut => return Err(err),
-                res = acquire_fut => res?,
-            };
-            acquired.push((orig_idx, guard));
-
-            for (_, g) in &acquired {
-                if let Some(err) = g.user().quit_error() {
-                    return Err(err);
-                }
-            }
-        }
-
-        // Restore caller iteration order:
-        acquired.sort_by_key(|(orig_idx, _)| *orig_idx);
-        Ok(acquired.into_iter().map(|(_, g)| g).collect())
+        acquire_many_dm_guards(&self.owner.core, collected, caller)
     }
 
     /// Partial/team-resilient multi-user DM lock: skips any `User` who is offline or quits
@@ -543,66 +480,10 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let (guards, _) = self.exclusive_available_at(collected, caller).await?;
+            let (guards, _) =
+                acquire_available_dm_guards(&self.owner.core, collected, caller).await?;
             Ok(guards)
         }
-    }
-
-    async fn exclusive_available_at(
-        &self,
-        users: Vec<User>,
-        caller: &'static Location<'static>,
-    ) -> Result<(Vec<ExclusiveDm>, Option<(String, Option<String>)>)> {
-        let core = &self.owner.core;
-        core.check_connected()?;
-
-        let mut seen = HashSet::with_capacity(users.len());
-        let mut indexed: Vec<(usize, User)> = Vec::new();
-        let mut last_offline: Option<(String, Option<String>)> = None;
-        for (idx, u) in users.into_iter().enumerate() {
-            if !u.belongs_to(core) {
-                return Err(Error::InvalidInput(
-                    "User handle belongs to a different Bot session",
-                ));
-            }
-            if !seen.insert(u.track_id()) {
-                return Err(Error::InvalidInput("duplicate User in exclusive_available"));
-            }
-            if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
-                last_offline = Some((nick, reason));
-            } else {
-                indexed.push((idx, u));
-            }
-        }
-
-        if indexed.is_empty() {
-            return Ok((Vec::new(), last_offline));
-        }
-
-        indexed.sort_by_key(|(_, u)| u.track_id());
-
-        let mut acquired: Vec<(usize, ExclusiveDm)> = Vec::with_capacity(indexed.len());
-        for (orig_idx, u) in indexed {
-            match acquire_single_dm_guard(Arc::clone(core), u, caller).await {
-                Ok(guard) => acquired.push((orig_idx, guard)),
-                Err(Error::UserLeft { nick, reason }) => {
-                    last_offline = Some((nick, reason));
-                }
-                Err(fatal) => return Err(fatal),
-            }
-        }
-
-        // Drop any guard whose user disconnected while later guards were being acquired:
-        acquired.retain(|(_, g)| {
-            if let Some(Error::UserLeft { nick, reason }) = g.user().quit_error() {
-                last_offline = Some((nick, reason));
-                false
-            } else {
-                true
-            }
-        });
-        acquired.sort_by_key(|(orig_idx, _)| *orig_idx);
-        Ok((acquired.into_iter().map(|(_, g)| g).collect(), last_offline))
     }
 
     /// Strict channel-free group DM deliberation guard.
@@ -618,7 +499,7 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let guards = self.exclusive_many_at(collected, caller).await?;
+            let guards = acquire_many_dm_guards(&self.owner.core, collected, caller).await?;
             Ok(self.build_huddle(guards, None, caller))
         }
     }
@@ -636,7 +517,8 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let (guards, initial_offline) = self.exclusive_available_at(collected, caller).await?;
+            let (guards, initial_offline) =
+                acquire_available_dm_guards(&self.owner.core, collected, caller).await?;
             Ok(self.build_huddle(guards, initial_offline, caller))
         }
     }
@@ -967,23 +849,6 @@ impl Bot {
         core.inboxes.clear();
         Ok(())
     }
-}
-
-async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
-    let waiters = tracks.iter().map(|t| {
-        let mut rx = t.status_tx.subscribe();
-        async move {
-            loop {
-                if let UserStatus::Quit { nick, reason, .. } = rx.borrow_and_update().clone() {
-                    return Error::UserLeft { nick, reason };
-                }
-                if rx.changed().await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            }
-        }
-    });
-    crate::supervise::race_all(waiters).await
 }
 
 #[cfg(test)]

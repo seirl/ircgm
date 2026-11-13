@@ -67,6 +67,8 @@ mod bot;
 mod breakout;
 mod casemap;
 mod error;
+mod exclusive_dm;
+pub mod future;
 mod huddle;
 mod inbox;
 mod message;
@@ -74,21 +76,12 @@ mod outbound;
 mod pump;
 mod room;
 mod state;
-mod supervise;
 pub mod testing;
 mod user;
 
 pub mod fmt {
     pub use irc_colors::{
         irc_format, Color, ColorValue, Colorize, ExtendedColor, Span, Style, Text,
-    };
-}
-
-pub mod future {
-    pub use crate::ask::{AskOptional, AskRequired};
-    pub use crate::supervise::{
-        MapOutput, NoneOnTimeout, OrUntil, RaceAll, RunFor, RunUntilDeadline, Until, WithDeadline,
-        WithTimeout,
     };
 }
 
@@ -106,12 +99,13 @@ pub use crate::{
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
     error::{DisconnectReason, Error, Result},
+    exclusive_dm::ExclusiveDm,
+    future::{race_all, GameFutureExt, Outcome},
     huddle::Huddle,
     inbox::{Inbox, InboxScope},
     message::{ChatMessage, Event, MessageKind, Target},
     room::{Member, Room},
-    supervise::{race_all, GameFutureExt, Outcome},
-    user::{ExclusiveDm, User, UserId},
+    user::{User, UserId},
 };
 
 const _: () = {

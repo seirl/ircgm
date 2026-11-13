@@ -1,10 +1,15 @@
+//! Cancellation, supervision, and timer combinators for `ircgm` futures.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::time::{Sleep, Instant};
+use tokio::time::{Instant, Sleep};
 
 use crate::error::{Error, Result};
+
+pub use crate::ask::{AskOptional, AskRequired};
+pub use crate::bot::ShutdownRequested;
 
 /// Outcome of racing a game future against one or more stop triggers via [`GameFutureExt::until`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,5 +379,5 @@ pub trait GameFutureExt: Future + Sized {
 impl<F: Future> GameFutureExt for F {}
 
 #[cfg(test)]
-#[path = "supervise_test.rs"]
+#[path = "future_test.rs"]
 mod test;

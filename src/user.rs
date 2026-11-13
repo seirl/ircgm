@@ -4,16 +4,16 @@ use std::future::Future;
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
 
 use irc_colors::Text;
-use tokio::sync::{watch, OwnedMutexGuard};
+use tokio::sync::watch;
 use tracing::Instrument as _;
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
+use crate::ask::{Ask, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::{CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
+use crate::exclusive_dm::{acquire_single_dm_guard, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
@@ -451,6 +451,10 @@ impl User {
         UserId(self.track.id)
     }
 
+    pub(crate) fn track(&self) -> &Arc<UserTrack> {
+        &self.track
+    }
+
     pub(crate) fn track_arc(&self) -> Arc<UserTrack> {
         Arc::clone(&self.track)
     }
@@ -615,183 +619,6 @@ impl User {
             Some(_) => Inbox::invalid_session(filter, caller),
             None => Inbox::disconnected_bot_dropped(filter, caller),
         }
-    }
-}
-
-pub(crate) async fn acquire_single_dm_guard(
-    core: Arc<BotCore>,
-    user: User,
-    caller: &'static Location<'static>,
-) -> Result<ExclusiveDm> {
-    core.check_connected()?;
-    if let Some(err) = user.quit_error() {
-        return Err(err);
-    }
-
-    let mut status_rx = user.track.status_tx.subscribe();
-    let lock_fut = Arc::clone(&user.track.dm_mutex).lock_owned();
-    tokio::pin!(lock_fut);
-
-    let warn_sleep = tokio::time::sleep(Duration::from_secs(15));
-    tokio::pin!(warn_sleep);
-    let mut warned = false;
-
-    let guard = loop {
-        tokio::select! {
-            biased;
-            disc = core.wait_disconnected() => {
-                return Err(Error::Disconnected(disc));
-            }
-            st_res = status_rx.changed() => {
-                if st_res.is_ok() {
-                    let st = status_rx.borrow_and_update().clone();
-                    if let UserStatus::Quit { nick, reason, .. } = st {
-                        return Err(Error::UserLeft { nick, reason });
-                    }
-                }
-            }
-            g = &mut lock_fut => {
-                break g;
-            }
-            _ = &mut warn_sleep, if !warned => {
-                warned = true;
-                let holder = *user.track.lock_holder.lock().unwrap();
-                tracing::warn!(
-                    user_id = user.track.id,
-                    nick = %user.nick(),
-                    waiter_at = %caller,
-                    holder_at = ?holder.map(|loc| loc.to_string()),
-                    "waiting >15s to acquire User ExclusiveDm mutex"
-                );
-            }
-        }
-    };
-
-    core.check_connected()?;
-    if let Some(err) = user.quit_error() {
-        return Err(err);
-    }
-
-    *user.track.lock_holder.lock().unwrap() = Some(caller);
-
-    let cm = core.casemap();
-    let mut inbox = core.inboxes.subscribe(
-        Arc::clone(&core),
-        Filter::Scoped {
-            rooms: Vec::new(),
-            dm_users: vec![Arc::clone(&user.track)],
-        },
-        caller,
-        cm,
-    );
-    inbox.idle_timeout = Some(Duration::from_secs(300));
-    let ask_config = Arc::clone(&core.ask_config);
-    ask_config.apply_to_inbox(&mut inbox);
-
-    Ok(ExclusiveDm {
-        core,
-        user,
-        inbox,
-        ask_config,
-        _guard: guard,
-    })
-}
-
-/// RAII guard holding exclusive access to a [`User`]'s interactive DM prompt slot
-/// plus a pre-subscribed [`Inbox`] and local [`AskConfig`].
-pub struct ExclusiveDm {
-    core: Arc<BotCore>,
-    user: User,
-    inbox: Inbox,
-    ask_config: Arc<AskConfig>,
-    _guard: OwnedMutexGuard<()>,
-}
-
-impl Drop for ExclusiveDm {
-    fn drop(&mut self) {
-        *self.user.track.lock_holder.lock().unwrap() = None;
-    }
-}
-
-impl ExclusiveDm {
-    pub(crate) fn core(&self) -> &Arc<BotCore> {
-        &self.core
-    }
-
-    pub(crate) fn split_for_ask(&mut self) -> (&Arc<BotCore>, &User, &mut Inbox) {
-        (&self.core, &self.user, &mut self.inbox)
-    }
-
-    pub(crate) fn send_chat_with_receipt(
-        &self,
-        kind: OutboundChatKind,
-        text: Text,
-    ) -> Result<WriteReceipt> {
-        self.core.check_connected()?;
-        if let Some(err) = self.user.quit_error() {
-            return Err(err);
-        }
-        let nick = self.user.nick();
-        self.core.send_chat_with_receipt(kind, &nick, text)
-    }
-
-    pub fn user(&self) -> &User {
-        &self.user
-    }
-
-    pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
-        self.set_ask_config(cfg);
-        self
-    }
-
-    pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.ask_config = Arc::new(cfg.clone());
-        cfg.apply_to_inbox(&mut self.inbox);
-    }
-
-    pub fn with_ignore_commands(mut self) -> Self {
-        self.inbox.set_ignore_commands(true);
-        self
-    }
-
-    pub fn with_accept_notices(mut self) -> Self {
-        self.inbox.set_accept_notices(true);
-        self
-    }
-
-    pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Privmsg, text.into())?;
-        Ok(())
-    }
-
-    pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Notice, text.into())?;
-        Ok(())
-    }
-
-    pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Action, text.into())?;
-        Ok(())
-    }
-
-    pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        let mut base_cfg = (*self.ask_config).clone();
-        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
-        Ask::new(
-            AskSource::BorrowedDm { dm: self },
-            base_cfg,
-            prompt.into(),
-            matcher,
-        )
-    }
-
-    pub fn inbox(&mut self) -> &mut Inbox {
-        &mut self.inbox
     }
 }
 

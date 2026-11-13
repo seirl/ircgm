@@ -13,12 +13,13 @@ use tracing::Instrument as _;
 
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
+use crate::exclusive_dm::ExclusiveDm;
 use crate::huddle::{Huddle, HuddleSender};
 use crate::inbox::Inbox;
 use crate::message::{ChatMessage, Target};
 use crate::outbound::{OutboundChatKind, WriteReceipt};
 use crate::room::Room;
-use crate::user::{ExclusiveDm, User, UserId};
+use crate::user::{User, UserId};
 
 mod private {
     pub trait Sealed {}

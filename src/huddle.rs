@@ -6,10 +6,11 @@ use irc_colors::{irc_format, Text};
 use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
+use crate::exclusive_dm::ExclusiveDm;
 use crate::inbox::Inbox;
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::user::{ExclusiveDm, User, UserId};
+use crate::user::{User, UserId};
 
 /// Disjoint outbound view of a [`Huddle`] so [`Ask`] can send prompts, countdown warnings,
 /// rejects, and banter relays while mutably polling `Huddle::inbox`.
