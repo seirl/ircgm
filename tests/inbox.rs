@@ -9,7 +9,7 @@ use ircgm::testing::{test_harness, test_harness_with};
 use ircgm::BotConfig;
 
 #[tokio::test]
-async fn packet_burst_and_wire_fair_inbox_users_race() {
+async fn packet_burst_and_wire_fair_inbox_dms_from_race() {
     let (bot, server) = test_harness("GM");
     server.complete_join("#q", &["Alice", "Bob"]);
     server.settle().await;
@@ -30,7 +30,7 @@ async fn packet_burst_and_wire_fair_inbox_users_race() {
     // `[alice, bob]` in vector order, but Bob's DM arrives FIRST on wire:
     let alice = bot.user("Alice").unwrap();
     let bob = bot.user("Bob").unwrap();
-    let mut race = bot.inbox_users([&alice, &bob]);
+    let mut race = bot.inbox_dms_from([&alice, &bob]);
 
     server.send_line(":Bob!u@h PRIVMSG GM :102\r\n");
     server.send_line(":Alice!u@h PRIVMSG GM :102\r\n");
@@ -58,7 +58,7 @@ async fn multisource_inbox_scope_and_unified_source_exhaustion() {
 
     let mut multi = bot.inbox_scope(InboxScope::new().rooms([&r1, &r2]).dms_from([&alice, &bob]));
     let mut r1_events = r1.inbox();
-    let mut users_only = bot.inbox_users([&alice, &bob]);
+    let mut users_only = bot.inbox_dms_from([&alice, &bob]);
     let mut mixed = bot.inbox_scope(InboxScope::new().room(&r1).dms_from([&alice, &bob]));
 
     server.chat("Alice", "#r1", "one");
@@ -168,9 +168,9 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     server.settle().await;
 
     let room = bot.room("#lobby").unwrap();
-    let mut default_in = bot.inbox_all();
-    let mut notice_in = bot.inbox_all().accept_notices();
-    let mut event_in = bot.inbox_all();
+    let mut default_in = bot.inbox();
+    let mut notice_in = bot.inbox().accept_notices();
+    let mut event_in = bot.inbox();
 
     server.send_line(":NickServ!s@services NOTICE GM :!heist\r\n");
     server.send_line(":irc.example.org NOTICE GM :!heist\r\n");

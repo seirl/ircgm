@@ -106,7 +106,7 @@ async fn accept_breakout_and_presence_chat_helpers_preserve_unrelated_commands()
 #[tokio::test]
 async fn test_server_disconnect_triggers_eof_on_open_inbox() {
     let (bot, server) = test_harness("gm");
-    let mut inbox = bot.inbox_all();
+    let mut inbox = bot.inbox();
     server.disconnect();
 
     let res = inbox.next_event().await;

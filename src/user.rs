@@ -17,7 +17,6 @@ use crate::exclusive_dm::{acquire_single_dm_guard, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::room::Room;
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_RENAME_RETRIES: u8 = 3;
@@ -593,30 +592,6 @@ impl User {
                 let cm = core.casemap();
                 core.inboxes.subscribe(core.clone(), filter, caller, cm)
             }
-            None => Inbox::disconnected_bot_dropped(filter, caller),
-        }
-    }
-
-    /// Opens a channel [`Inbox`] matching only this user's messages inside `room`.
-    #[track_caller]
-    pub fn inbox_in(&self, room: &Room) -> Inbox {
-        let caller = Location::caller();
-        self.inbox_in_at(room, caller)
-    }
-
-    pub(crate) fn inbox_in_at(&self, room: &Room, caller: &'static Location<'static>) -> Inbox {
-        let filter = Filter::UsersInRoom {
-            tracks: vec![Arc::clone(&self.track)],
-            channel_name: room.name().to_owned(),
-        };
-        match self.core.upgrade() {
-            Some(core) if Arc::ptr_eq(&core, room.core()) => {
-                let cm = core.casemap();
-                let mut inbox = core.inboxes.subscribe(core.clone(), filter, caller, cm);
-                room.ask_config().apply_to_inbox(&mut inbox);
-                inbox
-            }
-            Some(_) => Inbox::invalid_session(filter, caller),
             None => Inbox::disconnected_bot_dropped(filter, caller),
         }
     }

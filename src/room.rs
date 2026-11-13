@@ -56,10 +56,6 @@ impl Room {
         &self.core
     }
 
-    pub(crate) fn ask_config(&self) -> &AskConfig {
-        &self.ask_config
-    }
-
     fn self_occupant<'a>(
         ws: &'a crate::state::WorldState,
         chan: &'a crate::state::ChannelState,
@@ -553,7 +549,7 @@ impl Room {
     #[track_caller]
     pub fn inbox_user(&self, user: &User) -> Inbox {
         let caller = Location::caller();
-        user.inbox_in_at(self, caller)
+        self.inbox_users_at(std::slice::from_ref(user), caller)
     }
 
     /// Opens a channel [`Inbox`] matching only messages and presence events from `users`

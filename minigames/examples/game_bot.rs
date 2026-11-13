@@ -496,7 +496,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
         let admin_list = admins.to_vec();
         let lobby_for_admin = lobby.clone();
         let admin_stop = bot
-            .inbox_all()
+            .inbox()
             .on_for(move |m| {
                 is_admin_msg(m, &admin_list)
                     && m.is_cmd("!stop")
@@ -606,7 +606,7 @@ async fn admin_quit_loop(bot: &Bot, lobby: &Room, admins: &[String]) -> Result<(
         return Ok(());
     }
 
-    let mut inbox = bot.inbox_all().lossy();
+    let mut inbox = bot.inbox().lossy();
     while let Outcome::Completed(msg) = inbox
         .wait_cmd("!quit")
         .until(bot.shutdown_requested())

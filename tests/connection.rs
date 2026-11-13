@@ -20,8 +20,8 @@ async fn acyclic_bot_drop_releases_bot_core_with_surviving_user_and_member() {
     let members = room.members();
     assert_eq!(members.len(), 2);
     let alice = bot.user("Alice").unwrap();
-    let mut empty_inbox = bot.inbox_all();
-    let buffered_inbox = bot.inbox_all();
+    let mut empty_inbox = bot.inbox();
+    let buffered_inbox = bot.inbox();
 
     // Buffer an unread `WireEvent { User }` inside `buffered_inbox`, while `empty_inbox` drains it first:
     server.chat("Alice", "#lobby", "buffered unread line");

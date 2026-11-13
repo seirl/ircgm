@@ -727,14 +727,16 @@ impl Bot {
         Ok(())
     }
 
+    /// Opens an [`Inbox`] receiving all events across all joined channels and DMs on this session.
     #[track_caller]
-    pub fn inbox_all(&self) -> Inbox {
+    pub fn inbox(&self) -> Inbox {
         let caller = Location::caller();
         let core = &self.owner.core;
         core.inboxes
             .subscribe(Arc::clone(core), Filter::All, caller, core.casemap())
     }
 
+    /// Opens an [`Inbox`] receiving all DMs sent to the bot from any user.
     #[track_caller]
     pub fn inbox_dms(&self) -> Inbox {
         let caller = Location::caller();
@@ -743,8 +745,9 @@ impl Bot {
             .subscribe(Arc::clone(core), Filter::AllDms, caller, core.casemap())
     }
 
+    /// Opens an [`Inbox`] receiving DMs sent to the bot from `users` (matching [`InboxScope::dms_from`]).
     #[track_caller]
-    pub fn inbox_users<I, U>(&self, users: I) -> Inbox
+    pub fn inbox_dms_from<I, U>(&self, users: I) -> Inbox
     where
         I: IntoIterator<Item = U>,
         U: Borrow<User>,

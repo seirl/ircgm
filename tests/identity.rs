@@ -17,7 +17,7 @@ async fn single_batch_privmsg_rename_steal_quit_preserves_stamped_identity() {
     let mallory = bot.user("Mallory").unwrap();
     assert_ne!(alice, mallory);
 
-    let mut all_in = bot.inbox_all();
+    let mut all_in = bot.inbox();
 
     let ask_room = room.clone();
     let ask_alice = alice.clone();
@@ -59,7 +59,7 @@ async fn event_fields_server_time_ident_and_channels() {
     server.complete_join("#arena", &["@GM"]);
     server.settle().await;
 
-    let mut inbox = bot.inbox_all();
+    let mut inbox = bot.inbox();
     let before = tokio::time::Instant::now();
 
     server.send_line(":Cara!~cara@cloak.example JOIN #arena * :Cara\r\n");
@@ -195,7 +195,7 @@ async fn user_id_keys_and_consuming_inbox_combinators() {
     assert_ne!(alice_rejoined.id(), alice_id);
     assert!(seen.insert(alice_rejoined.id()));
 
-    let stop_fut = bot.inbox_all().on_for(|m| m.is_cmd("!stop"));
+    let stop_fut = bot.inbox().on_for(|m| m.is_cmd("!stop"));
     let abort_fut = bob.inbox().on_cmd("!abort");
 
     let work = async move {
@@ -261,7 +261,7 @@ async fn dynamic_casemapping_rekey_rfc1459_netsplit_and_accounts() {
         .unwrap_err();
     assert!(matches!(no_match, Error::TimedOut));
 
-    let mut all_events = bot.inbox_all();
+    let mut all_events = bot.inbox();
     server.send_line(":Bob!~b@h JOIN #[lobby] bob_acct :Bob Real\r\n");
     server.settle().await;
     let bob = bot.user("Bob").unwrap();

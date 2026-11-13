@@ -855,7 +855,7 @@ where
                 ));
             }
             room.ensure_user_askable(user)?;
-            let mut inbox = user.inbox_in_at(room, caller);
+            let mut inbox = room.inbox_users_at(std::slice::from_ref(user), caller);
             let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
             await_ask_loop(
                 &cfg,

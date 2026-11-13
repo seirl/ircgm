@@ -20,7 +20,7 @@ async fn chat_message_reply_mirrors_kind_and_checks_bot_left_room() {
     let (bot, mut server) = test_harness("gm");
     server.complete_join("#lobby", &["alice"]);
     server.settle().await;
-    let mut all = bot.inbox_all().accept_notices();
+    let mut all = bot.inbox().accept_notices();
 
     // 1. Channel PRIVMSG -> channel PRIVMSG:
     server.chat("alice", "#lobby", "hello room");
@@ -116,7 +116,7 @@ async fn user_ids_are_globally_unique_and_cross_bot_inbox_scope_is_rejected() {
     assert_ne!(alice1.id(), mallory2.id());
     assert_ne!(alice1, mallory2);
 
-    let mut foreign_inbox = bot2.inbox_users([&alice1]);
+    let mut foreign_inbox = bot2.inbox_dms_from([&alice1]);
     srv2.dm("Mallory", "private to gm2");
     srv2.settle().await;
     assert!(matches!(

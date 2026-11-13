@@ -360,7 +360,7 @@ impl InboxRegistry {
         }
     }
 
-    /// Returns `true` if any active `Inbox` listens to `folded_chan` (either via `inbox_all`
+    /// Returns `true` if any active `Inbox` listens to `folded_chan` (either via `Bot::inbox`
     /// or a channel-scoped subscription).
     pub(crate) fn has_interest_in_channel(&self, folded_chan: &FoldedStr) -> bool {
         let inner = self.inner.lock().unwrap();
