@@ -80,6 +80,7 @@ impl ChannelState {
 pub(crate) struct LostChannel {
     pub(crate) name: String,
     pub(crate) reason: Option<String>,
+    pub(crate) at_seq: u64,
 }
 
 pub(crate) struct WorldState {
@@ -91,6 +92,7 @@ pub(crate) struct WorldState {
     pub(crate) max_modes: usize,
     pub(crate) targmax_kick: usize,
     pub(crate) current_nick: String,
+    pub(crate) self_track_id: Option<u64>,
     pub(crate) self_ident: Option<String>,
     pub(crate) self_host: Option<String>,
     pub(crate) channels: HashMap<FoldedStr, ChannelState>,
@@ -107,6 +109,7 @@ impl WorldState {
             max_modes: 4,
             targmax_kick: 1,
             current_nick: initial_nick.into(),
+            self_track_id: None,
             self_ident: None,
             self_host: None,
             channels: HashMap::new(),
@@ -184,7 +187,10 @@ impl WorldState {
 
     pub(crate) fn handle_welcome(&mut self, args: &[String]) {
         if let Some(nick) = args.first() {
-            if !nick.is_empty() {
+            if !nick.is_empty() && !self.casemap.str_eq(&self.current_nick, nick) {
+                self.current_nick = nick.clone();
+                self.self_track_id = None;
+            } else if !nick.is_empty() {
                 self.current_nick = nick.clone();
             }
         }
@@ -388,6 +394,7 @@ impl WorldState {
         let is_self = self.casemap.str_eq(nick, &self.current_nick);
 
         if is_self {
+            self.self_track_id = Some(track.id);
             self.lost_channels.remove(&chan_key);
             let chan = self
                 .channels
@@ -421,6 +428,7 @@ impl WorldState {
         nick: &str,
         track_id: u64,
         reason: Option<String>,
+        at_seq: u64,
     ) -> bool {
         let chan_key = self.casemap.fold(channel);
         if self.casemap.str_eq(nick, &self.current_nick) {
@@ -434,6 +442,7 @@ impl WorldState {
                 LostChannel {
                     name: canonical,
                     reason,
+                    at_seq,
                 },
             );
             true
@@ -476,6 +485,7 @@ impl WorldState {
         self.observe_self_prefix(prefix);
         if self.casemap.str_eq(old_nick, &self.current_nick) {
             self.current_nick = new_nick.to_owned();
+            self.self_track_id = Some(track_id);
         }
         let mut occupied = Vec::new();
         for chan in self.channels.values() {
@@ -548,6 +558,9 @@ impl WorldState {
             }
 
             let track = users.get_or_create(nick);
+            if self.casemap.str_eq(nick, &self.current_nick) {
+                self.self_track_id = Some(track.id);
+            }
             parsed.push(Occupant { track, prefixes });
         }
 
@@ -579,13 +592,18 @@ impl WorldState {
 
     /// Applies a parameterized channel `MODE` sequence (`["+klo", "secret", "50", "Alice", "-v", "Bob"]`)
     /// respecting `005 PREFIX` and `005 CHANMODES` arity rules.
-    pub(crate) fn apply_channel_mode_tokens<S: AsRef<str>>(&mut self, channel: &str, tokens: &[S]) {
+    pub(crate) fn apply_channel_mode_tokens<S: AsRef<str>>(
+        &mut self,
+        channel: &str,
+        tokens: &[S],
+        users: &UserRegistry,
+    ) {
         let chan_key = self.casemap.fold(channel);
         if !self.channels.contains_key(&chan_key) {
             return;
         }
 
-        let mut updates: Vec<(&str, bool, char)> = Vec::new();
+        let mut updates: Vec<(u64, bool, char)> = Vec::new();
         let mut idx = 0;
         while idx < tokens.len() {
             let mode_word = tokens[idx].as_ref();
@@ -603,7 +621,9 @@ impl WorldState {
                             if idx < tokens.len() {
                                 let target_nick = tokens[idx].as_ref();
                                 idx += 1;
-                                updates.push((target_nick, adding, sym));
+                                if let Some(track) = users.get_existing(target_nick) {
+                                    updates.push((track.id, adding, sym));
+                                }
                             }
                         } else if self.chan_modes.list_a.contains(ch)
                             || self.chan_modes.param_always_b.contains(ch)
@@ -623,15 +643,11 @@ impl WorldState {
             }
         }
 
-        let casemap = self.casemap;
         let order: Vec<char> = self.status_prefixes.iter().map(|&(_, s)| s).collect();
         if let Some(chan) = self.channels.get_mut(&chan_key) {
-            for (target_nick, adding, sym) in updates {
+            for (target_id, adding, sym) in updates {
                 chan.for_each_map_mut(|map| {
-                    if let Some(occ) = map
-                        .values_mut()
-                        .find(|occ| casemap.str_eq(&occ.track.nick(), target_nick))
-                    {
+                    if let Some(occ) = map.get_mut(&target_id) {
                         if adding {
                             if !occ.prefixes.contains(&sym) {
                                 occ.prefixes.push(sym);
@@ -648,43 +664,46 @@ impl WorldState {
         }
     }
 
-    /// Extracts channel `MODE` tokens from an `irc::proto::Message` (`ChannelMODE` or `Raw("MODE")`)
+    /// Extracts channel `MODE` tokens from a normalized `irc::proto::Message` (`Raw("MODE")` or `324`)
     /// and applies them via `apply_channel_mode_tokens`.
-    pub(crate) fn apply_mode_message(&mut self, msg: &Message) {
+    pub(crate) fn apply_mode_message(&mut self, msg: &Message, users: &UserRegistry) {
         match &msg.command {
-            Command::ChannelMODE(chan, modes) => {
-                if !self.is_channel_name(chan) {
-                    return;
-                }
-                let mut flags = String::new();
-                let mut args: Vec<String> = Vec::new();
-                for m in modes {
-                    flags.push_str(&m.flag());
-                    if let Some(arg) = m.arg() {
-                        args.push(arg.to_owned());
-                    }
-                }
-                let mut tokens = Vec::with_capacity(1 + args.len());
-                tokens.push(flags);
-                tokens.extend(args);
-                self.apply_channel_mode_tokens(chan, &tokens);
-            }
             Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("MODE") && args.len() >= 2 => {
                 let chan = &args[0];
                 if self.is_channel_name(chan) {
-                    self.apply_channel_mode_tokens(chan, &args[1..]);
+                    self.apply_channel_mode_tokens(chan, &args[1..], users);
                 }
             }
             Command::Response(Response::RPL_CHANNELMODEIS, args) if args.len() >= 3 => {
                 // `324 <client> <channel> <modes> [mode_params...]`
                 let chan = &args[1];
                 if self.is_channel_name(chan) {
-                    self.apply_channel_mode_tokens(chan, &args[2..]);
+                    self.apply_channel_mode_tokens(chan, &args[2..], users);
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Normalizes an already-decoded [`Message`] from `irc::client::ClientStream` so channel `MODE`
+/// frames share the single `Command::Raw("MODE", ...)` representation used by [`parse_irc_message`].
+pub(crate) fn normalize_inbound_message(mut msg: Message) -> Message {
+    if let Command::ChannelMODE(chan, modes) = msg.command {
+        let mut flags = String::new();
+        let mut args = Vec::with_capacity(2 + modes.len());
+        args.push(chan);
+        args.push(String::new());
+        for m in modes {
+            flags.push_str(&m.flag());
+            if let Some(arg) = m.arg() {
+                args.push(arg.to_owned());
+            }
+        }
+        args[1] = flags;
+        msg.command = Command::Raw("MODE".into(), args);
+    }
+    msg
 }
 
 /// Parses an inbound IRC wire line into [`Message`], preserving all raw arguments on channel

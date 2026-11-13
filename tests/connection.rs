@@ -6,7 +6,7 @@ use irc::proto::Command;
 use ircgm::fmt::{Color, ColorValue};
 use ircgm::prelude::*;
 use ircgm::testing::{test_harness, test_harness_with};
-use ircgm::{race_all, BreakoutOptions, CaseMap, DisconnectReason};
+use ircgm::{race_all, BotConfig, BreakoutOptions, CaseMap, DisconnectReason};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 

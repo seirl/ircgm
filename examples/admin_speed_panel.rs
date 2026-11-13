@@ -25,7 +25,7 @@ fn parse_admin_dm(m: &ChatMessage) -> Option<(ChatMessage, AdminCmd)> {
         return Some((m.clone(), AdminCmd::Stop));
     }
     let factor = m
-        .cmd_args("!speed")?
+        .cmd_arg("!speed")?
         .parse::<f64>()
         .ok()
         .filter(|&x| x > 0.0)?;
@@ -56,10 +56,10 @@ pub async fn run_supervised_deliberation(bot: &Bot, room: &Room) -> Result<()> {
             match cmd {
                 AdminCmd::Speed(factor) => {
                     let _ = speed_tx.send(factor);
-                    bot.reply(&msg, format!("Speed set to {factor}x."))?;
+                    msg.reply(format!("Speed set to {factor}x."))?;
                 }
                 AdminCmd::Stop => {
-                    bot.reply(&msg, "Stopping deliberation.")?;
+                    msg.reply("Stopping deliberation.")?;
                     return Ok::<_, Error>(());
                 }
             }

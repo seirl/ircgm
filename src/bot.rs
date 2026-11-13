@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::future::Future;
 use std::panic::Location;
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use irc::proto::{CapSubCommand, Command};
 use irc_colors::Text;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
@@ -19,20 +20,18 @@ use crate::casemap::CaseMap;
 use crate::error::{DisconnectReason, Error, Result};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox, InboxRegistry, InboxScope};
-use crate::message::{ChatMessage, MessageKind, Target};
 use crate::outbound::{
     build_chat_commands, validate_param, validate_target, OutboundChatKind, OutboundSink, Priority,
     RawTransport, WriteReceipt,
 };
-use crate::pump::{run_pump, PumpSource, RegistrationTracker};
+use crate::pump::{extract_numeric, run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
 use crate::state::WorldState;
 use crate::user::{acquire_single_dm_guard, ExclusiveDm, User, UserRegistry, UserStatus, UserTrack};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Configuration for [`Bot::connect_with`], [`Bot::from_client_with`], and
-/// [`crate::testing::test_harness_with`].
+/// Configuration for [`Bot::connect_with`] and [`crate::testing::test_harness_with`].
 #[derive(Clone, Debug)]
 pub struct BotConfig {
     pub irc: irc::client::data::Config,
@@ -104,7 +103,8 @@ pub(crate) struct BotCore {
     pub(crate) inboxes: InboxRegistry,
     pub(crate) outbound: Arc<OutboundSink>,
     pub(crate) is_test_transport: bool,
-    pub(crate) shutdown_tx: watch::Sender<bool>,
+    pub(crate) shutting_down: AtomicBool,
+    pub(crate) shutdown_waiters: Mutex<Vec<oneshot::Sender<()>>>,
     pub(crate) registered_tx: watch::Sender<bool>,
     pub(crate) registered_flag: AtomicBool,
     pub(crate) disconnect_reason: Mutex<Option<DisconnectReason>>,
@@ -132,7 +132,6 @@ impl BotCore {
         config: &BotConfig,
     ) -> Arc<Self> {
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        let (shutdown_tx, _) = watch::channel(false);
         let (registered_tx, _) = watch::channel(false);
         Arc::new(Self {
             session_id,
@@ -141,7 +140,8 @@ impl BotCore {
             inboxes: InboxRegistry::default(),
             outbound,
             is_test_transport,
-            shutdown_tx,
+            shutting_down: AtomicBool::new(false),
+            shutdown_waiters: Mutex::new(Vec::new()),
             registered_tx,
             registered_flag: AtomicBool::new(false),
             disconnect_reason: Mutex::new(None),
@@ -253,6 +253,7 @@ impl Drop for BotOwner {
         self.core.state.write().unwrap().clear();
         self.core.inboxes.clear();
         self.core.users.clear();
+        self.core.shutdown_waiters.lock().unwrap().clear();
     }
 }
 
@@ -260,14 +261,25 @@ impl Drop for BotOwner {
 /// [`Bot::request_shutdown`] or [`Bot::quit`] is called.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct ShutdownRequested {
-    fut: Pin<Box<dyn Future<Output = ()> + Send>>,
+    rx: Option<oneshot::Receiver<()>>,
 }
 
 impl Future for ShutdownRequested {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        self.fut.as_mut().poll(cx)
+        let Some(rx) = self.rx.as_mut() else {
+            return Poll::Ready(());
+        };
+        match Pin::new(rx).poll(cx) {
+            Poll::Ready(Ok(())) => {
+                self.rx = None;
+                Poll::Ready(())
+            }
+            // If `BotCore` itself dropped without `request_shutdown`, park pending:
+            Poll::Ready(Err(_)) => Poll::Pending,
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -408,42 +420,6 @@ impl Bot {
         }
     }
 
-    /// Wraps an already-constructed `irc::client::Client` with default [`BotConfig`] settings.
-    pub fn from_client(client: &mut irc::client::Client) -> Result<Self> {
-        Self::from_client_with(client, BotConfig::default())
-    }
-
-    /// Wraps an already-constructed `irc::client::Client` with custom [`BotConfig`] settings.
-    pub fn from_client_with(client: &mut irc::client::Client, config: BotConfig) -> Result<Self> {
-        let stream = client.stream()?;
-        let sender = client.sender();
-        let initial_nick = client.current_nickname().to_owned();
-
-        let (outbound, outbound_task) = OutboundSink::new(
-            RawTransport::Irc(sender),
-            config.outbound_burst,
-            config.outbound_window,
-        );
-        let core = BotCore::new(initial_nick, outbound, false, &config);
-        let reg = RegistrationTracker {
-            cap_pending: false,
-            motd_done: true,
-        };
-        let pump_core = Arc::clone(&core);
-        let pump_task = tokio::spawn(async move {
-            run_pump(pump_core, PumpSource::Irc(Box::new(stream)), reg).await;
-        });
-
-        Ok(Self {
-            owner: Arc::new(BotOwner {
-                core,
-                pump_task: Mutex::new(Some(pump_task)),
-                outbound_task: Mutex::new(outbound_task),
-                _live_client: Mutex::new(None),
-            }),
-        })
-    }
-
     /// Monotonic process-unique connection session ID (`1, 2, 3, ...`).
     pub fn session_id(&self) -> u64 {
         self.owner.core.session_id
@@ -477,15 +453,16 @@ impl Bot {
     /// Strict all-or-nothing multi-user DM lock in canonical `UserTrack::id` order, returning
     /// guards in the caller's iteration order.
     #[track_caller]
-    pub fn exclusive_many<'a, I>(
+    pub fn exclusive_many<I, U>(
         &self,
         users: I,
     ) -> impl Future<Output = Result<Vec<ExclusiveDm>>> + Send + '_
     where
-        I: IntoIterator<Item = &'a User>,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
         let caller = Location::caller();
-        let collected: Vec<User> = users.into_iter().cloned().collect();
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         self.exclusive_many_at(collected, caller)
     }
 
@@ -555,28 +532,33 @@ impl Bot {
     /// Partial/team-resilient multi-user DM lock: skips any `User` who is offline or quits
     /// during lock acquisition, returning online guards in caller relative order.
     #[track_caller]
-    pub fn exclusive_available<'a, I>(
+    pub fn exclusive_available<I, U>(
         &self,
         users: I,
     ) -> impl Future<Output = Result<Vec<ExclusiveDm>>> + Send + '_
     where
-        I: IntoIterator<Item = &'a User>,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
         let caller = Location::caller();
-        let collected: Vec<User> = users.into_iter().cloned().collect();
-        self.exclusive_available_at(collected, caller)
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
+        async move {
+            let (guards, _) = self.exclusive_available_at(collected, caller).await?;
+            Ok(guards)
+        }
     }
 
     async fn exclusive_available_at(
         &self,
         users: Vec<User>,
         caller: &'static Location<'static>,
-    ) -> Result<Vec<ExclusiveDm>> {
+    ) -> Result<(Vec<ExclusiveDm>, Option<(String, Option<String>)>)> {
         let core = &self.owner.core;
         core.check_connected()?;
 
         let mut seen = HashSet::with_capacity(users.len());
         let mut indexed: Vec<(usize, User)> = Vec::new();
+        let mut last_offline: Option<(String, Option<String>)> = None;
         for (idx, u) in users.into_iter().enumerate() {
             if !u.belongs_to(core) {
                 return Err(Error::InvalidInput(
@@ -586,13 +568,15 @@ impl Bot {
             if !seen.insert(u.track_id()) {
                 return Err(Error::InvalidInput("duplicate User in exclusive_available"));
             }
-            if u.is_online() {
+            if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
+                last_offline = Some((nick, reason));
+            } else {
                 indexed.push((idx, u));
             }
         }
 
         if indexed.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), last_offline));
         }
 
         indexed.sort_by_key(|(_, u)| u.track_id());
@@ -601,85 +585,87 @@ impl Bot {
         for (orig_idx, u) in indexed {
             match acquire_single_dm_guard(Arc::clone(core), u, caller).await {
                 Ok(guard) => acquired.push((orig_idx, guard)),
-                Err(Error::UserLeft { .. }) => continue,
+                Err(Error::UserLeft { nick, reason }) => {
+                    last_offline = Some((nick, reason));
+                }
                 Err(fatal) => return Err(fatal),
             }
         }
 
         // Drop any guard whose user disconnected while later guards were being acquired:
-        acquired.retain(|(_, g)| g.user().is_online());
+        acquired.retain(|(_, g)| {
+            if let Some(Error::UserLeft { nick, reason }) = g.user().quit_error() {
+                last_offline = Some((nick, reason));
+                false
+            } else {
+                true
+            }
+        });
         acquired.sort_by_key(|(orig_idx, _)| *orig_idx);
-        Ok(acquired.into_iter().map(|(_, g)| g).collect())
+        Ok((acquired.into_iter().map(|(_, g)| g).collect(), last_offline))
     }
 
     /// Strict channel-free group DM deliberation guard.
     #[track_caller]
-    pub fn huddle<'a, I>(
+    pub fn huddle<I, U>(
         &self,
         users: I,
     ) -> impl Future<Output = Result<Huddle>> + Send + '_
     where
-        I: IntoIterator<Item = &'a User>,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
         let caller = Location::caller();
-        let collected: Vec<User> = users.into_iter().cloned().collect();
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
             let guards = self.exclusive_many_at(collected, caller).await?;
-            let core = &self.owner.core;
-            let dm_users: Vec<Arc<UserTrack>> =
-                guards.iter().map(|g| g.user().track_arc()).collect();
-            let cm = core.casemap();
-            let inbox = core.inboxes.subscribe(
-                Arc::clone(core),
-                Filter::Scoped {
-                    rooms: Vec::new(),
-                    dm_users,
-                },
-                caller,
-                cm,
-            );
-            Ok(Huddle::new(
-                Arc::clone(core),
-                guards,
-                inbox,
-                Arc::clone(&core.ask_config),
-            ))
+            Ok(self.build_huddle(guards, None, caller))
         }
     }
 
     /// Pack-resilient channel-free group DM deliberation guard (skips offline/quitting users).
     #[track_caller]
-    pub fn huddle_available<'a, I>(
+    pub fn huddle_available<I, U>(
         &self,
         users: I,
     ) -> impl Future<Output = Result<Huddle>> + Send + '_
     where
-        I: IntoIterator<Item = &'a User>,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
         let caller = Location::caller();
-        let collected: Vec<User> = users.into_iter().cloned().collect();
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let guards = self.exclusive_available_at(collected, caller).await?;
-            let core = &self.owner.core;
-            let dm_users: Vec<Arc<UserTrack>> =
-                guards.iter().map(|g| g.user().track_arc()).collect();
-            let cm = core.casemap();
-            let inbox = core.inboxes.subscribe(
-                Arc::clone(core),
-                Filter::Scoped {
-                    rooms: Vec::new(),
-                    dm_users,
-                },
-                caller,
-                cm,
-            );
-            Ok(Huddle::new(
-                Arc::clone(core),
-                guards,
-                inbox,
-                Arc::clone(&core.ask_config),
-            ))
+            let (guards, initial_offline) = self.exclusive_available_at(collected, caller).await?;
+            Ok(self.build_huddle(guards, initial_offline, caller))
         }
+    }
+
+    fn build_huddle(
+        &self,
+        guards: Vec<ExclusiveDm>,
+        initial_offline: Option<(String, Option<String>)>,
+        caller: &'static Location<'static>,
+    ) -> Huddle {
+        let core = &self.owner.core;
+        let dm_users: Vec<Arc<UserTrack>> = guards.iter().map(|g| g.user().track_arc()).collect();
+        let cm = core.casemap();
+        let inbox = core.inboxes.subscribe(
+            Arc::clone(core),
+            Filter::Scoped {
+                rooms: Vec::new(),
+                dm_users,
+            },
+            caller,
+            cm,
+        );
+        Huddle::new(
+            Arc::clone(core),
+            guards,
+            initial_offline,
+            inbox,
+            Arc::clone(&core.ask_config),
+        )
     }
 
     pub async fn join(&self, channel: &str) -> Result<Room> {
@@ -772,7 +758,7 @@ impl Bot {
             };
 
             // Check if 366 synced the channel or if a join-failure numeric arrived:
-            if let Some((code, args)) = extract_join_numeric(&raw.command) {
+            if let Some((code, args)) = extract_numeric(&raw.command) {
                 let live_cm = core.casemap();
                 match code {
                     366 => {
@@ -850,33 +836,6 @@ impl Bot {
         .await
     }
 
-    /// Replies to the channel if `msg` was in a channel, or directly to `msg.sender`'s live
-    /// nickname if `msg` was a DM (failing with [`Error::UserLeft`] if `msg.sender` has quit),
-    /// mirroring `msg.kind` (`MessageKind::Notice` sends `NOTICE`; `Privmsg | Action` sends `PRIVMSG`).
-    pub fn reply(&self, msg: &ChatMessage, text: impl Into<Text>) -> Result<()> {
-        let out_kind = match msg.kind {
-            MessageKind::Notice => OutboundChatKind::Notice,
-            MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,
-        };
-        match &msg.target {
-            Target::Channel(ch) => {
-                let _ = self
-                    .owner
-                    .core
-                    .send_chat_with_receipt(out_kind, ch, text.into())?;
-            }
-            Target::Dm => {
-                if !msg.sender.belongs_to(&self.owner.core) {
-                    return Err(Error::InvalidInput(
-                        "ChatMessage belongs to a different Bot session",
-                    ));
-                }
-                let _ = msg.sender.send_chat_with_receipt(out_kind, text.into())?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn send_raw(&self, cmd: impl Into<Command>) -> Result<()> {
         let core = &self.owner.core;
         core.check_connected()?;
@@ -903,7 +862,11 @@ impl Bot {
     }
 
     #[track_caller]
-    pub fn inbox_users<'a, I: IntoIterator<Item = &'a User>>(&self, users: I) -> Inbox {
+    pub fn inbox_users<I, U>(&self, users: I) -> Inbox
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
         let caller = Location::caller();
         let scope = InboxScope::new().dms_from(users);
         self.inbox_scope_at(scope, caller)
@@ -924,38 +887,47 @@ impl Bot {
 
     fn inbox_scope_at(&self, scope: InboxScope, caller: &'static Location<'static>) -> Inbox {
         let core = &self.owner.core;
-        let filter = Filter::Scoped {
-            rooms: scope.rooms,
-            dm_users: scope.dm_users,
-        };
+        let all_rooms_belong = scope
+            .rooms
+            .iter()
+            .all(|(_, sid)| *sid == core.session_id);
+        let all_users_belong = scope.dm_users.iter().all(|u| u.belongs_to(core));
+        let rooms: Vec<String> = scope.rooms.into_iter().map(|(r, _)| r).collect();
+        let dm_users: Vec<Arc<UserTrack>> = scope.dm_users.iter().map(User::track_arc).collect();
+        let filter = Filter::Scoped { rooms, dm_users };
+        if !all_rooms_belong || !all_users_belong {
+            return Inbox::invalid_session(filter, caller);
+        }
         core.inboxes
             .subscribe(Arc::clone(core), filter, caller, core.casemap())
     }
 
     pub fn request_shutdown(&self) {
-        let _ = self.owner.core.shutdown_tx.send_replace(true);
+        let core = &self.owner.core;
+        core.shutting_down.store(true, Ordering::Release);
+        let waiters: Vec<oneshot::Sender<()>> =
+            std::mem::take(&mut *core.shutdown_waiters.lock().unwrap());
+        for tx in waiters {
+            let _ = tx.send(());
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        *self.owner.core.shutdown_tx.borrow()
+        self.owner.core.shutting_down.load(Ordering::Acquire)
     }
 
     pub fn shutdown_requested(&self) -> ShutdownRequested {
-        let mut rx = self.owner.core.shutdown_tx.subscribe();
-        ShutdownRequested {
-            fut: Box::pin(async move {
-                if *rx.borrow_and_update() {
-                    return;
-                }
-                while rx.changed().await.is_ok() {
-                    if *rx.borrow_and_update() {
-                        return;
-                    }
-                }
-                // If `BotCore` itself dropped without `request_shutdown`, park pending:
-                std::future::pending::<()>().await
-            }),
+        let core = &self.owner.core;
+        if core.shutting_down.load(Ordering::Acquire) {
+            return ShutdownRequested { rx: None };
         }
+        let mut waiters = core.shutdown_waiters.lock().unwrap();
+        if core.shutting_down.load(Ordering::Acquire) {
+            return ShutdownRequested { rx: None };
+        }
+        let (tx, rx) = oneshot::channel();
+        waiters.push(tx);
+        ShutdownRequested { rx: Some(rx) }
     }
 
     pub async fn quit(&self, reason: Option<&str>) -> Result<()> {
@@ -994,19 +966,6 @@ impl Bot {
         core.mark_disconnected_if_unset(DisconnectReason::Quit);
         core.inboxes.clear();
         Ok(())
-    }
-}
-
-fn extract_join_numeric(cmd: &Command) -> Option<(u16, &[String])> {
-    match cmd {
-        Command::Response(resp, args) => Some((*resp as u16, args.as_slice())),
-        Command::Raw(raw_cmd, args)
-            if raw_cmd.len() == 3 && raw_cmd.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            let code = raw_cmd.parse::<u16>().ok()?;
-            Some((code, args.as_slice()))
-        }
-        _ => None,
     }
 }
 

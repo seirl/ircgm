@@ -221,13 +221,31 @@ impl TestServer {
     }
 
     /// Awaits an in-band barrier confirming the pump has processed every line injected prior to
-    /// this call, then flushes ready task reactions and `OutboundSink` writes.
+    /// this call, then loops cooperative task yields and pump barriers until woken tasks and
+    /// `OutboundSink` enqueues reach full quiescence.
     pub async fn settle(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.inbound_tx.send(PumpInput::Settle(tx)).is_ok() {
-            let _ = rx.await;
+        for _ in 0..64 {
+            let out_before = self
+                .core
+                .upgrade()
+                .map(|c| c.outbound.enqueue_seq())
+                .unwrap_or(0);
+
+            let (tx, rx) = oneshot::channel();
+            if self.inbound_tx.send(PumpInput::Settle(tx)).is_ok() {
+                let _ = rx.await;
+            }
+            self.flush().await;
+
+            let out_after = self
+                .core
+                .upgrade()
+                .map(|c| c.outbound.enqueue_seq())
+                .unwrap_or(0);
+            if out_after == out_before {
+                break;
+            }
         }
-        self.flush().await;
     }
 
     /// Waits for an outbound `JOIN` whose channel starts with `prefix` (must explicitly start with
@@ -321,6 +339,45 @@ impl TestServer {
 
         self.pending_cmds = kept;
         matched
+    }
+
+    /// Awaits and removes the next outbound `PRIVMSG`/`NOTICE` addressed to `target` (case-folded),
+    /// returning its plain-stripped text while preserving all earlier or non-matching commands in
+    /// `recv_sent` order.
+    pub async fn recv_message_to(&mut self, target: &str) -> String {
+        loop {
+            while let Ok(cmd) = self.outbound_rx.try_recv() {
+                self.pending_cmds.push_back(cmd);
+            }
+            let (_, cm) = self.current_nick_and_casemap();
+            if let Some(idx) = self.pending_cmds.iter().position(|cmd| {
+                matches!(
+                    cmd,
+                    Command::PRIVMSG(dest, _) | Command::NOTICE(dest, _)
+                        if cm.str_eq(dest, target)
+                )
+            }) {
+                let Some(Command::PRIVMSG(_, payload) | Command::NOTICE(_, payload)) =
+                    self.pending_cmds.remove(idx)
+                else {
+                    unreachable!()
+                };
+                return Text::parse(&payload).plain();
+            }
+
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("TestServer::recv_message_to timed out waiting for message to {target:?}")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "TestServer::recv_message_to saw outbound channel close before message to {target:?}"
+                        )
+                    });
+            self.pending_cmds.push_back(next);
+        }
     }
 }
 

@@ -288,15 +288,16 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
     server.complete_join("#lobby", &["Alice", "Cara", "Dan", "Eve"]);
     server.settle().await;
 
+    let alice = bot.user("Alice").unwrap();
+    let untracked_bob = bot.user("UntrackedBob").unwrap();
+    let cara = bot.user("Cara").unwrap();
+    let ghost_user = bot.user("GhostUser").unwrap();
     let dan = bot.user("Dan").unwrap();
     let eve = bot.user("Eve").unwrap();
 
     let vault_task = tokio::spawn({
         let bot = bot.clone();
-        async move {
-            bot.breakout_with(BreakoutOptions::exact("#vault").modes(None::<&str>))
-                .await
-        }
+        async move { bot.breakout_with(BreakoutOptions::exact("#vault").no_modes()).await }
     });
     assert_eq!(
         server.recv_sent().await.unwrap(),
@@ -305,8 +306,8 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
     server.complete_join("#vault", &[]);
     let vault = vault_task.await.unwrap().unwrap();
 
-    // 1. String targets (`"Alice"` in `#lobby` + `"UntrackedBob"` not in `#lobby`) rename between INVITE and JOIN:
-    let wait_renamed = vault.invite_and_wait(["Alice", "UntrackedBob"], Duration::from_secs(1));
+    // 1. Users (`Alice` in `#lobby` + `UntrackedBob` not in `#lobby`) rename between INVITE and JOIN:
+    let wait_renamed = vault.invite_and_wait([&alice, &untracked_bob], Duration::from_secs(1));
     let drive_renamed = async {
         assert_eq!(
             server.recv_sent().await.unwrap(),
@@ -327,8 +328,8 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
     assert!(vault.has_nick("Alicia"));
     assert!(vault.has_nick("Bobby"));
 
-    // 2. String target renames then QUITs before joining -> immediate `Error::UserLeft` with new nick:
-    let wait_quit = vault.invite_and_wait(["Cara"], Duration::from_secs(5));
+    // 2. User renames then QUITs before joining -> immediate `Error::UserLeft` with new nick:
+    let wait_quit = vault.invite_and_wait([&cara], Duration::from_secs(5));
     let drive_quit = async {
         assert_eq!(
             server.recv_sent().await.unwrap(),
@@ -344,8 +345,8 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
         "expected UserLeft(Cara_afk), got {res_quit:?}"
     );
 
-    // 3. Unknown string target receives 401 -> immediate `Error::UserLeft` (never hangs to HandshakeTimeout):
-    let wait_401 = vault.invite_and_wait(["GhostUser"], Duration::from_secs(5));
+    // 3. Unknown user receives 401 -> immediate `Error::UserLeft` (never hangs to HandshakeTimeout):
+    let wait_401 = vault.invite_and_wait([&ghost_user], Duration::from_secs(5));
     let drive_401 = async {
         assert_eq!(
             server.recv_sent().await.unwrap(),
@@ -401,4 +402,37 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
     };
     let (joined_avail, ()) = tokio::join!(avail_cross, drive_avail);
     assert_eq!(joined_avail.unwrap(), vec![eve.clone()]);
+
+    // 6. Early joiner parting before second invitee joins fails `invite_and_wait` with `UserLeft`:
+    let p1 = bot.user("Early1").unwrap();
+    let p2 = bot.user("Late2").unwrap();
+    let wait_early_part = vault.invite_and_wait([&p1, &p2], Duration::from_secs(5));
+    let drive_early_part = async {
+        let _ = server.recv_sent().await.unwrap();
+        let _ = server.recv_sent().await.unwrap();
+        server.join_user("Early1", "#vault");
+        server.part_user("Early1", "#vault", Some("changed mind"));
+        server.join_user("Late2", "#vault");
+        server.settle().await;
+    };
+    let (res_early_part, ()) = tokio::join!(wait_early_part, drive_early_part);
+    assert!(matches!(
+        res_early_part,
+        Err(Error::UserLeft { ref nick, .. }) if nick == "Early1"
+    ));
+
+    // 7. Early joiner quitting before handshake finishes is excluded from `invite_available`:
+    let q1 = bot.user("EarlyQuit").unwrap();
+    let q2 = bot.user("Survivor").unwrap();
+    let wait_avail_quit = vault.invite_available([&q1, &q2], Duration::from_secs(5));
+    let drive_avail_quit = async {
+        let _ = server.recv_sent().await.unwrap();
+        let _ = server.recv_sent().await.unwrap();
+        server.join_user("EarlyQuit", "#vault");
+        server.quit_user("EarlyQuit", Some("lost wifi"));
+        server.join_user("Survivor", "#vault");
+        server.settle().await;
+    };
+    let (res_avail_quit, ()) = tokio::join!(wait_avail_quit, drive_avail_quit);
+    assert_eq!(res_avail_quit.unwrap(), vec![q2]);
 }

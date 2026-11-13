@@ -113,3 +113,29 @@ async fn safecracker_breach_and_wrong_wire_doubles_alarm_rate_to_catch_crew() {
         .iter()
         .any(|m| m.contains("BUSTED!")));
 }
+
+#[tokio::test(start_paused = true)]
+async fn disconnect_during_breach_propagates_fatal_error_instead_of_swallowing() {
+    let (bot, mut srv) = test_harness("GM");
+    srv.complete_join("#lobby", &["Alice", "Bob"]);
+    srv.settle().await;
+
+    let lobby = bot.room("#lobby").unwrap();
+    let alice = bot.user("Alice").unwrap();
+    let bob = bot.user("Bob").unwrap();
+
+    let game = tokio::spawn({
+        let bot = bot.clone();
+        let lobby = lobby.clone();
+        async move { run_heist(&bot, &lobby, &alice, &bob, Wire::Red).await }
+    });
+
+    let _vault = accept_vault_and_join_crew(&mut srv, &["Alice", "Bob"]).await;
+    srv.disconnect();
+
+    let err = game.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, ircgm::Error::Disconnected(_)),
+        "expected fatal Error::Disconnected, got {err:?}"
+    );
+}

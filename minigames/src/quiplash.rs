@@ -23,8 +23,8 @@
 //!   server DM rejection numerics to [`Turn::Unreachable`].
 //! - **Identity-safe channel ballot collection:** [`Inbox::wait_map`] + [`UserId`] keys block
 //!   self-votes and double-votes even across mid-round `/nick` changes.
-//! - **Deadlock-free [`Bot::exclusive_many`] + wire-fair [`Bot::inbox_users`] tiebreaker:** Locks
-//!   tied finalists in canonical order and adjudicates packet-burst ties strictly by wire arrival (`seq`).
+//! - **Drop-out tolerant [`Bot::huddle_available`] + [`Huddle::ask`] tiebreaker:** Locks online
+//!   finalists in canonical order and adjudicates packet-burst ties strictly by wire arrival (`seq`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -38,12 +38,12 @@ const DEFAULT_PROMPTS: &[&str] = &[
     "Secret ingredient in mystery meat",
 ];
 
-/// Lobby entrypoint: recruits 3 players, collects DM quips, votes in `room`, and breaks ties via DM buzz-in!
-pub async fn play(bot: &Bot, room: &Room) -> Result<Option<(User, String)>> {
+/// Lobby entrypoint: recruits 3 players, collects DM quips, votes in `lobby`, and breaks ties via DM buzz-in!
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
-        crate::recruit_players(room, "Quiplash", 3, Duration::from_secs(30)).await?
+        crate::recruit_players(lobby, "Quiplash", 3..=3, Duration::from_secs(30)).await?
     else {
-        return Ok(None);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
 
     let assignments: Vec<(User, &str)> = players
@@ -52,8 +52,9 @@ pub async fn play(bot: &Bot, room: &Room) -> Result<Option<(User, String)>> {
         .map(|(idx, u)| (u, DEFAULT_PROMPTS[idx % DEFAULT_PROMPTS.len()]))
         .collect();
 
-    let submissions = collect_quips(room, &assignments).await?;
-    vote_on_quips(bot, room, &submissions).await
+    let submissions = collect_quips(lobby, &assignments).await?;
+    let _ = vote_on_quips(bot, lobby, &submissions).await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 /// Collects simultaneous secret DM quips from `assignments` (`(player, prompt)`), announcing
@@ -136,20 +137,25 @@ pub async fn tiebreaker_buzz_in(
     room: &Room,
     finalists: &[User],
 ) -> Result<Option<User>> {
-    let _locks = bot.exclusive_many(finalists).await?;
-    let mut race_in = bot.inbox_users(finalists);
-
-    room.say("⚡ TIEBREAKER! Finalists, check your DMs for a sudden-death math buzz-in!".yellow().bold())?;
-    for p in finalists {
-        p.say("⚡ Tiebreaker! What is 17 * 6? (20s)")?;
+    let mut huddle = bot.huddle_available(finalists).await?;
+    if huddle.is_empty() {
+        return Ok(None);
     }
 
-    race_in
-        .wait_for(|m| m.text.trim() == "102")
-        .with_timeout(Duration::from_secs(20))
-        .optional()
+    room.say(
+        "⚡ TIEBREAKER! Finalists, check your DMs for a sudden-death math buzz-in!"
+            .yellow()
+            .bold(),
+    )?;
+    huddle
+        .ask("⚡ Tiebreaker! What is 17 * 6? (20s)", |m| {
+            (m.text.trim() == "102").then(|| m.sender.clone())
+        })
+        .reply_timeout(Duration::from_secs(20))
+        .no_timeout_message()
+        .settled()
         .await
-        .map(|opt| opt.map(|m| m.sender))
+        .map(Turn::into_reply)
 }
 
 /// Posts anonymous quips in `room`, collects `!pick <1..=N>` votes for `20s`, and breaks ties via DM buzz-in.
@@ -185,12 +191,12 @@ pub async fn vote_on_quips(
         loop {
             let msg = inbox.wait_cmd("!pick").await?;
             if let Some(choice) = msg
-                .cmd_args("!pick")
+                .cmd_arg("!pick")
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| (1..=submissions.len()).contains(&n))
             {
                 let idx = choice - 1;
-                if submissions[idx].0.id() != msg.sender.id() {
+                if submissions[idx].0 != msg.sender {
                     ballots.insert(msg.sender.id(), idx);
                 }
             }
@@ -213,7 +219,7 @@ pub async fn vote_on_quips(
         let mut unique_finalists = Vec::new();
         for &idx in &tied_indices {
             let author = &submissions[idx].0;
-            if !unique_finalists.iter().any(|u: &User| u.id() == author.id()) {
+            if !unique_finalists.contains(author) {
                 unique_finalists.push(author.clone());
             }
         }
@@ -222,7 +228,7 @@ pub async fn vote_on_quips(
                 Some(buzz_winner) => tied_indices
                     .iter()
                     .copied()
-                    .find(|&idx| submissions[idx].0.id() == buzz_winner.id())
+                    .find(|&idx| submissions[idx].0 == buzz_winner)
                     .unwrap_or(tied_indices[0]),
                 None => tied_indices[0],
             }

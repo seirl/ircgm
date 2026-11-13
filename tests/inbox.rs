@@ -6,6 +6,7 @@ use futures::future::try_join_all;
 use irc::proto::Command;
 use ircgm::prelude::*;
 use ircgm::testing::{test_harness, test_harness_with};
+use ircgm::BotConfig;
 
 #[tokio::test]
 async fn packet_burst_and_wire_fair_inbox_users_race() {
@@ -202,7 +203,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     assert!(m_vote.is_dm());
     assert_eq!(m_vote.cmd_args("!vote"), Some("Bob"));
 
-    bot.reply(&m_vote, "Recorded").unwrap();
+    m_vote.reply("Recorded").unwrap();
     assert_eq!(
         server.recv_sent().await.unwrap(),
         Command::NOTICE("Alice".into(), "Recorded".into())

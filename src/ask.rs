@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::panic::Location;
@@ -230,6 +230,13 @@ pub(crate) enum AskSource<'a> {
     BorrowedHuddle {
         huddle: &'a mut Huddle,
     },
+    ImmediateErr(Error),
+}
+
+#[derive(Default)]
+struct HuddleBounceState {
+    bounced_users: HashSet<UserId>,
+    rename_retries: HashMap<UserId, u8>,
 }
 
 enum EndpointSender<'a> {
@@ -243,10 +250,13 @@ enum EndpointSender<'a> {
     Dm {
         core: &'a Arc<BotCore>,
         user: &'a User,
+        prompt: Text,
+        rename_retries: Mutex<u8>,
     },
     Huddle {
         sender: HuddleSender<'a>,
-        bounced_users: Mutex<HashSet<UserId>>,
+        prompt: Text,
+        bounce_state: Mutex<HuddleBounceState>,
     },
 }
 
@@ -316,28 +326,64 @@ impl<'a> EndpointSender<'a> {
             EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => room
                 .casemap()
                 .str_eq(target, room.name())
-                .then(|| Error::DeliveryFailed {
-                    target: target.to_owned(),
+                .then(|| Error::ChannelSendFailed {
+                    channel: target.to_owned(),
                     code,
                     message: message.to_owned(),
                 }),
-            EndpointSender::Dm { user, .. } => (target_user_id == Some(user.track_id())).then(|| {
-                Error::DeliveryFailed {
-                    target: target.to_owned(),
+            EndpointSender::Dm {
+                core,
+                user,
+                prompt,
+                rename_retries,
+            } => {
+                if target_user_id != Some(user.track_id()) {
+                    return None;
+                }
+                if code == 401 {
+                    let mut retries = rename_retries.lock().unwrap();
+                    if let Some(new_nick) = user
+                        .track_arc()
+                        .next_rename_retry_nick(target, &mut retries)
+                    {
+                        let _ = core.send_chat_with_receipt(
+                            OutboundChatKind::Privmsg,
+                            &new_nick,
+                            prompt.clone(),
+                        );
+                        return None;
+                    }
+                }
+                Some(Error::UserUnreachable {
+                    nick: target.to_owned(),
                     code,
                     message: message.to_owned(),
-                }
-            }),
+                })
+            }
             EndpointSender::Huddle {
                 sender,
-                bounced_users,
+                prompt,
+                bounce_state,
             } => {
-                if let Some(uid) = sender.find_matching_user_id(target_user_id) {
-                    let mut bounced = bounced_users.lock().unwrap();
-                    bounced.insert(uid);
-                    if !sender.any_reachable_online(&bounced) {
-                        return Some(Error::DeliveryFailed {
-                            target: target.to_owned(),
+                if let Some(member) = sender.find_matching_user(target_user_id) {
+                    let mut state = bounce_state.lock().unwrap();
+                    if code == 401 {
+                        let retries = state.rename_retries.entry(member.id()).or_insert(0);
+                        if let Some(new_nick) =
+                            member.track_arc().next_rename_retry_nick(target, retries)
+                        {
+                            let _ = sender.core().send_chat_with_receipt(
+                                OutboundChatKind::Privmsg,
+                                &new_nick,
+                                prompt.clone(),
+                            );
+                            return None;
+                        }
+                    }
+                    state.bounced_users.insert(member.id());
+                    if !sender.any_reachable_online(&state.bounced_users) {
+                        return Some(Error::UserUnreachable {
+                            nick: target.to_owned(),
                             code,
                             message: message.to_owned(),
                         });
@@ -351,13 +397,15 @@ impl<'a> EndpointSender<'a> {
 
 type BoxAskFuture<'a, O> = Pin<Box<dyn Future<Output = Result<O>> + Send + 'a>>;
 
+struct AskUnstarted<'a, F> {
+    cfg: AskConfig,
+    source: AskSource<'a>,
+    prompt: Text,
+    matcher: Box<F>,
+}
+
 enum AskState<'a, F, O> {
-    Unstarted {
-        cfg: AskConfig,
-        source: AskSource<'a>,
-        prompt: Text,
-        matcher: Box<F>,
-    },
+    Unstarted(Box<AskUnstarted<'a, F>>),
     Running(BoxAskFuture<'a, O>),
     Done,
 }
@@ -377,18 +425,22 @@ impl<'a, F, R: IntoVerdict> Ask<'a, F, R> {
         matcher: F,
     ) -> Self {
         Self {
-            state: AskState::Unstarted {
+            state: AskState::Unstarted(Box::new(AskUnstarted {
                 cfg: base_cfg,
                 source,
                 prompt,
                 matcher: Box::new(matcher),
-            },
+            })),
         }
     }
 
-    fn cfg_mut(&mut self) -> &mut AskConfig {
+    fn map_cfg(mut self, f: impl FnOnce(AskConfig) -> AskConfig) -> Self {
         match &mut self.state {
-            AskState::Unstarted { cfg, .. } => cfg,
+            AskState::Unstarted(unstarted) => {
+                let taken = std::mem::take(&mut unstarted.cfg);
+                unstarted.cfg = f(taken);
+                self
+            }
             AskState::Running(_) | AskState::Done => {
                 unreachable!("Ask builder methods consume self before polling")
             }
@@ -396,74 +448,62 @@ impl<'a, F, R: IntoVerdict> Ask<'a, F, R> {
     }
 
     /// Applies a reusable [`AskConfig`] value to this prompt.
-    pub fn config(mut self, cfg: &AskConfig) -> Self {
-        *self.cfg_mut() = cfg.clone();
-        self
+    pub fn config(self, cfg: &AskConfig) -> Self {
+        self.map_cfg(|_| cfg.clone())
     }
 
     /// Overrides the post-write reply deadline for this prompt.
-    pub fn reply_timeout(mut self, duration: Duration) -> Self {
-        self.cfg_mut().time_limit = TimeLimit::Duration(duration);
-        self
+    pub fn reply_timeout(self, duration: Duration) -> Self {
+        self.map_cfg(|c| c.reply_timeout(duration))
     }
 
     /// Overrides the post-write deadline for this prompt using an absolute [`Instant`].
-    pub fn reply_deadline(mut self, instant: Instant) -> Self {
-        self.cfg_mut().time_limit = TimeLimit::Deadline(instant);
-        self
+    pub fn reply_deadline(self, instant: Instant) -> Self {
+        self.map_cfg(|c| c.reply_deadline(instant))
     }
 
     /// Disables the reply deadline for this prompt.
-    pub fn no_reply_timeout(mut self) -> Self {
-        self.cfg_mut().time_limit = TimeLimit::None;
-        self
+    pub fn no_reply_timeout(self) -> Self {
+        self.map_cfg(AskConfig::no_reply_timeout)
     }
 
     /// Schedules a countdown warning `msg` when `remaining` time is left on this `Ask`'s
     /// post-write reply clock.
-    pub fn warn_remaining(mut self, remaining: Duration, msg: impl Into<Text>) -> Self {
-        self.cfg_mut().warnings.push((remaining, msg.into()));
-        self
+    pub fn warn_remaining(self, remaining: Duration, msg: impl Into<Text>) -> Self {
+        self.map_cfg(|c| c.warn_remaining(remaining, msg))
     }
 
     /// Clears any countdown warnings inherited from the handle's or `config`'s [`AskConfig`].
-    pub fn clear_warnings(mut self) -> Self {
-        self.cfg_mut().warnings.clear();
-        self
+    pub fn clear_warnings(self) -> Self {
+        self.map_cfg(AskConfig::clear_warnings)
     }
 
     /// Opt-in command skipping for this prompt (`BotConfig::command_prefixes`, default `["!"]`).
-    pub fn ignore_commands(mut self) -> Self {
-        self.cfg_mut().ignore_commands = true;
-        self
+    pub fn ignore_commands(self) -> Self {
+        self.map_cfg(AskConfig::ignore_commands)
     }
 
     /// Opt-in human `NOTICE` acceptance for this prompt (`MessageKind::Notice`).
-    pub fn accept_notices(mut self) -> Self {
-        self.cfg_mut().accept_notices = true;
-        self
+    pub fn accept_notices(self) -> Self {
+        self.map_cfg(AskConfig::accept_notices)
     }
 
     /// Overrides the message sent to the target if *this `Ask`'s own reply timer* expires.
-    pub fn timeout_message(mut self, msg: impl Into<Text>) -> Self {
-        self.cfg_mut().timeout_handler = Some(TimeoutHandler::Static(msg.into()));
-        self
+    pub fn timeout_message(self, msg: impl Into<Text>) -> Self {
+        self.map_cfg(|c| c.timeout_message(msg))
     }
 
-    pub fn timeout_message_fn<G, M>(mut self, f: G) -> Self
+    pub fn timeout_message_fn<G, M>(self, f: G) -> Self
     where
         G: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
         M: Into<Text>,
     {
-        self.cfg_mut().timeout_handler =
-            Some(TimeoutHandler::Dynamic(Arc::new(move |ctx| f(ctx).into())));
-        self
+        self.map_cfg(|c| c.timeout_message_fn(f))
     }
 
     /// Suppresses any inherited timeout message on this prompt.
-    pub fn no_timeout_message(mut self) -> Self {
-        self.cfg_mut().timeout_handler = None;
-        self
+    pub fn no_timeout_message(self) -> Self {
+        self.map_cfg(AskConfig::no_timeout_message)
     }
 }
 
@@ -505,6 +545,7 @@ fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
             user = Option::<&str>::None,
             timeout_ms = timeout_ms
         ),
+        AskSource::ImmediateErr(_) => tracing::debug_span!("ircgm::ask", timeout_ms = timeout_ms),
     }
 }
 
@@ -640,7 +681,11 @@ where
     R: IntoVerdict + 'a,
     R::Output: Send + 'a,
 {
+    if prompt.is_empty() {
+        return Err(Error::InvalidInput("Ask prompt cannot be empty"));
+    }
     match source {
+        AskSource::ImmediateErr(err) => Err(err),
         AskSource::RoomOpen { room, caller } => {
             room.ensure_bot_in_room_if_tracked()?;
             let mut inbox = room.inbox_at(caller);
@@ -698,7 +743,7 @@ where
                 }
             };
             dm.inbox().clear();
-            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,
@@ -706,6 +751,8 @@ where
                 EndpointSender::Dm {
                     core,
                     user: dm_user,
+                    prompt,
+                    rename_retries: Mutex::new(0),
                 },
                 inbox,
                 receipt,
@@ -718,7 +765,7 @@ where
                 return Err(err);
             }
             dm.inbox().clear();
-            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,
@@ -726,6 +773,8 @@ where
                 EndpointSender::Dm {
                     core,
                     user: dm_user,
+                    prompt,
+                    rename_retries: Mutex::new(0),
                 },
                 inbox,
                 receipt,
@@ -736,13 +785,14 @@ where
             huddle.check_connected()?;
             huddle.inbox().clear();
             let (sender, inbox) = huddle.split_for_ask();
-            let receipt = sender.broadcast_prompt_with_receipt(prompt)?;
+            let receipt = sender.broadcast_prompt_with_receipt(prompt.clone())?;
             await_ask_loop(
                 &cfg,
                 &mut *matcher,
                 EndpointSender::Huddle {
                     sender,
-                    bounced_users: Mutex::new(HashSet::new()),
+                    prompt,
+                    bounce_state: Mutex::new(HuddleBounceState::default()),
                 },
                 inbox,
                 receipt,
@@ -762,16 +812,18 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if matches!(this.state, AskState::Unstarted { .. }) {
-            let AskState::Unstarted {
+        if matches!(this.state, AskState::Unstarted(_)) {
+            let AskState::Unstarted(unstarted) =
+                std::mem::replace(&mut this.state, AskState::Done)
+            else {
+                unreachable!()
+            };
+            let AskUnstarted {
                 cfg,
                 source,
                 prompt,
                 matcher,
-            } = std::mem::replace(&mut this.state, AskState::Done)
-            else {
-                unreachable!()
-            };
+            } = *unstarted;
             let span = make_span(&cfg, &source);
             let fut = run_ask(cfg, source, prompt, matcher).instrument(span);
             this.state = AskState::Running(Box::pin(fut));
@@ -786,7 +838,7 @@ where
                 poll_res
             }
             AskState::Done => panic!("Ask polled after completion"),
-            AskState::Unstarted { .. } => unreachable!(),
+            AskState::Unstarted(_) => unreachable!(),
         }
     }
 }

@@ -80,23 +80,23 @@ pub mod fmt {
 
 pub mod future {
     pub use crate::supervise::{
-        MapOk, MapOutput, OkOrPending, Optional, OrUntil, RaceAll, RunFor, RunUntilDeadline,
-        Settled, Until, WithDeadline, WithTimeout,
+        MapOutput, Optional, OrUntil, RaceAll, RunFor, RunUntilDeadline, Settled, Until,
+        WithDeadline, WithTimeout,
     };
 }
 
 pub mod prelude {
     pub use crate::{
-        fmt::Colorize as _, AskConfig, Bot, BotConfig, Breakout, ChatMessage, Error, Event,
-        ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result,
-        Room, Target, Text, Turn, User, UserId, Verdict,
+        fmt::Colorize as _, AskConfig, Bot, Breakout, ChatMessage, Error, Event, ExclusiveDm,
+        GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result, Room, Text,
+        Turn, User, UserId, Verdict,
     };
 }
 
 pub use crate::{
     ask::{Ask, AskConfig, IntoVerdict, TimeoutCtx, Verdict},
     bot::{Bot, BotConfig, ShutdownRequested},
-    breakout::{Breakout, BreakoutNaming, BreakoutOptions, InviteTarget},
+    breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
     error::{DisconnectReason, Error, Result},
     huddle::Huddle,

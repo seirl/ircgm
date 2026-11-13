@@ -52,7 +52,7 @@ async fn mixed_channel_bids_and_secret_dm_appraise_and_proxy_resolve_in_wire_ord
     // Let the 20s gavel expire: Cara's proxy (`60g`) auto-outbid Bob's `50g` to `55g`!
     tokio::time::advance(Duration::from_secs(20)).await;
     let res = game.await.unwrap().unwrap().expect("winner");
-    assert_eq!(res.winner.id(), cara.id());
+    assert_eq!(res.winner, cara);
     assert_eq!(res.winning_bid, 55);
     assert_eq!(res.true_value, 100);
     assert_eq!(res.net_profit, 45);

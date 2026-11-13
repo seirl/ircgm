@@ -68,7 +68,7 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(!ws.occupant_is_op(carol));
 
     let mode_msg = parse_msg(":Bot!~bot@initial.host MODE #c +klo secret 50 Carol -v Bob\r\n");
-    ws.apply_mode_message(&mode_msg);
+    ws.apply_mode_message(&mode_msg, &users);
 
     let chan = &ws.channels[&ws.casemap.fold("#c")];
     let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
@@ -84,11 +84,21 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
         ws.apply_isupport(args);
     }
     let custom_mode = parse_msg(":Bot!~bot@initial.host MODE #c +fo 5:2 Bob\r\n");
-    ws.apply_mode_message(&custom_mode);
+    ws.apply_mode_message(&custom_mode, &users);
     let bob = ws.channels[&ws.casemap.fold("#c")]
         .member_by_nick("Bob", ws.casemap)
         .unwrap();
     assert!(ws.occupant_is_op(bob));
+
+    // Live-socket `Command::ChannelMODE` normalization fixes `irc-proto`'s `-l` arg consumption (`MODE #c -lo Bob`):
+    let live_parsed: Message = ":Bot!~bot@initial.host MODE #c -lo Bob\r\n".parse().unwrap();
+    assert!(matches!(live_parsed.command, Command::ChannelMODE(..)));
+    let normalized = normalize_inbound_message(live_parsed);
+    ws.apply_mode_message(&normalized, &users);
+    let bob = ws.channels[&ws.casemap.fold("#c")]
+        .member_by_nick("Bob", ws.casemap)
+        .unwrap();
+    assert!(!ws.occupant_is_op(bob));
 }
 
 #[test]
@@ -134,7 +144,7 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
     assert!(ch.member_by_nick("{alice}", CaseMap::Ascii).is_none());
 
     // Self-leave records `lost_channels`:
-    assert!(ws.handle_part_or_kick("#[Room]", "Bot", bt.id, Some("kicked".into())));
+    assert!(ws.handle_part_or_kick("#[Room]", "Bot", bt.id, Some("kicked".into()), 10));
     assert!(ws.lost_channels.contains_key(&CaseMap::Ascii.fold("#[room]")));
     // Rejoin clears `lost_channels`:
     ws.handle_join("#[Room]", "Bot", bt, None);
@@ -171,12 +181,12 @@ fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
     );
     users.rename("Bot", "Bot2");
     ws.handle_nick(bot_track.id, "Bot", "Bot2", None);
-    assert!(!ws.handle_part_or_kick("#c", "Bob", bob_track.id, None));
+    assert!(!ws.handle_part_or_kick("#c", "Bob", bob_track.id, None, 20));
     assert_eq!(ws.handle_quit(carol_track.id), vec!["#c".to_owned()]);
     let eve_track = users.get_or_create("Eve");
     ws.handle_join("#c", "Eve", Arc::clone(&eve_track), None);
     let mode_msg = parse_msg(":Bot2!~bot@h MODE #c +v Alicia\r\n");
-    ws.apply_mode_message(&mode_msg);
+    ws.apply_mode_message(&mode_msg, &users);
 
     // Commit on 366:
     let end = parse_msg(":srv 366 Bot2 #c :End of /NAMES list.\r\n");

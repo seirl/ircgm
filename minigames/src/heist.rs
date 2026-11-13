@@ -114,20 +114,19 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
 }
 
 /// Lobby entrypoint: recruits 2 thieves (`Hacker` + `Safecracker`) and runs Co-op Vault Heist.
-pub async fn play(bot: &Bot, lobby: &Room) -> Result<Option<HeistOutcome>> {
+pub async fn play(bot: &Bot, lobby: &Room) -> Result< crate::PlayOutcome > {
     let Some(players) =
-        crate::recruit_players(lobby, "Co-op Vault Heist", 2, Duration::from_secs(30)).await?
+        crate::recruit_players(lobby, "Co-op Vault Heist", 2..=2, Duration::from_secs(30)).await?
     else {
-        return Ok(None);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
     let safe_wire = if fastrand::bool() {
         Wire::Red
     } else {
         Wire::Blue
     };
-    run_heist(bot, lobby, &players[0], &players[1], safe_wire)
-        .await
-        .map(Some)
+    let _ = run_heist(bot, lobby, &players[0], &players[1], safe_wire).await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 /// Runs a complete 2-player Co-op Vault Heist inside a temporary `#vault-xxxxxx` [`Breakout`].
@@ -161,21 +160,23 @@ pub async fn run_heist(
         .await?;
 
     // Phase 1: Hacker (DM) vs Safecracker (#vault) race to open the outer blast door!
+    // Using `.settled()?` isolates per-player timeouts/departures while propagating fatal
+    // `Error::Disconnected` / `Error::BotLeftRoom` immediately.
     let breached = tokio::select! {
-        res = hack_terminal(hacker) => {
-            if res.is_ok() {
+        res = hack_terminal(hacker).settled() => {
+            if matches!(res?, Turn::Reply(())) {
                 vault.say("🔓 Hacker bypassed the outer vault door via DM!".green().bold())?;
                 true
             } else {
-                crack_tumblers(&vault, safecracker).await.is_ok()
+                matches!(crack_tumblers(&vault, safecracker).settled().await?, Turn::Reply(()))
             }
         }
-        res = crack_tumblers(&vault, safecracker) => {
-            if res.is_ok() {
+        res = crack_tumblers(&vault, safecracker).settled() => {
+            if matches!(res?, Turn::Reply(())) {
                 vault.say("🔓 Safecracker picked the outer vault door!".green().bold())?;
                 true
             } else {
-                hack_terminal(hacker).await.is_ok()
+                matches!(hack_terminal(hacker).settled().await?, Turn::Reply(()))
             }
         }
     };
@@ -197,12 +198,12 @@ pub async fn run_heist(
     let (rate_tx, mut rate_rx) = watch::channel(1.0_f64);
     let dual_keys = async {
         tokio::try_join!(
-            hacker
-                .inbox_in(&vault)
-                .into_wait_for(|m| m.cmd_args("!turn") == Some("alpha")),
-            safecracker
-                .inbox_in(&vault)
-                .into_wait_for(|m| m.cmd_args("!turn") == Some("omega")),
+            vault
+                .inbox_user(hacker)
+                .into_wait_for(|m| m.cmd_arg("!turn") == Some("alpha")),
+            vault
+                .inbox_user(safecracker)
+                .into_wait_for(|m| m.cmd_arg("!turn") == Some("omega")),
         )?;
         Ok::<HeistOutcome, Error>(HeistOutcome::ExtractedDualKeys)
     };
@@ -221,7 +222,7 @@ pub async fn run_heist(
                     "❄️ Liquid nitrogen sprayed on the sensor — alarm slowed to "
                         + format!("{current_rate}x!").cyan().bold(),
                 )?;
-            } else if let Some(arg) = msg.cmd_args("!cut") {
+            } else if let Some(arg) = msg.cmd_arg("!cut") {
                 if let Some(wire) = Wire::parse(arg) {
                     if wire == safe_wire {
                         return Ok::<HeistOutcome, Error>(HeistOutcome::DisarmedWire);

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -172,11 +173,9 @@ struct SchedulerState {
     burst: usize,
     window: Duration,
     sent_timestamps: VecDeque<Instant>,
-    emitting_front: VecDeque<QueuedCmd>,
     interactive: VecDeque<QueuedCmd>,
     background: VecDeque<QueuedCmd>,
     quit_pending: Option<(Option<String>, oneshot::Sender<()>)>,
-    last_casemap: CaseMap,
     pacing_warned: bool,
     closed: bool,
     aborted: bool,
@@ -184,40 +183,13 @@ struct SchedulerState {
 
 impl SchedulerState {
     fn has_pending(&self) -> bool {
-        !self.emitting_front.is_empty()
-            || !self.interactive.is_empty()
+        !self.interactive.is_empty()
             || !self.background.is_empty()
             || self.quit_pending.is_some()
     }
 
-    fn pop_next_item(&mut self, casemap: CaseMap) -> Option<QueuedCmd> {
-        if let Some(front) = self.emitting_front.pop_front() {
-            return Some(front);
-        }
-
+    fn pop_next_item(&mut self) -> Option<QueuedCmd> {
         if let Some(item) = self.interactive.pop_front() {
-            // Before emitting an Interactive `JOIN <chan>`, flush any pending Background
-            // `KICK`/`PART` items targeting the same channel so `JOIN #foo` never precedes `PART #foo`.
-            if let Command::JOIN(ref chan_list, _, _) = item.cmd {
-                let mut flushed = VecDeque::new();
-                for raw_chan in chan_list.split(',') {
-                    let target_key = casemap.fold(raw_chan.trim());
-                    let mut remaining = VecDeque::with_capacity(self.background.len());
-                    while let Some(bg_item) = self.background.pop_front() {
-                        if bg_item.bg_channel.as_ref() == Some(&target_key) {
-                            flushed.push_back(bg_item);
-                        } else {
-                            remaining.push_back(bg_item);
-                        }
-                    }
-                    self.background = remaining;
-                }
-                if !flushed.is_empty() {
-                    self.emitting_front.extend(flushed);
-                    self.emitting_front.push_back(item);
-                    return self.emitting_front.pop_front();
-                }
-            }
             return Some(item);
         }
 
@@ -239,7 +211,7 @@ impl SchedulerState {
 
     /// Flushes as many queued items as permitted by the rolling burst window at `now`.
     /// Returns `Some(next_slot_instant)` if items remain throttled, or `None` if drained.
-    fn try_flush_ready(&mut self, now: Instant, casemap: CaseMap) -> Option<Instant> {
+    fn try_flush_ready(&mut self, now: Instant) -> Option<Instant> {
         if self.burst != usize::MAX {
             while let Some(&oldest) = self.sent_timestamps.front() {
                 if now.saturating_duration_since(oldest) >= self.window {
@@ -262,7 +234,7 @@ impl SchedulerState {
                     tracing::warn!(
                         burst = self.burst,
                         window_ms = self.window.as_millis() as u64,
-                        queued_interactive = self.interactive.len() + self.emitting_front.len(),
+                        queued_interactive = self.interactive.len(),
                         queued_background = self.background.len(),
                         "outbound IRC rate limit reached; pacing queued commands"
                     );
@@ -271,7 +243,7 @@ impl SchedulerState {
                 return Some(oldest + self.window);
             }
 
-            let Some(item) = self.pop_next_item(casemap) else {
+            let Some(item) = self.pop_next_item() else {
                 self.pacing_warned = false;
                 return None;
             };
@@ -291,6 +263,7 @@ impl SchedulerState {
 pub(crate) struct OutboundSink {
     state: Mutex<SchedulerState>,
     notify: Notify,
+    enqueue_seq: AtomicU64,
 }
 
 impl OutboundSink {
@@ -306,16 +279,15 @@ impl OutboundSink {
                 burst,
                 window,
                 sent_timestamps: VecDeque::new(),
-                emitting_front: VecDeque::new(),
                 interactive: VecDeque::new(),
                 background: VecDeque::new(),
                 quit_pending: None,
-                last_casemap: CaseMap::default(),
                 pacing_warned: false,
                 closed: false,
                 aborted: false,
             }),
             notify: Notify::new(),
+            enqueue_seq: AtomicU64::new(0),
         });
 
         let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -330,6 +302,10 @@ impl OutboundSink {
         (sink, task)
     }
 
+    pub(crate) fn enqueue_seq(&self) -> u64 {
+        self.enqueue_seq.load(Ordering::Acquire)
+    }
+
     async fn run_pacer(sink: Arc<Self>) {
         loop {
             let next_wake = {
@@ -337,8 +313,7 @@ impl OutboundSink {
                 if st.aborted {
                     break;
                 }
-                let cm = st.last_casemap;
-                st.try_flush_ready(Instant::now(), cm)
+                st.try_flush_ready(Instant::now())
             };
 
             match next_wake {
@@ -373,9 +348,29 @@ impl OutboundSink {
             if st.closed || st.aborted || st.quit_pending.is_some() {
                 return WriteReceipt::immediate();
             }
-            st.last_casemap = casemap;
+            self.enqueue_seq.fetch_add(1, Ordering::Release);
 
             for cmd in cmds {
+                if priority == Priority::Interactive {
+                    // Promote any earlier Background `KICK`/`PART` on the same channel ahead of
+                    // this `JOIN` at enqueue time so `PART #c` -> `JOIN #c` preserves order while
+                    // a later `PART #c` enqueued after `JOIN #c` stays behind `JOIN #c`.
+                    if let Command::JOIN(ref chan_list, _, _) = cmd {
+                        for raw_chan in chan_list.split(',') {
+                            let target_key = casemap.fold(raw_chan.trim());
+                            let mut remaining = VecDeque::with_capacity(st.background.len());
+                            while let Some(bg_item) = st.background.pop_front() {
+                                if bg_item.bg_channel.as_ref() == Some(&target_key) {
+                                    st.interactive.push_back(bg_item);
+                                } else {
+                                    remaining.push_back(bg_item);
+                                }
+                            }
+                            st.background = remaining;
+                        }
+                    }
+                }
+
                 let bg_channel = if priority == Priority::Background {
                     match &cmd {
                         Command::KICK(chan, _, _) | Command::PART(chan, _) => {
@@ -405,7 +400,7 @@ impl OutboundSink {
                 last.receipt_tx = Some(tx);
             }
 
-            st.try_flush_ready(Instant::now(), casemap).is_some()
+            st.try_flush_ready(Instant::now()).is_some()
         };
 
         if needs_wake {
@@ -425,7 +420,7 @@ impl OutboundSink {
 
     /// Schedules `QUIT` after all currently queued `Interactive` and `Background` commands drain,
     /// returning a [`WriteReceipt`] resolved once `QUIT` has been written.
-    pub(crate) fn enqueue_quit(&self, reason: Option<&str>, casemap: CaseMap) -> WriteReceipt {
+    pub(crate) fn enqueue_quit(&self, reason: Option<&str>, _casemap: CaseMap) -> WriteReceipt {
         let clean_reason = reason.map(sanitize_reason);
         let (tx, rx) = oneshot::channel();
         let needs_wake = {
@@ -433,9 +428,9 @@ impl OutboundSink {
             if st.closed || st.aborted {
                 return WriteReceipt::immediate();
             }
-            st.last_casemap = casemap;
+            self.enqueue_seq.fetch_add(1, Ordering::Release);
             st.quit_pending = Some((clean_reason, tx));
-            st.try_flush_ready(Instant::now(), casemap).is_some()
+            st.try_flush_ready(Instant::now()).is_some()
         };
         if needs_wake {
             self.notify.notify_one();
@@ -448,7 +443,6 @@ impl OutboundSink {
             let mut st = self.state.lock().unwrap();
             st.aborted = true;
             st.closed = true;
-            st.emitting_front.clear();
             st.interactive.clear();
             st.background.clear();
             st.quit_pending = None;

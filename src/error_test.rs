@@ -3,50 +3,58 @@ use std::panic::Location;
 use super::*;
 
 #[test]
-fn is_fatal_classifies_player_vs_session_errors() {
+fn is_fatal_distinguishes_dead_session_from_room_or_player_errors() {
+    // Only transport / socket termination is session-fatal:
+    assert!(Error::Disconnected(DisconnectReason::Eof).is_fatal());
+    assert!(Error::Disconnected(DisconnectReason::Quit).is_fatal());
+    assert!(Error::Disconnected(DisconnectReason::BotDropped).is_fatal());
+    assert!(Error::Disconnected(DisconnectReason::Transport("reset".into())).is_fatal());
+
+    // Per-player and per-room errors do NOT tear down the whole Bot session:
     assert!(!Error::TimedOut.is_fatal());
     assert!(!Error::UserLeft {
         nick: "alice".into(),
         reason: Some("Quit: bye".into()),
     }
     .is_fatal());
-    assert!(!Error::DeliveryFailed {
-        target: "alice".into(),
+    assert!(!Error::UserUnreachable {
+        nick: "alice".into(),
         code: 716,
         message: "is in +g mode".into(),
     }
     .is_fatal());
-
-    assert!(Error::Disconnected(DisconnectReason::Eof).is_fatal());
-    assert!(Error::Disconnected(DisconnectReason::Quit).is_fatal());
-    assert!(Error::Disconnected(DisconnectReason::BotDropped).is_fatal());
-    assert!(Error::Disconnected(DisconnectReason::Transport("reset".into())).is_fatal());
-    assert!(Error::Lagged {
+    assert!(!Error::ChannelSendFailed {
+        channel: "#lobby".into(),
+        code: 404,
+        message: "Cannot send to channel".into(),
+    }
+    .is_fatal());
+    assert!(!Error::Lagged {
         scope: "room #lobby".into(),
         skipped: 42,
         opened_at: Location::caller(),
     }
     .is_fatal());
-    assert!(Error::JoinFailed {
+    assert!(!Error::JoinFailed {
         channel: "#secret".into(),
         code: 473,
         message: "Cannot join (+i)".into(),
     }
     .is_fatal());
-    assert!(Error::BotLeftRoom {
+    assert!(!Error::BotLeftRoom {
         channel: "#lobby".into(),
         reason: None,
     }
     .is_fatal());
-    assert!(Error::NotChannelOp {
+    assert!(!Error::NotChannelOp {
         channel: "#heist-123".into(),
     }
     .is_fatal());
-    assert!(Error::HandshakeTimeout {
+    assert!(!Error::HandshakeTimeout {
         operation: "JOIN / NAMES",
     }
     .is_fatal());
-    assert!(Error::InvalidInput("empty target").is_fatal());
+    assert!(!Error::InvalidInput("empty target").is_fatal());
 }
 
 #[test]

@@ -38,23 +38,25 @@ pub struct AuctionWinner {
 const MIN_INCREMENT: u32 = 5;
 const OPENING_MIN: u32 = 10;
 
-/// Lobby entrypoint: recruits 3 bidders and auctions a mystery relic.
-pub async fn play(bot: &Bot, room: &Room) -> Result<Option<AuctionWinner>> {
+/// Lobby entrypoint: recruits 2–5 bidders and auctions a mystery relic.
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
-        crate::recruit_players(room, "Silent-Snipe Auction", 3, Duration::from_secs(30)).await?
+        crate::recruit_players(lobby, "Silent-Snipe Auction", 2..=5, Duration::from_secs(30))
+            .await?
     else {
-        return Ok(None);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
     let true_value = 40 + fastrand::u32(0..=22) * 5;
-    run_auction(
+    let _ = run_auction(
         bot,
-        room,
+        lobby,
         &players,
         "Sunken Astrolabe",
         true_value,
         Duration::from_secs(20),
     )
-    .await
+    .await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 fn min_required_bid(high_bid: Option<&(User, u32)>) -> u32 {
@@ -74,7 +76,7 @@ fn apply_proxies(
         let challenger = proxies.iter().find(|(u, max_amt)| {
             let is_already_leader = high_bid
                 .as_ref()
-                .is_some_and(|(leader, _)| leader.id() == u.id());
+                .is_some_and(|(leader, _)| leader == u);
             !is_already_leader && *max_amt >= needed
         });
 
@@ -136,11 +138,11 @@ pub async fn run_auction(
                     } else {
                         msg.sender.say("You already used your appraisal!".yellow())?;
                     }
-                } else if let Some(arg) = msg.cmd_args("!proxy") {
+                } else if let Some(arg) = msg.cmd_arg("!proxy") {
                     match arg.parse::<u32>() {
                         Ok(max_amt) if max_amt >= min_required_bid(high_bid.as_ref()) => {
                             if let Some(slot) =
-                                proxies.iter_mut().find(|(u, _)| u.id() == msg.sender.id())
+                                proxies.iter_mut().find(|(u, _)| u == &msg.sender)
                             {
                                 slot.1 = max_amt;
                             } else {
@@ -162,7 +164,7 @@ pub async fn run_auction(
                     }
                 }
             } else if msg.is_in(room) {
-                if let Some(arg) = msg.cmd_args("!bid") {
+                if let Some(arg) = msg.cmd_arg("!bid") {
                     let needed = min_required_bid(high_bid.as_ref());
                     match arg.parse::<u32>() {
                         Ok(amt) if amt >= needed => {

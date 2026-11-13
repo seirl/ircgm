@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::ops::Deref;
 use std::panic::Location;
@@ -9,41 +10,16 @@ use irc::proto::Command;
 use irc_colors::Text;
 
 use crate::ask::AskConfig;
-use crate::casemap::CaseMap;
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
 use crate::message::WireKind;
 use crate::outbound::{sanitize_reason, sanitize_text, Priority};
-pub use crate::room::InviteTarget;
 use crate::room::Room;
-use crate::user::{User, UserStatus, UserTrack};
-
-struct PendingInvite {
-    track: Arc<UserTrack>,
-    retries: u8,
-}
-
-impl PendingInvite {
-    /// Returns `Some(new_nick)` if this `401` bounced an outdated pre-rename nick while
-    /// `self.track` is still online under `new_nick` (and retry budget remains).
-    fn next_reinvite_nick(&mut self, bounced_target: &str, cm: CaseMap) -> Option<String> {
-        let cur_nick = self.track.nick();
-        if self.track.is_online()
-            && !cur_nick.is_empty()
-            && !cm.str_eq(&cur_nick, bounced_target)
-            && self.retries < 3
-        {
-            self.retries += 1;
-            Some(cur_nick)
-        } else {
-            None
-        }
-    }
-}
+use crate::user::{User, UserStatus};
 
 /// Channel naming strategy for [`BreakoutOptions`].
 #[derive(Clone, Debug)]
-pub enum BreakoutNaming {
+pub(crate) enum BreakoutNaming {
     /// Generates `<prefix>-<6 lowercase alphanumeric>` (`prefix` must start with `'#'` or `'&'`,
     /// e.g. `"#vault"` or `"##vault"`).
     RandomSuffix { prefix: String },
@@ -83,7 +59,7 @@ impl BreakoutNaming {
 /// Configuration options for [`crate::Bot::breakout_with`].
 #[derive(Clone, Debug)]
 pub struct BreakoutOptions {
-    pub naming: BreakoutNaming,
+    pub(crate) naming: BreakoutNaming,
     /// Modes applied upon creation (default: `Some("+is".into())`).
     pub modes: Option<String>,
     /// Verifies `@` chanop after `JOIN`/`NAMES` (default: `true`).
@@ -124,6 +100,12 @@ impl BreakoutOptions {
 
     pub fn modes(mut self, modes: Option<impl Into<String>>) -> Self {
         self.modes = modes.map(Into::into);
+        self
+    }
+
+    /// Disables automatic mode setting on breakout room creation (`modes = None`).
+    pub fn no_modes(mut self) -> Self {
+        self.modes = None;
         self
     }
 
@@ -251,171 +233,64 @@ impl Breakout {
     }
 
     /// Strict all-or-nothing invite handshake.
-    pub async fn invite_and_wait<'a, I, P>(&self, targets: I, timeout: Duration) -> Result<()>
+    pub async fn invite_and_wait<I, U>(&self, users: I, timeout: Duration) -> Result<()>
     where
-        I: IntoIterator<Item = &'a P>,
-        P: InviteTarget + ?Sized + 'a,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
-        self.room.ensure_bot_in_room_if_tracked()?;
-        let core = self.room.core();
-
-        let mut tracked_users: Vec<Arc<UserTrack>> = Vec::new();
-        for t in targets {
-            let (nick, track_opt) = crate::room::resolve_invite_target(t, core)?;
-            let track = track_opt.unwrap_or_else(|| core.users.get_or_create(&nick));
-            if !tracked_users.iter().any(|existing| existing.id == track.id) {
-                tracked_users.push(track);
-            }
-        }
-        if tracked_users.is_empty() {
-            return Ok(());
-        }
-
-        let cm = core.casemap();
-        let mut inbox = core.inboxes.subscribe(
-            Arc::clone(core),
-            Filter::Scoped {
-                rooms: vec![self.room.name().to_owned()],
-                dm_users: tracked_users.clone(),
-            },
-            Location::caller(),
-            cm,
-        );
-
-        let mut pending: Vec<PendingInvite> = Vec::new();
-        let mut invite_cmds: Vec<Command> = Vec::new();
-        for track in tracked_users {
-            if let UserStatus::Quit { nick, reason, .. } = track.status() {
-                return Err(Error::UserLeft { nick, reason });
-            }
-            let already_in = {
-                let ws = core.state.read().unwrap();
-                let ckey = ws.casemap.fold(self.room.name());
-                ws.channels
-                    .get(&ckey)
-                    .is_some_and(|c| c.members.contains_key(&track.id))
-            };
-            if !already_in {
-                let nick = track.nick();
-                if !nick.is_empty() {
-                    invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
-                    pending.push(PendingInvite { track, retries: 0 });
-                }
-            }
-        }
-
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        let _ = core
-            .outbound
-            .enqueue_batch(Priority::Interactive, invite_cmds, cm);
-
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
-
-        loop {
-            let wire_res = tokio::select! {
-                biased;
-                res = poll_fn(|cx| inbox.poll_next_wire(cx)) => res,
-                _ = &mut sleep => {
-                    return Err(Error::HandshakeTimeout {
-                        operation: "breakout invite_and_wait",
-                    });
-                }
-            };
-            let wire = wire_res?;
-            let live_cm = core.casemap();
-
-            match &wire.kind {
-                WireKind::Joined { channel, user, .. }
-                    if live_cm.str_eq(channel, self.room.name()) =>
-                {
-                    pending.retain(|p| p.track.id != user.track_id());
-                    if pending.is_empty() {
-                        return Ok(());
-                    }
-                }
-                WireKind::Quit {
-                    user, nick, reason, ..
-                } => {
-                    if pending.iter().any(|p| p.track.id == user.track_id()) {
-                        return Err(Error::UserLeft {
-                            nick: nick.clone(),
-                            reason: reason.clone(),
-                        });
-                    }
-                }
-                WireKind::SendError {
-                    target,
-                    target_user_id: Some(uid),
-                    code: 401,
-                    message,
-                } => {
-                    if let Some(p) = pending.iter_mut().find(|p| p.track.id == *uid) {
-                        if let Some(new_nick) = p.next_reinvite_nick(target, live_cm) {
-                            let _ = core.outbound.enqueue_one(
-                                Priority::Interactive,
-                                Command::INVITE(new_nick, self.room.name().to_owned()),
-                                live_cm,
-                            );
-                        } else {
-                            return Err(Error::UserLeft {
-                                nick: target.clone(),
-                                reason: Some(message.clone()),
-                            });
-                        }
-                    }
-                }
-                WireKind::BotLeftRoom { channel, reason }
-                    if live_cm.str_eq(channel, self.room.name()) =>
-                {
-                    return Err(Error::BotLeftRoom {
-                        channel: channel.clone(),
-                        reason: reason.clone(),
-                    });
-                }
-                _ => {}
-            }
-
-            // Also double-check tracked statuses in case a `Quit` updated `UserTrack` directly:
-            for p in &pending {
-                if let UserStatus::Quit { nick, reason, .. } = p.track.status() {
-                    return Err(Error::UserLeft { nick, reason });
-                }
-            }
-        }
+        self.invite_handshake(users, true, timeout).await.map(|_| ())
     }
 
     /// Partial/pack-resilient invite handshake: skips offline users, invites online ones,
     /// finishes early once all invited users have either joined or quit, and returns whichever
-    /// users joined before `timeout` elapsed.
-    pub async fn invite_available<'a, I>(&self, users: I, timeout: Duration) -> Result<Vec<User>>
+    /// users joined and remained present before `timeout` elapsed.
+    pub async fn invite_available<I, U>(&self, users: I, timeout: Duration) -> Result<Vec<User>>
     where
-        I: IntoIterator<Item = &'a User>,
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
+        self.invite_handshake(users, false, timeout).await
+    }
+
+    async fn invite_handshake<I, U>(
+        &self,
+        users: I,
+        strict: bool,
+        timeout: Duration,
+    ) -> Result<Vec<User>>
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
     {
         self.room.ensure_bot_in_room_if_tracked()?;
         let core = self.room.core();
 
-        let mut online_users: Vec<User> = Vec::new();
+        let mut tracked_users: Vec<User> = Vec::new();
         let mut seen_ids: HashSet<u64> = HashSet::new();
-        for u in users {
+        for item in users {
+            let u = item.borrow();
             if !u.belongs_to(core) {
                 return Err(Error::InvalidInput(
                     "User handle belongs to a different Bot session",
                 ));
             }
-            if u.is_online() && seen_ids.insert(u.track_id()) {
-                online_users.push(u.clone());
+            if strict {
+                if let Some(err) = u.quit_error() {
+                    return Err(err);
+                }
+                if seen_ids.insert(u.track_id()) {
+                    tracked_users.push(u.clone());
+                }
+            } else if u.is_online() && seen_ids.insert(u.track_id()) {
+                tracked_users.push(u.clone());
             }
         }
 
-        if online_users.is_empty() {
+        if tracked_users.is_empty() {
             return Ok(Vec::new());
         }
 
-        let dm_tracks: Vec<Arc<UserTrack>> = online_users.iter().map(User::track_arc).collect();
+        let dm_tracks = tracked_users.iter().map(User::track_arc).collect();
         let cm = core.casemap();
         let mut inbox = core.inboxes.subscribe(
             Arc::clone(core),
@@ -429,23 +304,23 @@ impl Breakout {
 
         let mut joined_ids: HashSet<u64> = HashSet::new();
         let mut gone_ids: HashSet<u64> = HashSet::new();
-        let mut pending: Vec<PendingInvite> = Vec::new();
+        let mut retries: HashMap<u64, u8> = HashMap::new();
         let mut invite_cmds: Vec<Command> = Vec::new();
 
-        for u in &online_users {
-            if self.room.has_user(u) {
+        for u in &tracked_users {
+            if let Some(err) = u.quit_error() {
+                if strict {
+                    return Err(err);
+                }
+                gone_ids.insert(u.track_id());
+            } else if self.room.has_user(u) {
                 joined_ids.insert(u.track_id());
-            } else if u.is_online() {
+            } else {
                 let nick = u.nick();
                 if !nick.is_empty() {
                     invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
-                    pending.push(PendingInvite {
-                        track: u.track_arc(),
-                        retries: 0,
-                    });
+                    retries.insert(u.track_id(), 0);
                 }
-            } else {
-                gone_ids.insert(u.track_id());
             }
         }
 
@@ -455,8 +330,8 @@ impl Breakout {
                 .enqueue_batch(Priority::Interactive, invite_cmds, cm);
         }
 
-        if joined_ids.len() + gone_ids.len() >= online_users.len() {
-            return Ok(online_users
+        if joined_ids.len() + gone_ids.len() >= tracked_users.len() {
+            return Ok(tracked_users
                 .into_iter()
                 .filter(|u| joined_ids.contains(&u.track_id()))
                 .collect());
@@ -469,7 +344,14 @@ impl Breakout {
             let wire_res = tokio::select! {
                 biased;
                 res = poll_fn(|cx| inbox.poll_next_wire(cx)) => res,
-                _ = &mut sleep => break,
+                _ = &mut sleep => {
+                    if strict {
+                        return Err(Error::HandshakeTimeout {
+                            operation: "breakout invite_and_wait",
+                        });
+                    }
+                    break;
+                }
             };
 
             match wire_res {
@@ -479,40 +361,73 @@ impl Breakout {
                         WireKind::Joined { channel, user, .. }
                             if live_cm.str_eq(channel, self.room.name()) =>
                         {
-                            if seen_ids.contains(&user.track_id()) {
+                            if seen_ids.contains(&user.track_id()) && user.is_online() {
+                                gone_ids.remove(&user.track_id());
                                 joined_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Quit { user, .. } => {
-                            if seen_ids.contains(&user.track_id())
-                                && !joined_ids.contains(&user.track_id())
-                            {
+                        WireKind::Parted {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                        }
+                        | WireKind::Kicked {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                            ..
+                        } if live_cm.str_eq(channel, self.room.name()) => {
+                            if seen_ids.contains(&user.track_id()) {
+                                joined_ids.remove(&user.track_id());
+                                if strict {
+                                    return Err(Error::UserLeft {
+                                        nick: nick.clone(),
+                                        reason: reason.clone(),
+                                    });
+                                }
                                 gone_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Parted { channel, user, .. }
-                        | WireKind::Kicked { channel, user, .. }
-                            if live_cm.str_eq(channel, self.room.name()) =>
-                        {
-                            joined_ids.remove(&user.track_id());
-                            gone_ids.insert(user.track_id());
+                        WireKind::Quit {
+                            user, nick, reason, ..
+                        } => {
+                            if seen_ids.contains(&user.track_id()) {
+                                joined_ids.remove(&user.track_id());
+                                if strict {
+                                    return Err(Error::UserLeft {
+                                        nick: nick.clone(),
+                                        reason: reason.clone(),
+                                    });
+                                }
+                                gone_ids.insert(user.track_id());
+                            }
                         }
                         WireKind::SendError {
                             target,
                             target_user_id: Some(uid),
                             code: 401,
-                            ..
+                            message,
                         } => {
-                            if let Some(p) = pending.iter_mut().find(|p| p.track.id == *uid) {
-                                if !joined_ids.contains(&p.track.id) {
-                                    if let Some(new_nick) = p.next_reinvite_nick(target, live_cm) {
+                            if let Some(u) = tracked_users.iter().find(|u| u.track_id() == *uid) {
+                                if !joined_ids.contains(uid) {
+                                    let cnt = retries.entry(*uid).or_insert(0);
+                                    if let Some(new_nick) =
+                                        u.track_arc().next_rename_retry_nick(target, cnt)
+                                    {
                                         let _ = core.outbound.enqueue_one(
                                             Priority::Interactive,
                                             Command::INVITE(new_nick, self.room.name().to_owned()),
                                             live_cm,
                                         );
+                                    } else if strict {
+                                        return Err(Error::UserLeft {
+                                            nick: target.clone(),
+                                            reason: Some(message.clone()),
+                                        });
                                     } else {
-                                        gone_ids.insert(p.track.id);
+                                        gone_ids.insert(*uid);
                                     }
                                 }
                             }
@@ -528,22 +443,36 @@ impl Breakout {
                         _ => {}
                     }
 
-                    for u in &online_users {
-                        if !u.is_online() && !joined_ids.contains(&u.track_id()) {
+                    for u in &tracked_users {
+                        if let UserStatus::Quit { nick, reason, .. } = u.track_arc().status() {
+                            joined_ids.remove(&u.track_id());
+                            if strict {
+                                return Err(Error::UserLeft { nick, reason });
+                            }
                             gone_ids.insert(u.track_id());
                         }
                     }
 
-                    if joined_ids.len() + gone_ids.len() >= online_users.len() {
+                    if joined_ids.len() + gone_ids.len() >= tracked_users.len() {
                         break;
                     }
                 }
-                Err(Error::UserLeft { .. }) => break,
+                Err(e @ Error::UserLeft { .. }) => {
+                    if strict {
+                        return Err(e);
+                    }
+                    for u in &tracked_users {
+                        if !u.is_online() {
+                            joined_ids.remove(&u.track_id());
+                        }
+                    }
+                    break;
+                }
                 Err(e) => return Err(e),
             }
         }
 
-        Ok(online_users
+        Ok(tracked_users
             .into_iter()
             .filter(|u| joined_ids.contains(&u.track_id()))
             .collect())
@@ -571,7 +500,7 @@ impl Breakout {
         let (cmds, cmd_cm) = self.build_teardown_commands();
         let _ = core
             .outbound
-            .enqueue_batch(Priority::Background, cmds, cmd_cm);
+            .enqueue_batch(Priority::Interactive, cmds, cmd_cm);
 
         // If the channel wasn't even joined in WorldState anymore, return immediately:
         {

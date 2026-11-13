@@ -52,18 +52,18 @@ async fn huddle_sender_tracks_bounced_and_offline_members() {
 
     let outsider = bot.user("outsider").unwrap();
     assert_eq!(
-        sender.find_matching_user_id(Some(w1.id().as_u64())),
-        Some(w1.id())
+        sender.find_matching_user(Some(w1.id().as_u64())),
+        Some(&w1)
     );
     assert_eq!(
-        sender.find_matching_user_id(Some(w2.id().as_u64())),
-        Some(w2.id())
+        sender.find_matching_user(Some(w2.id().as_u64())),
+        Some(&w2)
     );
     assert_eq!(
-        sender.find_matching_user_id(Some(outsider.id().as_u64())),
+        sender.find_matching_user(Some(outsider.id().as_u64())),
         None
     );
-    assert_eq!(sender.find_matching_user_id(None), None);
+    assert_eq!(sender.find_matching_user(None), None);
 
     let mut bounced = HashSet::new();
     assert!(sender.any_reachable_online(&bounced));
@@ -78,11 +78,48 @@ async fn huddle_sender_tracks_bounced_and_offline_members() {
 }
 
 #[tokio::test]
-async fn empty_huddle_ask_returns_user_left() {
-    let (bot, _server) = test_harness("gm");
-    let mut empty = bot.huddle_available(std::iter::empty()).await.unwrap();
-    assert!(empty.is_empty());
+async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock() {
+    let (bot, mut server) = test_harness("gm");
 
+    // 1. Truly 0-argument huddle fails with `InvalidInput` (no fabricated `nick: ""`!):
+    let mut empty = bot.huddle_available(std::iter::empty::<&User>()).await.unwrap();
+    assert!(empty.is_empty());
     let res = empty.ask("Anyone here?", |m| Some(m.text.clone())).await;
-    assert!(matches!(res, Err(Error::UserLeft { .. })));
+    assert!(matches!(res, Err(Error::InvalidInput(_))));
+
+    // 2. Huddle whose candidates were offline preserves real quitter nick in `UserLeft`:
+    let gone = bot.user("ghostwolf").unwrap();
+    server.quit_user("ghostwolf", Some("away"));
+    server.settle().await;
+    let mut all_offline = bot.huddle_available([&gone]).await.unwrap();
+    assert!(all_offline.is_empty());
+    assert!(matches!(
+        all_offline.ask("Anyone here?", |m| Some(m.text.clone())).await,
+        Err(Error::UserLeft { ref nick, ref reason }) if nick == "ghostwolf" && reason.as_deref() == Some("away")
+    ));
+
+    // 3. `has_user`, `dm_mut`, and `ask_user` borrow the already-locked guard without self-deadlock:
+    let w1 = bot.user("wolf1").unwrap();
+    let w2 = bot.user("wolf2").unwrap();
+    let outsider = bot.user("villager").unwrap();
+    let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
+    assert!(pack.has_user(&w1));
+    assert!(!pack.has_user(&outsider));
+    assert!(pack.dm_mut(&outsider).is_none());
+    pack.dm_mut(&w1).unwrap().say("Alpha instructions").unwrap();
+    assert_eq!(server.recv_message_to("wolf1").await, "Alpha instructions");
+
+    let ask_member = pack.ask_user(&w2, "Confirm bite?", |m| Some(m.text.clone()));
+    let drive = async {
+        assert_eq!(server.recv_message_to("wolf2").await, "Confirm bite?");
+        server.dm("wolf2", "confirmed");
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(ask_member, drive);
+    assert_eq!(ans.unwrap(), "confirmed");
+
+    assert!(matches!(
+        pack.ask_user(&outsider, "Hello?", |m| Some(m.text.clone())).await,
+        Err(Error::InvalidInput(_))
+    ));
 }

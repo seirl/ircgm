@@ -88,7 +88,7 @@ async fn cancel_during_exclusive_dm_and_ignore_commands() {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let alice_flow = alice.clone();
     let flow_task = tokio::spawn(async move {
-        let cancel_sig = alice_flow.inbox().into_wait_cmd("!cancel").ok_or_pending();
+        let cancel_sig = alice_flow.inbox().on_cmd("!cancel");
         let body = async {
             let mut dm = alice_flow.exclusive().await?.with_ignore_commands();
             let _ = ready_tx.send(());
@@ -273,5 +273,20 @@ async fn exclusive_many_available_and_huddle_semantics() {
         .ask("Anyone?", |_| Some(()))
         .await
         .unwrap_err();
-    assert!(matches!(empty_err, Error::UserLeft { .. }));
+    assert!(matches!(empty_err, Error::UserLeft { ref nick, .. } if nick == "Wolf3"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn exclusive_dm_inbox_enforces_300s_idle_safety_timeout() {
+    let (bot, server) = test_harness("GM");
+    server.complete_join("#lobby", &["BouncerUser"]);
+    server.settle().await;
+
+    let bouncer = bot.user("BouncerUser").unwrap();
+    let mut dm = bouncer.exclusive().await.unwrap();
+
+    let start = tokio::time::Instant::now();
+    let res = dm.inbox().next_chat().await;
+    assert!(matches!(res, Err(Error::TimedOut)));
+    assert_eq!(start.elapsed(), Duration::from_secs(300));
 }

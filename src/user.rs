@@ -19,6 +19,9 @@ use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
 use crate::room::Room;
 
+static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) const MAX_RENAME_RETRIES: u8 = 3;
+
 /// Live connection state of a tracked IRC user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UserStatus {
@@ -117,6 +120,26 @@ impl UserTrack {
     pub(crate) fn status(&self) -> UserStatus {
         self.status_tx.borrow().clone()
     }
+
+    /// Returns `Some(new_nick)` if a `401` bounced an outdated pre-rename nick while
+    /// `self` is still online under `new_nick` and retry budget remains.
+    pub(crate) fn next_rename_retry_nick(
+        &self,
+        bounced_target: &str,
+        retries: &mut u8,
+    ) -> Option<String> {
+        let cur_nick = self.nick();
+        if self.is_online()
+            && !cur_nick.is_empty()
+            && !self.casemap().str_eq(&cur_nick, bounced_target)
+            && *retries < MAX_RENAME_RETRIES
+        {
+            *retries += 1;
+            Some(cur_nick)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -151,7 +174,6 @@ impl RegistryState {
 pub(crate) struct UserRegistry {
     state: Mutex<RegistryState>,
     casemap: Arc<AtomicU8>,
-    next_id: AtomicU64,
 }
 
 impl Default for UserRegistry {
@@ -165,7 +187,6 @@ impl UserRegistry {
         Self {
             state: Mutex::new(RegistryState::default()),
             casemap: Arc::new(AtomicU8::new(initial_casemap.to_u8())),
-            next_id: AtomicU64::new(1),
         }
     }
 
@@ -194,7 +215,7 @@ impl UserRegistry {
         }
 
         state.former_tracks.remove(&folded);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
         let track = Arc::new(UserTrack::new(id, nick.to_owned(), Arc::clone(&self.casemap)));
         state.tracks.insert(folded, Arc::downgrade(&track));
         track
@@ -215,7 +236,7 @@ impl UserRegistry {
         } else if let Some(existing) = state.tracks.get(&new_folded).and_then(Weak::upgrade) {
             existing
         } else {
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
             Arc::new(UserTrack::new(
                 id,
                 new_nick.to_owned(),
@@ -559,7 +580,10 @@ impl User {
     }
 
     pub(crate) fn inbox_at(&self, caller: &'static Location<'static>) -> Inbox {
-        let filter = Filter::UserDm(Arc::clone(&self.track));
+        let filter = Filter::Scoped {
+            rooms: Vec::new(),
+            dm_users: vec![Arc::clone(&self.track)],
+        };
         match self.core.upgrade() {
             Some(core) => {
                 let cm = core.casemap();
@@ -584,9 +608,12 @@ impl User {
         match self.core.upgrade() {
             Some(core) if Arc::ptr_eq(&core, room.core()) => {
                 let cm = core.casemap();
-                core.inboxes.subscribe(core.clone(), filter, caller, cm)
+                let mut inbox = core.inboxes.subscribe(core.clone(), filter, caller, cm);
+                room.ask_config().apply_to_inbox(&mut inbox);
+                inbox
             }
-            _ => Inbox::disconnected_bot_dropped(filter, caller),
+            Some(_) => Inbox::invalid_session(filter, caller),
+            None => Inbox::disconnected_bot_dropped(filter, caller),
         }
     }
 }
@@ -650,10 +677,14 @@ pub(crate) async fn acquire_single_dm_guard(
     let cm = core.casemap();
     let mut inbox = core.inboxes.subscribe(
         Arc::clone(&core),
-        Filter::UserDm(Arc::clone(&user.track)),
+        Filter::Scoped {
+            rooms: Vec::new(),
+            dm_users: vec![Arc::clone(&user.track)],
+        },
         caller,
         cm,
     );
+    inbox.idle_timeout = Some(Duration::from_secs(300));
     let ask_config = Arc::clone(&core.ask_config);
     ask_config.apply_to_inbox(&mut inbox);
 
@@ -719,13 +750,11 @@ impl ExclusiveDm {
     }
 
     pub fn with_ignore_commands(mut self) -> Self {
-        Arc::make_mut(&mut self.ask_config).ignore_commands = true;
         self.inbox.set_ignore_commands(true);
         self
     }
 
     pub fn with_accept_notices(mut self) -> Self {
-        Arc::make_mut(&mut self.ask_config).accept_notices = true;
         self.inbox.set_accept_notices(true);
         self
     }
@@ -751,7 +780,8 @@ impl ExclusiveDm {
         R: IntoVerdict + 'a,
         R::Output: Send + 'a,
     {
-        let base_cfg = (*self.ask_config).clone();
+        let mut base_cfg = (*self.ask_config).clone();
+        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
         Ask::new(
             AskSource::BorrowedDm { dm: self },
             base_cfg,

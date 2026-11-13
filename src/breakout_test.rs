@@ -61,7 +61,7 @@ async fn build_teardown_commands_honors_kick_on_drop_and_targmax_kick() {
         async move {
             bot.breakout_with(
                 BreakoutOptions::exact("#vault")
-                    .modes(None::<String>)
+                    .no_modes()
                     .kick_reason("Vault sealed"),
             )
             .await

@@ -109,8 +109,8 @@ async fn simon_says_runs_hud_notice_action_notice_rename_fakeout_and_bunker_rush
 
     let survivors = game.await.unwrap().unwrap();
     assert_eq!(survivors.len(), 2);
-    assert_eq!(survivors[0].id(), alice.id());
+    assert_eq!(survivors[0], alice);
     assert_eq!(survivors[0].nick(), "spy_alice");
-    assert_eq!(survivors[1].id(), cara.id());
+    assert_eq!(survivors[1], cara);
     assert_eq!(survivors[1].nick(), "spy_cara");
 }

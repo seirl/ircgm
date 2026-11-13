@@ -4,7 +4,7 @@ use futures::future::try_join_all;
 use irc::proto::Command;
 use ircgm::prelude::*;
 use ircgm::testing::{test_harness, test_harness_with};
-use ircgm::DisconnectReason;
+use ircgm::{BotConfig, DisconnectReason, Target};
 
 #[tokio::test(start_paused = true)]
 async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
@@ -430,15 +430,20 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
         matches!(&first_raw.command, Command::PRIVMSG(ch, txt) if ch == "#room" && txt == "!join")
     );
 
+    // Empty prompt rejected upfront without wire traffic:
+    assert!(matches!(
+        room.ask("", |_| Some(())).await,
+        Err(Error::InvalidInput(_))
+    ));
+
     let r_404 = room.clone();
-    let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).await });
-    tokio::task::yield_now().await;
-    let _ = server.take_messages_to("#room");
+    let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).settled().await });
+    assert_eq!(server.recv_message_to("#room").await, "Hello?");
     server.send_line(":irc.srv 404 GM #room :Cannot send to channel (+m)\r\n");
     server.settle().await;
     let err_404 = ask_404.await.unwrap().unwrap_err();
     assert!(
-        matches!(err_404, Error::DeliveryFailed { ref target, code: 404, .. } if target == "#room")
+        matches!(err_404, Error::ChannelSendFailed { ref channel, code: 404, .. } if channel == "#room")
     );
 
     let mut dms_events = bot.inbox_dms();
@@ -481,7 +486,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
 }
 
 #[tokio::test]
-async fn dm_and_huddle_ask_handle_inflight_rename_bounces_and_evict_claimed_former_nicks() {
+async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_former_nicks() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#room", &["Alice", "Mallory", "Wolf1", "Wolf2"]);
     server.settle().await;
@@ -491,26 +496,23 @@ async fn dm_and_huddle_ask_handle_inflight_rename_bounces_and_evict_claimed_form
     let w2 = bot.user("Wolf2").unwrap();
 
     // 1. `alice.ask` sends to `Alice`, `Alice` renames to `Alicia` in flight, server bounces `401 Alice`
-    //    -> immediately resolves `Unreachable` instead of hanging until timeout, while keeping `alice` online!
+    //    -> `Ask` automatically re-sends `"First prompt?"` to `"Alicia"` and accepts her reply!
     let a1 = alice.clone();
     let ask1 = tokio::spawn(async move {
         a1.ask("First prompt?", |m| Some(m.text.clone()))
             .settled()
             .await
     });
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    assert_eq!(server.take_messages_to("Alice"), vec!["First prompt?"]);
+    assert_eq!(server.recv_message_to("Alice").await, "First prompt?");
 
     server.rename_user("Alice", "Alicia");
     server.send_line(":irc.srv 401 GM Alice :No such nick/channel\r\n");
+    assert_eq!(server.recv_message_to("Alicia").await, "First prompt?");
+    server.dm("Alicia", "renamed and replied!");
     server.settle().await;
 
     let out1 = ask1.await.unwrap().unwrap();
-    assert!(
-        matches!(out1, Turn::Unreachable { ref target, code: 401, .. } if target == "Alice"),
-        "expected Unreachable(Alice, 401), got {out1:?}"
-    );
+    assert_eq!(out1, Turn::Reply("renamed and replied!".into()));
     assert!(alice.is_online());
     assert_eq!(alice.nick(), "Alicia");
 
@@ -521,32 +523,30 @@ async fn dm_and_huddle_ask_handle_inflight_rename_bounces_and_evict_claimed_form
 
     let a2 = alice.clone();
     let ask2 = tokio::spawn(async move { a2.ask("Second prompt?", |m| Some(m.text.clone())).await });
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    assert_eq!(server.take_messages_to("Alicia"), vec!["Second prompt?"]);
+    assert_eq!(server.recv_message_to("Alicia").await, "Second prompt?");
 
     server.send_line(":irc.srv 716 GM Alice :callerid\r\n");
     server.dm("Alicia", "got it!");
     server.settle().await;
     assert_eq!(ask2.await.unwrap().unwrap(), "got it!");
 
-    // 3. `Huddle::ask` where both members rename in flight and their prompts bounce -> `DeliveryFailed`:
+    // 3. `Huddle::ask` where `Wolf1` renames in flight (`401 Wolf1` -> re-sends to `AlphaWolf`) while
+    //    `Wolf2` bounces `716`, then `AlphaWolf` also bounces `716` -> `UserUnreachable`:
     let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
     let huddle_fut = pack.ask("Target?", |m| Some(m.text.clone()));
     let drive_huddle = async {
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert_eq!(server.take_messages_to("Wolf1"), vec!["Target?"]);
-        assert_eq!(server.take_messages_to("Wolf2"), vec!["Target?"]);
+        assert_eq!(server.recv_message_to("Wolf1").await, "Target?");
+        assert_eq!(server.recv_message_to("Wolf2").await, "Target?");
         server.rename_user("Wolf1", "AlphaWolf");
-        server.rename_user("Wolf2", "BetaWolf");
         server.send_line(":irc.srv 401 GM Wolf1 :No such nick/channel\r\n");
         server.send_line(":irc.srv 716 GM Wolf2 :callerid\r\n");
+        assert_eq!(server.recv_message_to("AlphaWolf").await, "Target?");
+        server.send_line(":irc.srv 716 GM AlphaWolf :callerid\r\n");
         server.settle().await;
     };
     let (huddle_res, ()) = tokio::join!(huddle_fut, drive_huddle);
     assert!(matches!(
         huddle_res,
-        Err(Error::DeliveryFailed { code: 716, .. })
+        Err(Error::UserUnreachable { ref nick, code: 716, .. }) if nick == "AlphaWolf"
     ));
 }

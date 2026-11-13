@@ -110,3 +110,29 @@ async fn canceling_ambassador_exchange_releases_dm_lock_immediately_for_queued_s
     assert_eq!(kept, None);
     assert_eq!(steal, StealResolution::Stolen { coins: 2 });
 }
+
+#[tokio::test(start_paused = true)]
+async fn target_pm_block_or_quit_during_steal_resolves_as_unblocked_steal() {
+    let (bot, mut srv) = test_harness("GM");
+    srv.complete_join("#lobby", &["Alice", "Bob"]);
+    srv.settle().await;
+
+    let lobby = bot.room("#lobby").unwrap();
+    let alice = bot.user("Alice").unwrap();
+    let bob = bot.user("Bob").unwrap();
+
+    let steal = tokio::spawn({
+        let lobby = lobby.clone();
+        async move { resolve_steal_attempt(&lobby, &bob, &alice).await }
+    });
+    srv.flush().await;
+
+    // Alice has `+g` callerid enabled (`716`) -> `settled()` resolves to unblocked steal!
+    srv.send_line(":irc.srv 716 GM Alice :is in +g mode\r\n");
+    let res = steal.await.unwrap().unwrap();
+    assert_eq!(res, StealResolution::Stolen { coins: 2 });
+    assert!(srv
+        .take_messages_to("#lobby")
+        .iter()
+        .any(|m| m.contains("Bob steals 2 coins from Alice!")));
+}

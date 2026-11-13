@@ -50,9 +50,16 @@ pub enum Error {
         message: String,
     },
 
-    #[error("message delivery to {target} rejected ({code}): {message}")]
-    DeliveryFailed {
-        target: String,
+    #[error("channel send to {channel} rejected ({code}): {message}")]
+    ChannelSendFailed {
+        channel: String,
+        code: u16,
+        message: String,
+    },
+
+    #[error("message delivery to {nick} rejected ({code}): {message}")]
+    UserUnreachable {
+        nick: String,
         code: u16,
         message: String,
     },
@@ -74,14 +81,10 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns `false` for expected per-player/per-target interruptions
-    /// (`TimedOut`, `UserLeft { .. }`, `DeliveryFailed { .. }`),
-    /// and `true` for connection, lag, or protocol-level failures.
+    /// Returns `true` if the underlying IRC connection session itself has terminated or failed
+    /// (`Disconnected` or `Irc`), as opposed to a room- or player-scoped error.
     pub fn is_fatal(&self) -> bool {
-        !matches!(
-            self,
-            Error::TimedOut | Error::UserLeft { .. } | Error::DeliveryFailed { .. }
-        )
+        matches!(self, Error::Disconnected(_) | Error::Irc(_))
     }
 }
 

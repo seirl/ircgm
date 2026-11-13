@@ -26,25 +26,6 @@ async fn until_or_until_and_map_output() {
 }
 
 #[tokio::test]
-async fn ok_or_pending_parks_on_err() {
-    let failing_stop = async {
-        Err::<&str, Error>(Error::UserLeft {
-            nick: "Alice".into(),
-            reason: None,
-        })
-    }
-    .ok_or_pending();
-
-    let out = (async {
-        tokio::task::yield_now().await;
-        "game_done"
-    })
-    .until(failing_stop)
-    .await;
-    assert_eq!(out, Outcome::Completed("game_done"));
-}
-
-#[tokio::test]
 async fn empty_race_all_stays_pending_without_panicking() {
     let empty: Vec<std::future::Ready<u32>> = Vec::new();
     let out = (async { "ok" }).until(race_all(empty)).await;
@@ -119,8 +100,8 @@ async fn optional_and_settled_mappings() {
     assert!(s_left.is_left());
 
     let s_unreach = async {
-        Err::<u32, Error>(Error::DeliveryFailed {
-            target: "Alice".into(),
+        Err::<u32, Error>(Error::UserUnreachable {
+            nick: "Alice".into(),
             code: 716,
             message: "is in +g mode".into(),
         })
@@ -137,6 +118,21 @@ async fn optional_and_settled_mappings() {
             message: "is in +g mode".into(),
         }
     );
+
+    // Channel send failure (404 / 403) is NOT swallowed into `Turn::Unreachable`:
+    let chan_err = async {
+        Err::<u32, Error>(Error::ChannelSendFailed {
+            channel: "#lobby".into(),
+            code: 404,
+            message: "Cannot send to channel".into(),
+        })
+    }
+    .settled()
+    .await;
+    assert!(matches!(
+        chan_err,
+        Err(Error::ChannelSendFailed { ref channel, code: 404, .. }) if channel == "#lobby"
+    ));
 
     let res_disc = async { Err::<u32, Error>(Error::Disconnected(DisconnectReason::Eof)) }
         .settled()
@@ -189,24 +185,18 @@ async fn run_for_and_run_until_deadline_infer_diverging_and_early_exit_loops() {
         fatal,
         Err(Error::Disconnected(DisconnectReason::Eof))
     ));
-}
 
-#[tokio::test]
-async fn until_ok_or_until_ok_and_map_ok_ignore_err_and_trigger_on_ok() {
-    let failing = async {
-        Err::<&str, Error>(Error::UserLeft {
-            nick: "Alice".into(),
-            reason: None,
-        })
-    };
-    let succeeding = async { Ok::<u32, Error>(7) }.map_ok(|n| if n == 7 { "stopped" } else { "?" });
-
-    let out = (async {
-        tokio::task::yield_now().await;
-        "completed"
-    })
-    .until_ok(failing)
-    .or_until_ok(succeeding)
+    // 4. Inner `Err(Error::TimedOut)` propagates verbatim instead of being mistaken for outer phase expiry!
+    let inner_timeout = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Err::<(), Error>(Error::TimedOut)
+    }
+    .run_for(Duration::from_secs(10))
     .await;
-    assert_eq!(out, Outcome::Stopped("stopped"));
+    assert!(matches!(inner_timeout, Err(Error::TimedOut)));
+
+    let inner_deadline_timeout = async { Err::<(), Error>(Error::TimedOut) }
+        .run_until_deadline(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(matches!(inner_deadline_timeout, Err(Error::TimedOut)));
 }

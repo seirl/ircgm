@@ -22,7 +22,7 @@ use std::process::ExitCode;
 
 use ircgm::irc::client::data::Config as IrcConfig;
 use ircgm::prelude::*;
-use minigames::{play_by_name, GAMES};
+use minigames::{play_by_name, PlayOutcome, GAMES};
 
 const DEFAULT_SERVER: &str = "127.0.0.1:6667";
 const DEFAULT_LOBBY: &str = "#ircgm-minigames";
@@ -502,43 +502,40 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
         );
 
         let admin_list = admins.to_vec();
+        let lobby_for_admin = lobby.clone();
         let admin_stop = bot
             .inbox_all()
-            .lossy()
-            .into_wait_for(move |m| {
+            .on_for(move |m| {
                 is_admin_msg(m, &admin_list)
                     && m.is_cmd("!stop")
-                    && (m.is_dm() || m.is_in(lobby))
+                    && (m.is_dm() || m.is_in(&lobby_for_admin))
             })
-            .ok_or_pending()
             .map_output(|m| StopReason::Admin(Box::new(m)));
 
         let abort_scope = InboxScope::new().room(lobby).dm_from(&starter);
         let starter_for_abort = starter.clone();
         let lobby_for_abort = lobby.clone();
-        let abort_stop = bot
-            .inbox_scope(abort_scope)
-            .lossy()
-            .into_wait_map(move |m| {
-                if !(m.is_cmd("!abort") || m.is_cmd("!stop")) {
-                    return None;
-                }
-                let is_starter = m.sender.id() == starter_for_abort.id();
-                let starter_gone =
-                    !starter_for_abort.is_online() || !lobby_for_abort.has_user(&starter_for_abort);
-                if is_starter || (starter_gone && m.is_in(&lobby_for_abort)) {
-                    Some(StopReason::Aborted(m.sender.clone()))
-                } else {
-                    None
-                }
-            })
-            .ok_or_pending();
+        let abort_stop = bot.inbox_scope(abort_scope).on_map(move |m| {
+            if !(m.is_cmd("!abort") || m.is_cmd("!stop")) {
+                return None;
+            }
+            let is_starter = m.sender == starter_for_abort;
+            let starter_gone =
+                !starter_for_abort.is_online() || !lobby_for_abort.has_user(&starter_for_abort);
+            if is_starter || (starter_gone && m.is_in(&lobby_for_abort)) {
+                Some(StopReason::Aborted(m.sender.clone()))
+            } else {
+                None
+            }
+        });
 
         let game_with_busy_hint = async {
             tokio::select! {
                 biased;
                 res = play_by_name(slug, bot, lobby) => res,
-                res = busy_lobby_responder(lobby, slug, &starter) => res.map(|()| true),
+                res = busy_lobby_responder(lobby, slug, &starter) => {
+                    res.map(|()| Some(PlayOutcome::Completed))
+                }
             }
         };
 
@@ -548,13 +545,8 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
             .or_until(abort_stop)
             .await;
 
-        // Ensure `#lobby` isn't left `+m` if `mafia` was cancelled or errored mid-night:
-        if slug == "mafia" && lobby.bot_is_op() {
-            let _ = lobby.set_mode("-m", &[]);
-        }
-
         match outcome {
-            Outcome::Completed(Ok(true)) => {
+            Outcome::Completed(Ok(Some(PlayOutcome::Completed))) => {
                 tracing::info!(game = slug, "minigame completed");
                 lobby.say(
                     "🏁 ".bold()
@@ -562,7 +554,10 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                         + " finished — lobby is open! Type `!play <game>`, `!random`, or `!games`.",
                 )?;
             }
-            Outcome::Completed(Ok(false)) => {
+            Outcome::Completed(Ok(Some(PlayOutcome::NotEnoughPlayers))) => {
+                tracing::info!(game = slug, "minigame ended: not enough players");
+            }
+            Outcome::Completed(Ok(None)) => {
                 lobby.say(format!("Unknown game `{slug}` — try `!games`.").yellow())?;
             }
             Outcome::Completed(Err(err)) => {
@@ -570,7 +565,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                     &err,
                     Error::BotLeftRoom { channel, .. } if lobby.casemap().str_eq(channel, lobby.name())
                 );
-                if matches!(err, Error::Disconnected(_)) || lost_lobby {
+                if err.is_fatal() || lost_lobby {
                     return Err(err);
                 }
                 tracing::warn!(game = slug, error = %err, "minigame ended with error");
@@ -590,7 +585,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
             Outcome::Stopped(StopReason::Shutdown) => break,
             Outcome::Stopped(StopReason::Admin(admin_msg)) => {
                 tracing::info!(game = slug, admin = %admin_msg.nick, "minigame stopped by admin");
-                bot.reply(&admin_msg, format!("🛑 Stopped `{slug}`.").yellow())?;
+                admin_msg.reply(format!("🛑 Stopped `{slug}`.").yellow())?;
                 if admin_msg.is_dm() {
                     lobby.say(format!("🛑 `{slug}` was stopped by an admin.").yellow())?;
                 }
@@ -623,7 +618,7 @@ async fn admin_quit_loop(bot: &Bot, lobby: &Room, admins: &[String]) -> Result<(
     {
         let msg = msg?;
         if (msg.is_dm() || msg.is_in(lobby)) && is_admin_msg(&msg, admins) {
-            bot.reply(&msg, "👋 Shutting down minigames bot!".yellow())?;
+            msg.reply("👋 Shutting down minigames bot!".yellow())?;
             bot.quit(Some("Requested by admin")).await?;
             break;
         }
@@ -717,13 +712,6 @@ mod test {
     use ircgm::testing::test_harness;
 
     use super::{parse_cli, resolve_game_slug, run_lobby_bot, ParseOutcome};
-
-    async fn settle_loops(srv: &ircgm::testing::TestServer) {
-        srv.settle().await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-    }
 
     #[test]
     fn parse_cli_handles_libera_server_and_lobby_flags() {
@@ -820,7 +808,7 @@ mod test {
             let lobby = lobby.clone();
             async move { run_lobby_bot(&bot, &lobby, &[]).await }
         });
-        settle_loops(&srv).await;
+        srv.settle().await;
 
         // Initial greeting in `#ircgm-minigames`:
         let opening = srv.take_messages_to("#ircgm-minigames");
@@ -829,17 +817,17 @@ mod test {
             "expected greeting, got: {opening:?}"
         );
 
-        // 1. Anyone (`Carol`) lists games with `!games`:
-        srv.chat("Carol", "#ircgm-minigames", "!games");
-        settle_loops(&srv).await;
+        // 1. Anyone (`Carol`) lists games with uppercase `!GAMES` (case-insensitive commands!):
+        srv.chat("Carol", "#ircgm-minigames", "!GAMES");
+        srv.settle().await;
         let catalog = srv.take_messages_to("#ircgm-minigames");
         assert!(catalog.iter().any(|m| m.contains("blackjack")));
         assert!(catalog.iter().any(|m| m.contains("simon_says")));
 
-        // 2. `Alice` starts `blackjack` via `!play blackjack`; `Bob` tries starting `heist` mid-game
+        // 2. `Alice` starts `blackjack` via `!PLAY Blackjack`; `Bob` tries starting `heist` mid-game
         //    and gets a busy hint without queueing a stale `!play heist` for later!
-        srv.chat("Alice", "#ircgm-minigames", "!play blackjack");
-        settle_loops(&srv).await;
+        srv.chat("Alice", "#ircgm-minigames", "!PLAY Blackjack");
+        srv.settle().await;
         let bj_open = srv.take_messages_to("#ircgm-minigames");
         assert!(
             bj_open.iter().any(|m| m.contains("Blackjack")),
@@ -847,42 +835,47 @@ mod test {
         );
 
         srv.chat("Bob", "#ircgm-minigames", "!play heist");
-        settle_loops(&srv).await;
+        srv.settle().await;
         let busy = srv.take_messages_to("#ircgm-minigames");
         assert!(
             busy.iter().any(|m| m.contains("already running")),
             "expected busy message while blackjack is active, got: {busy:?}"
         );
 
-        // Let Blackjack's 20s seat window expire with 0 players so it finishes cleanly:
+        // Let Blackjack's 20s seat window expire with 0 players: it announces `Not enough players`
+        // without a misleading `blackjack finished` banner!
         tokio::time::advance(Duration::from_secs(20)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        srv.settle().await;
         let bj_done = srv.take_messages_to("#ircgm-minigames");
         assert!(
-            bj_done.iter().any(|m| m.contains("blackjack finished")),
-            "expected completion banner, got: {bj_done:?}"
+            bj_done
+                .iter()
+                .any(|m| m.contains("Not enough players joined for Blackjack.")),
+            "expected not-enough-players notice, got: {bj_done:?}"
+        );
+        assert!(
+            !bj_done.iter().any(|m| m.contains("blackjack finished")),
+            "0-player expiry must not emit completion banner: {bj_done:?}"
         );
         assert!(
             !bj_done.iter().any(|m| m.contains("Vault Heist")),
-            "mid-game `!play heist` must not replay after blackjack finishes: {bj_done:?}"
+            "mid-game `!play heist` must not replay after blackjack ends: {bj_done:?}"
         );
 
         // 3. `Bob` starts `heist` via shorthand `!heist`, then aborts directly in `#ircgm-minigames`:
         srv.chat("Bob", "#ircgm-minigames", "!heist");
-        settle_loops(&srv).await;
+        srv.settle().await;
         let heist_open = srv.take_messages_to("#ircgm-minigames");
         assert!(heist_open.iter().any(|m| m.contains("Co-op Vault Heist")));
 
         // Non-starter `Carol` cannot abort while `Bob` is still in the lobby:
         srv.chat("Carol", "#ircgm-minigames", "!abort");
-        settle_loops(&srv).await;
+        srv.settle().await;
         assert!(srv.take_messages_to("#ircgm-minigames").is_empty());
 
         // Starter `Bob` aborts right in the lobby channel:
         srv.chat("Bob", "#ircgm-minigames", "!abort");
-        settle_loops(&srv).await;
+        srv.settle().await;
         let aborted = srv.take_messages_to("#ircgm-minigames");
         assert!(
             aborted.iter().any(|m| m.contains("Bob aborted `heist`")),
@@ -892,14 +885,14 @@ mod test {
         // 4. Orphaned game recovery: `Alice` starts `cold-war`, then quits IRC —
         //    now `Carol` in `#ircgm-minigames` can `!abort`!
         srv.chat("Alice", "#ircgm-minigames", "!play cold-war");
-        settle_loops(&srv).await;
+        srv.settle().await;
         let _ = srv.take_messages_to("#ircgm-minigames");
 
         srv.quit_user("Alice", Some("Client Quit"));
-        settle_loops(&srv).await;
+        srv.settle().await;
 
         srv.chat("Carol", "#ircgm-minigames", "!abort");
-        settle_loops(&srv).await;
+        srv.settle().await;
         let orphan_abort = srv.take_messages_to("#ircgm-minigames");
         assert!(
             orphan_abort

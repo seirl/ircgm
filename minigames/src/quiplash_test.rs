@@ -32,8 +32,7 @@ async fn quiplash_handles_validation_reject_pm_block_716_warning_timeout_and_vot
             vote_on_quips(&bot, &room, &quips).await
         }
     });
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    server.flush().await;
     let _ = server.take_messages_to("Alice");
     let _ = server.take_messages_to("Carol");
     let _ = server.take_messages_to("Dan");
@@ -46,7 +45,6 @@ async fn quiplash_handles_validation_reject_pm_block_716_warning_timeout_and_vot
     server.dm("Alice", "See you at the next one!");
     server.dm("Dan", "Help I am trapped in a bakery");
     server.settle().await;
-    tokio::task::yield_now().await;
 
     assert!(server
         .take_messages_to("Alice")
@@ -55,14 +53,14 @@ async fn quiplash_handles_validation_reject_pm_block_716_warning_timeout_and_vot
 
     // Advance 35s -> Carol gets 10s warning; advance 10s -> Carol times out and voting begins!
     tokio::time::advance(Duration::from_secs(35)).await;
-    tokio::task::yield_now().await;
+    server.flush().await;
     assert_eq!(
         server.take_messages_to("Carol"),
         vec!["⏳ 10 seconds left to submit!"]
     );
 
     tokio::time::advance(Duration::from_secs(10)).await;
-    tokio::task::yield_now().await;
+    server.flush().await;
 
     let room_msgs = server.take_messages_to("#quip");
     assert!(room_msgs
@@ -121,7 +119,7 @@ async fn tied_quips_trigger_wire_fair_dm_tiebreaker_race() {
     server.dm("Alice", "102");
 
     let winner = vote.await.unwrap().unwrap().unwrap();
-    assert_eq!(winner.0.id(), dan.id());
+    assert_eq!(winner.0, dan);
     assert!(server
         .take_messages_to("#quip")
         .iter()

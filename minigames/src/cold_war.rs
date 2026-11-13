@@ -45,13 +45,14 @@ pub enum ColdWarOutcome {
 }
 
 /// Recruits 2 players in `lobby` and runs a full Cold War Hotline game.
-pub async fn play(bot: &Bot, lobby: &Room) -> Result<Option<ColdWarOutcome>> {
-    let Some(players) = crate::recruit_players(lobby, "Cold War Hotline", 2, Duration::from_secs(30)).await? else {
-        return Ok(None);
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
+    let Some(players) =
+        crate::recruit_players(lobby, "Cold War Hotline", 2..=2, Duration::from_secs(30)).await?
+    else {
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-    run_cold_war(bot, lobby, &players[0], &players[1])
-        .await
-        .map(Some)
+    let _ = run_cold_war(bot, lobby, &players[0], &players[1]).await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 /// Runs a 2-player Cold War Hotline match between `usa_premier` and `ussr_premier`.

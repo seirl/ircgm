@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::panic::Location;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use futures_core::Stream;
 use irc::proto::Message;
 use tokio::sync::mpsc;
 
+use crate::ask::AskConfig;
 use crate::bot::BotCore;
 use crate::casemap::{CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
@@ -17,12 +18,12 @@ use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
 use crate::room::Room;
 use crate::user::{User, UserStatus, UserTrack};
 
-/// Multi-source filter builder for [` crate::Bot::inbox_scope `] (delivers matching channels
+/// Multi-source filter builder for [`crate::Bot::inbox_scope`] (delivers matching channels
 /// and/or DMs into one wire-ordered [`Inbox`]).
 #[derive(Clone, Debug, Default)]
 pub struct InboxScope {
-    pub(crate) rooms: Vec<String>,
-    pub(crate) dm_users: Vec<Arc<UserTrack>>,
+    pub(crate) rooms: Vec<(String, u64)>,
+    pub(crate) dm_users: Vec<User>,
 }
 
 impl InboxScope {
@@ -32,8 +33,13 @@ impl InboxScope {
 
     pub fn room(mut self, room: &Room) -> Self {
         let cm = room.casemap();
-        if !self.rooms.iter().any(|r| cm.str_eq(r, room.name())) {
-            self.rooms.push(room.name().to_owned());
+        let sid = room.core().session_id;
+        if !self
+            .rooms
+            .iter()
+            .any(|(r, existing_sid)| *existing_sid == sid && cm.str_eq(r, room.name()))
+        {
+            self.rooms.push((room.name().to_owned(), sid));
         }
         self
     }
@@ -46,16 +52,19 @@ impl InboxScope {
     }
 
     pub fn dm_from(mut self, user: &User) -> Self {
-        let track = user.track_arc();
-        if !self.dm_users.iter().any(|t| t.id == track.id) {
-            self.dm_users.push(track);
+        if !self.dm_users.iter().any(|u| u == user) {
+            self.dm_users.push(user.clone());
         }
         self
     }
 
-    pub fn dms_from<'a, I: IntoIterator<Item = &'a User>>(mut self, users: I) -> Self {
+    pub fn dms_from<I, U>(mut self, users: I) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
         for u in users {
-            self = self.dm_from(u);
+            self = self.dm_from(u.borrow());
         }
         self
     }
@@ -65,7 +74,6 @@ impl InboxScope {
 pub(crate) enum Filter {
     All,
     AllDms,
-    UserDm(Arc<UserTrack>),
     UsersInRoom {
         tracks: Vec<Arc<UserTrack>>,
         channel_name: String,
@@ -81,7 +89,6 @@ impl Filter {
         match self {
             Filter::All => "bot".into(),
             Filter::AllDms => "dm".into(),
-            Filter::UserDm(track) => format!("user {}", track.nick()),
             Filter::UsersInRoom {
                 tracks,
                 channel_name,
@@ -116,21 +123,6 @@ impl Filter {
                 WireKind::Notice { target, .. } => target.is_dm(),
                 WireKind::SendError { .. } => !is_channel_target,
                 WireKind::RawOnly => !is_channel_target,
-                _ => false,
-            },
-            Filter::UserDm(track) => match &ev.kind {
-                WireKind::Chat(m) => m.target.is_dm() && m.sender.track_id() == track.id,
-                WireKind::Notice {
-                    sender: Some(u),
-                    target: Target::Dm,
-                    ..
-                } => u.track_id() == track.id,
-                WireKind::Quit { user, .. } | WireKind::NickChanged { user, .. } => {
-                    user.track_id() == track.id
-                }
-                WireKind::SendError { target_user_id, .. } => {
-                    !is_channel_target && *target_user_id == Some(track.id)
-                }
                 _ => false,
             },
             Filter::UsersInRoom {
@@ -195,7 +187,13 @@ impl Filter {
                         }
                     }
                     WireKind::BotLeftRoom { channel, .. } => has_room(channel),
-                    WireKind::RawOnly => true,
+                    WireKind::RawOnly => {
+                        if is_channel_target {
+                            !rooms.is_empty()
+                        } else {
+                            !dm_users.is_empty() || !rooms.is_empty()
+                        }
+                    }
                 }
             }
         }
@@ -258,9 +256,6 @@ impl InboxRegistry {
                 match &filter {
                     Filter::All => inner.all_ids.push(slot_id),
                     Filter::AllDms => inner.dm_ids.push(slot_id),
-                    Filter::UserDm(track) => {
-                        inner.by_user.entry(track.id).or_default().push(slot_id);
-                    }
                     Filter::UsersInRoom {
                         tracks,
                         channel_name,
@@ -306,6 +301,7 @@ impl InboxRegistry {
             }
         }
 
+        let departed_users = snapshot_departed_room_users(&core, &filter);
         Inbox {
             core: Some(core),
             slot_id,
@@ -318,8 +314,10 @@ impl InboxRegistry {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
+            idle_timeout: None,
             latched_departure: None,
             last_user_departure: None,
+            departed_users,
         }
     }
 
@@ -331,14 +329,6 @@ impl InboxRegistry {
         match &slot.filter {
             Filter::All => inner.all_ids.retain(|&id| id != slot_id),
             Filter::AllDms => inner.dm_ids.retain(|&id| id != slot_id),
-            Filter::UserDm(track) => {
-                if let Some(vec) = inner.by_user.get_mut(&track.id) {
-                    vec.retain(|&id| id != slot_id);
-                    if vec.is_empty() {
-                        inner.by_user.remove(&track.id);
-                    }
-                }
-            }
             Filter::UsersInRoom { tracks, .. } => {
                 for track in tracks {
                     if let Some(vec) = inner.by_user.get_mut(&track.id) {
@@ -553,6 +543,28 @@ impl InboxRegistry {
     }
 }
 
+fn snapshot_departed_room_users(core: &BotCore, filter: &Filter) -> HashSet<u64> {
+    let Filter::UsersInRoom {
+        tracks,
+        channel_name,
+    } = filter
+    else {
+        return HashSet::new();
+    };
+    let ws = core.state.read().unwrap();
+    let chan_key = ws.casemap.fold(channel_name);
+    let chan = ws.channels.get(&chan_key);
+    let mut departed = HashSet::new();
+    for track in tracks {
+        if !track.is_online()
+            || chan.is_some_and(|c| c.names_synced && !c.members.contains_key(&track.id))
+        {
+            departed.insert(track.id);
+        }
+    }
+    departed
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LagPolicy {
     Strict,
@@ -570,10 +582,12 @@ pub struct Inbox {
     dropped: Arc<AtomicU64>,
     warned_75: Arc<AtomicBool>,
     lag_policy: LagPolicy,
-    ignore_commands: bool,
-    accept_notices: bool,
+    pub(crate) ignore_commands: bool,
+    pub(crate) accept_notices: bool,
+    pub(crate) idle_timeout: Option<Duration>,
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
+    departed_users: HashSet<u64>,
 }
 
 impl Drop for Inbox {
@@ -605,9 +619,27 @@ impl Inbox {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
+            idle_timeout: None,
             latched_departure: None,
             last_user_departure: None,
+            departed_users: HashSet::new(),
         }
+    }
+
+    pub(crate) fn invalid_session(
+        filter: Filter,
+        opened_at: &'static Location<'static>,
+    ) -> Self {
+        let mut inbox = Self::disconnected_bot_dropped(filter, opened_at);
+        inbox.latched_departure = Some(Error::InvalidInput(
+            "handle belongs to a different Bot session",
+        ));
+        inbox
+    }
+
+    pub(crate) fn sync_flags_to_ask_config(&self, cfg: &mut AskConfig) {
+        cfg.ignore_commands = self.ignore_commands;
+        cfg.accept_notices = self.accept_notices;
     }
 
     pub fn ignore_commands(mut self) -> Self {
@@ -633,16 +665,49 @@ impl Inbox {
         self
     }
 
-    /// Discards all messages currently buffered in this inbox and clears any pending lag state.
+    /// Discards all messages currently buffered in this inbox and clears any pending lag or
+    /// latched departure state.
     pub fn clear(&mut self) {
         while self.rx.try_recv().is_ok() {}
         self.dropped.store(0, Ordering::Release);
         self.warned_75.store(false, Ordering::Relaxed);
+        self.latched_departure = None;
+        self.last_user_departure = None;
+        if let Some(core) = &self.core {
+            self.departed_users = snapshot_departed_room_users(core, &self.filter);
+        } else {
+            self.departed_users.clear();
+        }
+    }
+
+    async fn next_wire(&mut self, use_idle_timeout: bool) -> Result<Arc<WireEvent>> {
+        match self.idle_timeout.filter(|_| use_idle_timeout) {
+            None => poll_fn(|cx| self.poll_next_wire(cx)).await,
+            Some(dur) => tokio::time::timeout(dur, poll_fn(|cx| self.poll_next_wire(cx)))
+                .await
+                .map_err(|_| Error::TimedOut)?,
+        }
     }
 
     /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`] and [`crate::Ask`].
     pub(crate) async fn wait_reply_map<B, F, T>(
         &mut self,
+        ignore_commands: bool,
+        accept_notices: bool,
+        check_bounce: B,
+        f: F,
+    ) -> Result<T>
+    where
+        B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
+        F: FnMut(&ChatMessage) -> Option<T>,
+    {
+        self.wait_reply_map_inner(false, ignore_commands, accept_notices, check_bounce, f)
+            .await
+    }
+
+    async fn wait_reply_map_inner<B, F, T>(
+        &mut self,
+        use_idle_timeout: bool,
         ignore_commands: bool,
         accept_notices: bool,
         mut check_bounce: B,
@@ -652,62 +717,59 @@ impl Inbox {
         B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        poll_fn(|cx| loop {
-            match self.poll_next_wire(cx) {
-                Poll::Ready(Ok(wire)) => match &wire.kind {
-                    WireKind::SendError {
-                        target,
-                        target_user_id,
-                        code,
-                        message,
-                    } => {
-                        if let Some(err) = check_bounce(target, *target_user_id, *code, message) {
-                            return Poll::Ready(Err(err));
-                        }
+        loop {
+            let wire = self.next_wire(use_idle_timeout).await?;
+            match &wire.kind {
+                WireKind::SendError {
+                    target,
+                    target_user_id,
+                    code,
+                    message,
+                } => {
+                    if let Some(err) = check_bounce(target, *target_user_id, *code, message) {
+                        return Err(err);
                     }
-                    WireKind::Chat(msg) => {
-                        if ignore_commands
-                            && self
-                                .core
-                                .as_ref()
-                                .is_some_and(|c| c.is_command_text(&msg.text))
-                        {
-                            continue;
-                        }
-                        if let Some(val) = f(msg) {
-                            return Poll::Ready(Ok(val));
-                        }
+                }
+                WireKind::Chat(msg) => {
+                    if ignore_commands
+                        && self
+                            .core
+                            .as_ref()
+                            .is_some_and(|c| c.is_command_text(&msg.text))
+                    {
+                        continue;
                     }
-                    WireKind::Notice {
-                        human_chat: Some(msg),
-                        ..
-                    } if accept_notices => {
-                        if ignore_commands
-                            && self
-                                .core
-                                .as_ref()
-                                .is_some_and(|c| c.is_command_text(&msg.text))
-                        {
-                            continue;
-                        }
-                        if let Some(val) = f(msg) {
-                            return Poll::Ready(Ok(val));
-                        }
+                    if let Some(val) = f(msg) {
+                        return Ok(val);
                     }
-                    _ => {}
-                },
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                }
+                WireKind::Notice {
+                    human_chat: Some(msg),
+                    ..
+                } if accept_notices => {
+                    if ignore_commands
+                        && self
+                            .core
+                            .as_ref()
+                            .is_some_and(|c| c.is_command_text(&msg.text))
+                    {
+                        continue;
+                    }
+                    if let Some(val) = f(msg) {
+                        return Ok(val);
+                    }
+                }
+                _ => {}
             }
-        })
-        .await
+        }
     }
 
     pub async fn wait_map<F, T>(&mut self, f: F) -> Result<T>
     where
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        self.wait_reply_map(
+        self.wait_reply_map_inner(
+            true,
             self.ignore_commands,
             self.accept_notices,
             |_, _, _, _| None,
@@ -723,12 +785,33 @@ impl Inbox {
         self.wait_map(|m| pred(m).then(|| m.clone())).await
     }
 
+    /// Waits for a word-boundary command `cmd` (ASCII case-insensitive), ignoring
+    /// `self.ignore_commands` so explicit command waits never deadlock on command-skipping inboxes.
     pub async fn wait_cmd(&mut self, cmd: &str) -> Result<ChatMessage> {
-        self.wait_for(|m| m.is_cmd(cmd)).await
+        self.wait_reply_map_inner(
+            true,
+            false,
+            self.accept_notices,
+            |_, _, _, _| None,
+            |m| m.is_cmd(cmd).then(|| m.clone()),
+        )
+        .await
+    }
+
+    /// Waits for `cmd` followed by non-empty arguments, returning `(msg, trimmed_arg_string)`.
+    pub async fn wait_cmd_arg(&mut self, cmd: &str) -> Result<(ChatMessage, String)> {
+        self.wait_reply_map_inner(
+            true,
+            false,
+            self.accept_notices,
+            |_, _, _, _| None,
+            |m| m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned())),
+        )
+        .await
     }
 
     pub async fn next_chat(&mut self) -> Result<ChatMessage> {
-        poll_fn(|cx| self.poll_next_chat_candidate(cx)).await
+        self.wait_map(|m| Some(m.clone())).await
     }
 
     pub async fn next_event(&mut self) -> Result<Event> {
@@ -736,7 +819,7 @@ impl Inbox {
     }
 
     /// Consuming one-shot variant of [`Inbox::wait_map`] that owns this [`Inbox`] inside the
-    /// returned future (ideal for `.until(...)` / `.or_until(...)` chains and helper functions).
+    /// returned future.
     pub async fn into_wait_map<F, T>(mut self, f: F) -> Result<T>
     where
         F: FnMut(&ChatMessage) -> Option<T>,
@@ -757,14 +840,45 @@ impl Inbox {
         self.wait_cmd(cmd).await
     }
 
-    /// Consuming one-shot variant of [`Inbox::next_chat`].
-    pub async fn into_next_chat(mut self) -> Result<ChatMessage> {
-        self.next_chat().await
+    /// Lossy supervision stop-trigger: enables `.lossy()` internally (so burst lag logs a warning
+    /// and keeps listening rather than killing the trigger) and parks `Pending` if the watched
+    /// scope closes or disconnects (so a departing user never triggers a false stop in `.until()`).
+    pub async fn on_map<F, T>(mut self, f: F) -> T
+    where
+        F: FnMut(&ChatMessage) -> Option<T>,
+    {
+        self.lag_policy = LagPolicy::Lossy;
+        match self
+            .wait_reply_map_inner(
+                false,
+                self.ignore_commands,
+                self.accept_notices,
+                |_, _, _, _| None,
+                f,
+            )
+            .await
+        {
+            Ok(val) => val,
+            Err(_) => {
+                drop(self);
+                std::future::pending::<T>().await
+            }
+        }
     }
 
-    /// Consuming one-shot variant of [`Inbox::next_event`].
-    pub async fn into_next_event(mut self) -> Result<Event> {
-        self.next_event().await
+    /// Lossy supervision stop-trigger matching `pred` (for `.until(...)` / `.or_until(...)`).
+    pub async fn on_for<P>(self, mut pred: P) -> ChatMessage
+    where
+        P: FnMut(&ChatMessage) -> bool,
+    {
+        self.on_map(move |m| pred(m).then(|| m.clone())).await
+    }
+
+    /// Lossy supervision stop-trigger matching word-boundary `cmd` (ASCII case-insensitive),
+    /// always accepting commands even if `ignore_commands` was set.
+    pub async fn on_cmd(mut self, cmd: &str) -> ChatMessage {
+        self.ignore_commands = false;
+        self.on_for(|m| m.is_cmd(cmd)).await
     }
 
     /// Waits for and transforms the next matching high-level [`Event`] in this inbox.
@@ -772,111 +886,29 @@ impl Inbox {
     where
         F: FnMut(&Event) -> Option<T>,
     {
-        poll_fn(|cx| loop {
-            match self.poll_next_wire(cx) {
-                Poll::Ready(Ok(wire)) => {
-                    if let Some(ev) = wire.to_public_event() {
-                        if let Some(val) = f(&ev) {
-                            return Poll::Ready(Ok(val));
-                        }
-                    }
+        loop {
+            let wire = self.next_wire(true).await?;
+            if let Some(ev) = wire.to_public_event() {
+                if let Some(val) = f(&ev) {
+                    return Ok(val);
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
             }
-        })
-        .await
-    }
-
-    /// Waits for the next high-level [`Event`] in this inbox matching `pred`.
-    pub async fn wait_event_for<P>(&mut self, mut pred: P) -> Result<Event>
-    where
-        P: FnMut(&Event) -> bool,
-    {
-        poll_fn(|cx| loop {
-            match self.poll_next_wire(cx) {
-                Poll::Ready(Ok(wire)) => {
-                    if let Some(ev) = wire.to_public_event() {
-                        if pred(&ev) {
-                            return Poll::Ready(Ok(ev));
-                        }
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        })
-        .await
-    }
-
-    /// Consuming one-shot variant of [`Inbox::wait_event_map`].
-    pub async fn into_wait_event_map<F, T>(mut self, f: F) -> Result<T>
-    where
-        F: FnMut(&Event) -> Option<T>,
-    {
-        self.wait_event_map(f).await
-    }
-
-    /// Consuming one-shot variant of [`Inbox::wait_event_for`].
-    pub async fn into_wait_event_for<P>(mut self, pred: P) -> Result<Event>
-    where
-        P: FnMut(&Event) -> bool,
-    {
-        self.wait_event_for(pred).await
+        }
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        poll_fn(|cx| match self.poll_next_wire(cx) {
-            Poll::Ready(Ok(wire)) => Poll::Ready(Ok(Arc::clone(&wire.raw))),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        })
-        .await
+        let wire = self.next_wire(true).await?;
+        Ok(Arc::clone(&wire.raw))
     }
 
     pub async fn wait_raw_map<F, T>(&mut self, mut f: F) -> Result<T>
     where
         F: FnMut(&Message) -> Option<T>,
     {
-        poll_fn(|cx| loop {
-            match self.poll_next_wire(cx) {
-                Poll::Ready(Ok(wire)) => {
-                    if let Some(val) = f(&wire.raw) {
-                        return Poll::Ready(Ok(val));
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        })
-        .await
-    }
-
-    fn poll_next_chat_candidate(&mut self, cx: &mut Context<'_>) -> Poll<Result<ChatMessage>> {
         loop {
-            match self.poll_next_wire(cx) {
-                Poll::Ready(Ok(wire)) => {
-                    let msg_opt = match &wire.kind {
-                        WireKind::Chat(msg) => Some(msg),
-                        WireKind::Notice {
-                            human_chat: Some(msg),
-                            ..
-                        } if self.accept_notices => Some(msg),
-                        _ => None,
-                    };
-                    if let Some(msg) = msg_opt {
-                        if self.ignore_commands {
-                            if let Some(core) = &self.core {
-                                if core.is_command_text(&msg.text) {
-                                    continue;
-                                }
-                            }
-                        }
-                        return Poll::Ready(Ok(msg.clone()));
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+            let wire = self.next_wire(true).await?;
+            if let Some(val) = f(&wire.raw) {
+                return Ok(val);
             }
         }
     }
@@ -936,38 +968,15 @@ impl Inbox {
         };
         let cm = core.casemap();
         match &self.filter {
-            Filter::UserDm(track) => {
-                if let WireKind::Quit {
-                    user, nick, reason, ..
-                } = &wire.kind
-                {
-                    if user.track_id() == track.id {
-                        self.latched_departure = Some(Error::UserLeft {
-                            nick: nick.clone(),
-                            reason: reason.clone(),
-                        });
-                    }
-                }
-            }
+            Filter::All | Filter::AllDms => {}
             Filter::UsersInRoom {
                 tracks,
                 channel_name,
             } => {
+                if tracks.is_empty() {
+                    return;
+                }
                 let has_user = |uid: u64| tracks.iter().any(|t| t.id == uid);
-                let record_departure = |nick: &str, reason: &Option<String>| {
-                    let info = (nick.to_owned(), reason.clone());
-                    if tracks.len() == 1 {
-                        (
-                            Some(Error::UserLeft {
-                                nick: info.0,
-                                reason: info.1,
-                            }),
-                            None,
-                        )
-                    } else {
-                        (None, Some(info))
-                    }
-                };
                 match &wire.kind {
                     WireKind::BotLeftRoom { channel, reason }
                         if cm.str_eq(channel, channel_name) =>
@@ -976,6 +985,11 @@ impl Inbox {
                             channel: channel.clone(),
                             reason: reason.clone(),
                         });
+                    }
+                    WireKind::Joined { channel, user, .. }
+                        if has_user(user.track_id()) && cm.str_eq(channel, channel_name) =>
+                    {
+                        self.departed_users.remove(&user.track_id());
                     }
                     WireKind::Parted {
                         channel,
@@ -990,29 +1004,103 @@ impl Inbox {
                         reason,
                         ..
                     } if has_user(user.track_id()) && cm.str_eq(channel, channel_name) => {
-                        let (latched, last) = record_departure(nick, reason);
-                        if let Some(err) = latched {
-                            self.latched_departure = Some(err);
-                        }
-                        if let Some(info) = last {
-                            self.last_user_departure = Some(info);
+                        self.departed_users.insert(user.track_id());
+                        self.last_user_departure = Some((nick.clone(), reason.clone()));
+                        let any_live = tracks.iter().any(|t| {
+                            !self.departed_users.contains(&t.id)
+                                && !matches!(
+                                    t.status(),
+                                    UserStatus::Quit { at_seq, .. } if at_seq <= wire.seq
+                                )
+                        });
+                        if !any_live {
+                            self.latched_departure = Some(Error::UserLeft {
+                                nick: nick.clone(),
+                                reason: reason.clone(),
+                            });
                         }
                     }
                     WireKind::Quit {
                         user, nick, reason, ..
                     } if has_user(user.track_id()) => {
-                        let (latched, last) = record_departure(nick, reason);
-                        if let Some(err) = latched {
-                            self.latched_departure = Some(err);
-                        }
-                        if let Some(info) = last {
-                            self.last_user_departure = Some(info);
+                        self.departed_users.insert(user.track_id());
+                        self.last_user_departure = Some((nick.clone(), reason.clone()));
+                        let any_live = tracks.iter().any(|t| {
+                            !self.departed_users.contains(&t.id)
+                                && !matches!(
+                                    t.status(),
+                                    UserStatus::Quit { at_seq, .. } if at_seq <= wire.seq
+                                )
+                        });
+                        if !any_live {
+                            self.latched_departure = Some(Error::UserLeft {
+                                nick: nick.clone(),
+                                reason: reason.clone(),
+                            });
                         }
                     }
                     _ => {}
                 }
             }
-            Filter::All | Filter::AllDms | Filter::Scoped { .. } => {}
+            Filter::Scoped { rooms, dm_users } => {
+                if rooms.is_empty() && dm_users.is_empty() {
+                    return;
+                }
+                match &wire.kind {
+                    WireKind::BotLeftRoom { channel, reason }
+                        if rooms.iter().any(|r| cm.str_eq(r, channel)) =>
+                    {
+                        let any_live_room = {
+                            let ws = core.state.read().unwrap();
+                            rooms.iter().any(|r| {
+                                !ws.casemap.str_eq(r, channel)
+                                    && ws
+                                        .lost_channels
+                                        .get(&ws.casemap.fold(r))
+                                        .is_none_or(|lost| lost.at_seq > wire.seq)
+                            })
+                        };
+                        let any_live_user = dm_users.iter().any(|t| {
+                            !matches!(
+                                t.status(),
+                                UserStatus::Quit { at_seq, .. } if at_seq <= wire.seq
+                            )
+                        });
+                        if !any_live_room && !any_live_user {
+                            self.latched_departure = Some(Error::BotLeftRoom {
+                                channel: channel.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
+                    }
+                    WireKind::Quit {
+                        user, nick, reason, ..
+                    } if dm_users.iter().any(|t| t.id == user.track_id()) => {
+                        let any_live_room = {
+                            let ws = core.state.read().unwrap();
+                            rooms.iter().any(|r| {
+                                ws.lost_channels
+                                    .get(&ws.casemap.fold(r))
+                                    .is_none_or(|lost| lost.at_seq > wire.seq)
+                            })
+                        };
+                        let any_live_user = dm_users.iter().any(|t| {
+                            t.id != user.track_id()
+                                && !matches!(
+                                    t.status(),
+                                    UserStatus::Quit { at_seq, .. } if at_seq <= wire.seq
+                                )
+                        });
+                        if !any_live_room && !any_live_user {
+                            self.latched_departure = Some(Error::UserLeft {
+                                nick: nick.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1024,19 +1112,12 @@ impl Inbox {
 
         match &self.filter {
             Filter::All | Filter::AllDms => None,
-            Filter::UserDm(track) => match track.status() {
-                UserStatus::Online => None,
-                UserStatus::Quit { nick, reason, .. } => Some(Error::UserLeft { nick, reason }),
-            },
             Filter::UsersInRoom {
                 tracks,
                 channel_name,
             } => {
                 if tracks.is_empty() {
-                    return Some(Error::UserLeft {
-                        nick: String::new(),
-                        reason: None,
-                    });
+                    return None;
                 }
                 let ws = core.state.read().unwrap();
                 let chan_key = ws.casemap.fold(channel_name);
@@ -1071,15 +1152,12 @@ impl Inbox {
                     .last_user_departure
                     .clone()
                     .or(fallback_left)
-                    .unwrap_or_else(|| (String::new(), None));
+                    .expect("non-empty tracks with 0 live_tracks must have a departed user");
                 Some(Error::UserLeft { nick, reason })
             }
             Filter::Scoped { rooms, dm_users } => {
                 if rooms.is_empty() && dm_users.is_empty() {
-                    return Some(Error::UserLeft {
-                        nick: String::new(),
-                        reason: None,
-                    });
+                    return None;
                 }
 
                 let ws = core.state.read().unwrap();
@@ -1111,26 +1189,12 @@ impl Inbox {
 
                 if let Some((channel, reason)) = last_lost_room {
                     Some(Error::BotLeftRoom { channel, reason })
-                } else if let Some((nick, reason)) = last_quit_user {
-                    Some(Error::UserLeft { nick, reason })
                 } else {
-                    Some(Error::UserLeft {
-                        nick: String::new(),
-                        reason: None,
-                    })
+                    let (nick, reason) =
+                        last_quit_user.expect("exhausted non-empty Scoped filter has quit user");
+                    Some(Error::UserLeft { nick, reason })
                 }
             }
-        }
-    }
-}
-
-impl Stream for Inbox {
-    type Item = Result<ChatMessage>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.poll_next_chat_candidate(cx) {
-            Poll::Ready(res) => Poll::Ready(Some(res)),
-            Poll::Pending => Poll::Pending,
         }
     }
 }

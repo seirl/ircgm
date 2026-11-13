@@ -55,14 +55,14 @@ async fn accept_breakout_and_presence_chat_helpers_preserve_unrelated_commands()
             let mut inbox = vault.inbox().accept_notices();
             let act = inbox.next_chat().await?;
             let ntc = inbox.next_chat().await?;
-            let join_ev = inbox
-                .wait_event_for(|ev| matches!(ev, crate::Event::Joined { .. }))
+            inbox
+                .wait_event_map(|ev| matches!(ev, crate::Event::Joined { .. }).then_some(()))
                 .await?;
-            let nick_ev = inbox
-                .wait_event_for(|ev| matches!(ev, crate::Event::NickChanged { .. }))
+            inbox
+                .wait_event_map(|ev| matches!(ev, crate::Event::NickChanged { .. }).then_some(()))
                 .await?;
-            let part_ev = inbox
-                .wait_event_for(|ev| matches!(ev, crate::Event::Parted { .. }))
+            inbox
+                .wait_event_map(|ev| matches!(ev, crate::Event::Parted { .. }).then_some(()))
                 .await?;
             Ok::<_, Error>((
                 vault.name().to_owned(),
@@ -70,9 +70,6 @@ async fn accept_breakout_and_presence_chat_helpers_preserve_unrelated_commands()
                 act.text,
                 ntc.is_notice(),
                 ntc.text,
-                join_ev,
-                nick_ev,
-                part_ev,
             ))
         }
     });
@@ -99,7 +96,7 @@ async fn accept_breakout_and_presence_chat_helpers_preserve_unrelated_commands()
     server.rename_user("bob", "bobby");
     server.part_user("bobby", &vault_name, Some("escaped"));
 
-    let (_, is_act, act_txt, is_ntc, ntc_txt, _, _, _) = task.await.unwrap().unwrap();
+    let (_, is_act, act_txt, is_ntc, ntc_txt) = task.await.unwrap().unwrap();
     assert!(is_act);
     assert_eq!(act_txt, "sneaks in");
     assert!(is_ntc);

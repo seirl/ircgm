@@ -18,7 +18,7 @@ async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_shor
     // 1. Alice joins, renames to `Alicia`, tries joining again (ignored!), then Bob joins -> 2 distinct!
     let join_task = tokio::spawn({
         let lobby = lobby.clone();
-        async move { recruit_players(&lobby, "TestGame", 2, Duration::from_secs(15)).await }
+        async move { recruit_players(&lobby, "TestGame", 2..=2, Duration::from_secs(15)).await }
     });
     srv.flush().await;
 
@@ -32,9 +32,22 @@ async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_shor
     assert_eq!(players[0].nick(), "Alicia");
     assert_eq!(players[1].nick(), "Bob");
 
-    // 2. Timeout returns `Ok(None)` cleanly when fewer than `exact_count` join:
+    // 2. Flexible `2..=4` range returns `Ok(Some(2))` when window expires with >= `min` players:
+    let range_task = tokio::spawn({
+        let lobby = lobby.clone();
+        async move { recruit_players(&lobby, "RangeGame", 2..=4, Duration::from_secs(10)).await }
+    });
+    srv.flush().await;
+    srv.chat("Alicia", "#lobby", "!join");
+    srv.chat("Bob", "#lobby", "!join");
+    srv.settle().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let range_players = range_task.await.unwrap().unwrap().expect("2..=4 satisfied");
+    assert_eq!(range_players.len(), 2);
+
+    // 3. Timeout returns `Ok(None)` cleanly when fewer than `min` join:
     let short_task = tokio::spawn(async move {
-        recruit_players(&lobby, "TestGame", 3, Duration::from_secs(10)).await
+        recruit_players(&lobby, "TestGame", 3..=3, Duration::from_secs(10)).await
     });
     srv.flush().await;
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -67,18 +80,18 @@ async fn external_supervisor_cancels_running_minigame_and_tears_down_breakout_on
         async move {
             let admin_stop = bot
                 .inbox_all()
-                .into_wait_for(|m| m.account.as_deref() == Some("staff") && m.is_cmd("!stop"))
-                .map_ok(|_| ExternalStop::AdminStop);
+                .on_for(|m| m.account.as_deref() == Some("staff") && m.is_cmd("!stop"))
+                .map_output(|_| ExternalStop::AdminStop);
 
             let starter_abort = alice
                 .inbox()
-                .into_wait_cmd("!abort")
-                .map_ok(|_| ExternalStop::StarterAbort);
+                .on_cmd("!abort")
+                .map_output(|_| ExternalStop::StarterAbort);
 
             run_heist(&bot, &lobby, &alice, &bob, Wire::Red)
                 .until(bot.shutdown_requested().map_output(|()| ExternalStop::Shutdown))
-                .or_until_ok(admin_stop)
-                .or_until_ok(starter_abort)
+                .or_until(admin_stop)
+                .or_until(starter_abort)
                 .await
         }
     });

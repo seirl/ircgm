@@ -16,11 +16,16 @@ use crate::user::{ExclusiveDm, User, UserId};
 pub(crate) struct HuddleSender<'a> {
     core: &'a Arc<BotCore>,
     guards: &'a [ExclusiveDm],
+    initial_offline: &'a Option<(String, Option<String>)>,
     relay_prefix: &'a Option<Text>,
     relay_commands: bool,
 }
 
-impl HuddleSender<'_> {
+impl<'a> HuddleSender<'a> {
+    pub(crate) fn core(&self) -> &'a Arc<BotCore> {
+        self.core
+    }
+
     pub(crate) fn has_relay(&self) -> bool {
         self.relay_prefix.is_some()
     }
@@ -39,10 +44,13 @@ impl HuddleSender<'_> {
         }
 
         last_receipt.ok_or_else(|| {
-            last_offline_err.unwrap_or(Error::UserLeft {
-                nick: String::new(),
-                reason: None,
-            })
+            last_offline_err
+                .or_else(|| {
+                    self.initial_offline
+                        .clone()
+                        .map(|(nick, reason)| Error::UserLeft { nick, reason })
+                })
+                .unwrap_or(Error::InvalidInput("Huddle has no members"))
         })
     }
 
@@ -80,9 +88,12 @@ impl HuddleSender<'_> {
         Ok(())
     }
 
-    pub(crate) fn find_matching_user_id(&self, target_user_id: Option<u64>) -> Option<UserId> {
+    pub(crate) fn find_matching_user(&self, target_user_id: Option<u64>) -> Option<&'a User> {
         let uid = UserId(target_user_id?);
-        self.guards.iter().any(|g| g.user().id() == uid).then_some(uid)
+        self.guards
+            .iter()
+            .map(ExclusiveDm::user)
+            .find(|u| u.id() == uid)
     }
 
     pub(crate) fn any_reachable_online(&self, bounced_users: &HashSet<UserId>) -> bool {
@@ -100,6 +111,7 @@ impl HuddleSender<'_> {
 pub struct Huddle {
     core: Arc<BotCore>,
     guards: Vec<ExclusiveDm>,
+    initial_offline: Option<(String, Option<String>)>,
     inbox: Inbox,
     ask_config: Arc<AskConfig>,
     relay_prefix: Option<Text>,
@@ -110,13 +122,16 @@ impl Huddle {
     pub(crate) fn new(
         core: Arc<BotCore>,
         guards: Vec<ExclusiveDm>,
+        initial_offline: Option<(String, Option<String>)>,
         mut inbox: Inbox,
         ask_config: Arc<AskConfig>,
     ) -> Self {
+        inbox.idle_timeout = Some(std::time::Duration::from_secs(300));
         ask_config.apply_to_inbox(&mut inbox);
         Self {
             core,
             guards,
+            initial_offline,
             inbox,
             ask_config,
             relay_prefix: None,
@@ -132,6 +147,7 @@ impl Huddle {
         HuddleSender {
             core: &self.core,
             guards: &self.guards,
+            initial_offline: &self.initial_offline,
             relay_prefix: &self.relay_prefix,
             relay_commands: self.relay_commands,
         }
@@ -141,6 +157,7 @@ impl Huddle {
         let sender = HuddleSender {
             core: &self.core,
             guards: &self.guards,
+            initial_offline: &self.initial_offline,
             relay_prefix: &self.relay_prefix,
             relay_commands: self.relay_commands,
         };
@@ -158,6 +175,20 @@ impl Huddle {
             .filter(|u| u.is_online())
             .cloned()
             .collect()
+    }
+
+    /// Returns `true` if `user` holds an [`ExclusiveDm`] slot inside this `Huddle`.
+    pub fn has_user(&self, user: &User) -> bool {
+        user.belongs_to(&self.core) && self.guards.iter().any(|g| g.user() == user)
+    }
+
+    /// Borrows `user`'s already-locked [`ExclusiveDm`] inside this `Huddle`, avoiding
+    /// self-deadlock on `user.exclusive()` / `user.ask(...)`.
+    pub fn dm_mut(&mut self, user: &User) -> Option<&mut ExclusiveDm> {
+        if !user.belongs_to(&self.core) {
+            return None;
+        }
+        self.guards.iter_mut().find(|g| g.user() == user)
     }
 
     pub fn len(&self) -> usize {
@@ -179,13 +210,11 @@ impl Huddle {
     }
 
     pub fn with_ignore_commands(mut self) -> Self {
-        Arc::make_mut(&mut self.ask_config).ignore_commands = true;
         self.inbox.set_ignore_commands(true);
         self
     }
 
     pub fn with_accept_notices(mut self) -> Self {
-        Arc::make_mut(&mut self.ask_config).accept_notices = true;
         self.inbox.set_accept_notices(true);
         self
     }
@@ -244,13 +273,46 @@ impl Huddle {
         R: IntoVerdict + 'a,
         R::Output: Send + 'a,
     {
-        let base_cfg = (*self.ask_config).clone();
+        let mut base_cfg = (*self.ask_config).clone();
+        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
         Ask::new(
             AskSource::BorrowedHuddle { huddle: self },
             base_cfg,
             prompt.into(),
             matcher,
         )
+    }
+
+    /// Prompts a single `Huddle` member over their already-held [`ExclusiveDm`] guard without
+    /// self-deadlocking `dm_mutex` or leaking the prompt to teammates.
+    pub fn ask_user<'a, F, R>(
+        &'a mut self,
+        user: &User,
+        prompt: impl Into<Text>,
+        matcher: F,
+    ) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoVerdict + 'a,
+        R::Output: Send + 'a,
+    {
+        let mut base_cfg = (*self.ask_config).clone();
+        self.inbox.sync_flags_to_ask_config(&mut base_cfg);
+        let source = if !user.belongs_to(&self.core) {
+            AskSource::ImmediateErr(Error::InvalidInput(
+                "User handle belongs to a different Bot session",
+            ))
+        } else if let Some(idx) = self.guards.iter().position(|g| g.user() == user) {
+            AskSource::BorrowedDm {
+                dm: &mut self.guards[idx],
+            }
+        } else {
+            let err = user
+                .quit_error()
+                .unwrap_or(Error::InvalidInput("User is not a member of this Huddle"));
+            AskSource::ImmediateErr(err)
+        };
+        Ask::new(source, base_cfg, prompt.into(), matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {

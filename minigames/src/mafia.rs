@@ -36,24 +36,73 @@ use ircgm::prelude::*;
 use ircgm::race_all;
 use tokio::time::Instant;
 
+use crate::PlayOutcome;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MafiaWinner {
     Town,
     Werewolves,
 }
 
-/// Lobby entrypoint: recruits 5 players (`2 Werewolves`, `1 Bodyguard`, `2 Villagers`) and runs a round.
-pub async fn play(bot: &Bot, room: &Room) -> Result<Option<MafiaWinner>> {
-    let Some(mut players) =
-        crate::recruit_players(room, "One-Night Werewolf & Bodyguard", 5, Duration::from_secs(30))
-            .await?
+/// RAII guard restoring `-m`, devoicing players, and restoring the prior channel topic when
+/// `run_mafia_round` finishes or is cancelled externally mid-game.
+struct MafiaRoomGuard<'a> {
+    room: &'a Room,
+    players: Vec<User>,
+    prev_topic: Option<String>,
+    active: bool,
+}
+
+impl<'a> MafiaRoomGuard<'a> {
+    fn enter_night(room: &'a Room, alive: &[User], dead: &[User], night: u32) -> Result<Self> {
+        let prev_topic = room.topic();
+        let players: Vec<User> = alive.iter().chain(dead.iter()).cloned().collect();
+        if room.bot_is_op() {
+            start_mafia_night(room, alive, dead, night)?;
+            Ok(Self {
+                room,
+                players,
+                prev_topic,
+                active: true,
+            })
+        } else {
+            Ok(Self {
+                room,
+                players,
+                prev_topic,
+                active: false,
+            })
+        }
+    }
+}
+
+impl Drop for MafiaRoomGuard<'_> {
+    fn drop(&mut self) {
+        if self.active && self.room.bot_is_op() {
+            let _ = self.room.set_mode("-m", &[]);
+            let _ = self.room.devoice_many(&self.players);
+            let _ = self.room.set_topic(self.prev_topic.as_deref().unwrap_or(""));
+        }
+    }
+}
+
+/// Lobby entrypoint: recruits 4–5 players (`1–2 Werewolves`, `1 Bodyguard`, `2 Villagers`) and runs a round.
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<PlayOutcome> {
+    let Some(mut players) = crate::recruit_players(
+        lobby,
+        "One-Night Werewolf & Bodyguard",
+        4..=5,
+        Duration::from_secs(30),
+    )
+    .await?
     else {
-        return Ok(None);
+        return Ok(PlayOutcome::NotEnoughPlayers);
     };
     fastrand::shuffle(&mut players);
-    let wolves = players[..2].to_vec();
-    let guards = vec![players[2].clone()];
-    let villagers = players[3..].to_vec();
+    let wolf_count = if players.len() >= 5 { 2 } else { 1 };
+    let wolves = players[..wolf_count].to_vec();
+    let guards = vec![players[wolf_count].clone()];
+    let villagers = players[wolf_count + 1..].to_vec();
 
     for w in &wolves {
         let _ = w.say("🐺 You are a WEREWOLF!".red().bold());
@@ -65,9 +114,8 @@ pub async fn play(bot: &Bot, room: &Room) -> Result<Option<MafiaWinner>> {
         let _ = v.say("🏡 You are a VILLAGER!".green().bold());
     }
 
-    run_mafia_round(bot, room, &wolves, &guards, &villagers)
-        .await
-        .map(Some)
+    let _ = run_mafia_round(bot, lobby, &wolves, &guards, &villagers).await?;
+    Ok(PlayOutcome::Completed)
 }
 
 /// Sets channel topic, `+m`, devoices `dead`, and voices `alive` at nightfall.
@@ -95,7 +143,7 @@ pub async fn werewolf_pack_kill(
                 .timeout_message("⏳ Dawn breaks—the pack missed its chance!".yellow()),
         );
 
-    if pack.users().is_empty() {
+    if pack.is_empty() {
         return Ok(None);
     }
 
@@ -103,7 +151,7 @@ pub async fn werewolf_pack_kill(
         .ask(
             "🐺 Whisper here to deliberate, or `!kill <nick>` to strike (30s):",
             |m| {
-                let Some(target) = m.cmd_args("!kill") else {
+                let Some(target) = m.cmd_arg("!kill") else {
                     return Verdict::Ignore;
                 };
                 match townsfolk.iter().find(|u| u.eq_nick(target)) {
@@ -130,11 +178,12 @@ pub async fn werewolf_pack_kill(
     }
 }
 
-/// Collects simultaneous secret `!vote <nick>` DMs from all `alive` players before a shared deadline.
+/// Collects simultaneous secret `!vote <nick>` DMs from all `alive` players before a shared deadline,
+/// rejecting unknown/dead nicks with a private retry hint rather than wasting the voter's ballot.
 pub async fn collect_secret_votes(
     room: &Room,
     alive: &[User],
-) -> Result<Vec<(User, Option<String>)>> {
+) -> Result<Vec<(User, Option<User>)>> {
     let mut dms: Vec<_> = alive
         .iter()
         .map(|u| (u.clone(), u.inbox().lossy()))
@@ -145,9 +194,15 @@ pub async fn collect_secret_votes(
     try_join_all(dms.iter_mut().map(|(voter, inbox)| async move {
         let pick = inbox
             .wait_map(|m| {
-                m.cmd_args("!vote")
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
+                let target = m.cmd_arg("!vote")?;
+                match alive.iter().find(|u| u.eq_nick(target)) {
+                    Some(target_user) => Some(target_user.clone()),
+                    None => {
+                        let _ =
+                            voter.say("Pick a living player's nick with `!vote <nick>`!".yellow());
+                        None
+                    }
+                }
             })
             .with_deadline(deadline)
             .settled()
@@ -170,10 +225,7 @@ pub async fn run_mafia_round(
     let mut alive: Vec<User> = wolves.iter().chain(townsfolk.iter()).cloned().collect();
     let mut dead: Vec<User> = Vec::new();
     let graveyard = bot.breakout(&crate::breakout_slug(room, "graveyard")).await?;
-
-    if room.bot_is_op() {
-        start_mafia_night(room, &alive, &dead, 1)?;
-    }
+    let _room_guard = MafiaRoomGuard::enter_night(room, &alive, &dead, 1)?;
 
     // Brief online Bodyguards without failing if one disconnected (`exclusive_available`):
     {
@@ -191,11 +243,10 @@ pub async fn run_mafia_round(
             async move {
                 let saved = guard
                     .inbox()
-                    .into_wait_map(|m| {
-                        let target = m.cmd_args("!protect")?;
+                    .on_map(|m| {
+                        let target = m.cmd_arg("!protect")?;
                         townsfolk.iter().find(|u| u.eq_nick(target)).cloned()
                     })
-                    .ok_or_pending()
                     .await;
                 Ok::<(User, User), Error>((guard, saved))
             }
@@ -206,7 +257,7 @@ pub async fn run_mafia_round(
             .optional()
             .await?
         {
-            Some((_hero, protected)) => protected.id() == victim.id(),
+            Some((_hero, protected)) => protected == victim,
             None => false,
         };
 
@@ -218,7 +269,7 @@ pub async fn run_mafia_round(
                     + victim.nick().bold().red()
                     + " was devoured in the night!",
             )?;
-            alive.retain(|u| u.id() != victim.id());
+            alive.retain(|u| u != &victim);
             if room.bot_is_op() {
                 let _ = room.devoice(&victim);
             }
@@ -235,10 +286,8 @@ pub async fn run_mafia_round(
     let ballots = collect_secret_votes(room, &alive).await?;
     let mut tally: HashMap<UserId, usize> = HashMap::new();
     for (_voter, pick_opt) in ballots {
-        if let Some(target_nick) = pick_opt {
-            if let Some(target_user) = alive.iter().find(|u| u.eq_nick(&target_nick)) {
-                *tally.entry(target_user.id()).or_default() += 1;
-            }
+        if let Some(target_user) = pick_opt {
+            *tally.entry(target_user.id()).or_default() += 1;
         }
     }
 
@@ -249,7 +298,7 @@ pub async fn run_mafia_round(
         .collect();
 
     let winner = if let [exiled] = leaders.as_slice() {
-        let was_wolf = wolves.iter().any(|w| w.id() == exiled.id());
+        let was_wolf = wolves.contains(exiled);
         if was_wolf {
             room.say(
                 "🎉 The town exiled ".green().bold()
@@ -270,9 +319,6 @@ pub async fn run_mafia_round(
         MafiaWinner::Werewolves
     };
 
-    if room.bot_is_op() {
-        let _ = room.set_mode("-m", &[]);
-    }
     Ok(winner)
 }
 

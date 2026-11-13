@@ -23,10 +23,7 @@ pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>
     }
     .with_timeout(Duration::from_secs(60));
 
-    match flow
-        .until_ok(player.inbox().into_wait_cmd("!cancel"))
-        .await
-    {
+    match flow.until(player.inbox().on_cmd("!cancel")).await {
         Outcome::Completed(res) => res.map(Some),
         Outcome::Stopped(_) => {
             player.say("Loadout selection cancelled.".yellow())?;

@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::panic::Location;
 use std::sync::Arc;
 
@@ -14,72 +15,8 @@ use crate::outbound::{
     sanitize_reason, sanitize_text, validate_param, validate_target, OutboundChatKind, Priority,
     WriteReceipt,
 };
-use crate::user::{User, UserTrack};
-
-mod private {
-    use crate::user::User;
-
-    pub trait Sealed {
-        fn as_user_or_nick(&self) -> std::result::Result<&User, &str>;
-    }
-}
-
-/// Sealed target trait accepted by [`Room::invite`] and [`crate::Breakout::invite_and_wait`]
-/// (implemented for [`User`], `str`, and `String`).
-pub trait InviteTarget: private::Sealed {}
-
-impl private::Sealed for User {
-    fn as_user_or_nick(&self) -> std::result::Result<&User, &str> {
-        Ok(self)
-    }
-}
-impl InviteTarget for User {}
-
-impl private::Sealed for str {
-    fn as_user_or_nick(&self) -> std::result::Result<&User, &str> {
-        Err(self)
-    }
-}
-impl InviteTarget for str {}
-
-impl private::Sealed for String {
-    fn as_user_or_nick(&self) -> std::result::Result<&User, &str> {
-        Err(self.as_str())
-    }
-}
-impl InviteTarget for String {}
-
-impl<T: InviteTarget + ?Sized> private::Sealed for &T {
-    fn as_user_or_nick(&self) -> std::result::Result<&User, &str> {
-        (**self).as_user_or_nick()
-    }
-}
-impl<T: InviteTarget + ?Sized> InviteTarget for &T {}
-
-pub(crate) fn resolve_invite_target<T: InviteTarget + ?Sized>(
-    target: &T,
-    core: &Arc<BotCore>,
-) -> Result<(String, Option<Arc<UserTrack>>)> {
-    match target.as_user_or_nick() {
-        Ok(user) => {
-            if !user.belongs_to(core) {
-                return Err(Error::InvalidInput(
-                    "User handle belongs to a different Bot session",
-                ));
-            }
-            if let Some(err) = user.quit_error() {
-                return Err(err);
-            }
-            let nick = user.nick();
-            validate_target(&nick, "invite target")?;
-            Ok((nick, Some(user.track_arc())))
-        }
-        Err(nick) => {
-            validate_target(nick, "invite target")?;
-            Ok((nick.to_owned(), None))
-        }
-    }
-}
+use crate::state::Occupant;
+use crate::user::User;
 
 /// Snapshot of a channel occupant in `WorldState`, preserving [`User`] identity and status prefixes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +56,21 @@ impl Room {
         &self.core
     }
 
+    pub(crate) fn ask_config(&self) -> &AskConfig {
+        &self.ask_config
+    }
+
+    fn self_occupant<'a>(
+        ws: &'a crate::state::WorldState,
+        chan: &'a crate::state::ChannelState,
+    ) -> Option<&'a Occupant> {
+        if let Some(self_id) = ws.self_track_id {
+            chan.members.get(&self_id)
+        } else {
+            chan.member_by_nick(&ws.current_nick, ws.casemap)
+        }
+    }
+
     pub(crate) fn ensure_bot_in_room_if_tracked(&self) -> Result<()> {
         self.core.check_connected()?;
         let ws = self.core.state.read().unwrap();
@@ -147,7 +99,7 @@ impl Room {
         }
         if let Some(chan) = ws.channels.get(&key) {
             if chan.names_synced {
-                if chan.member_by_nick(&ws.current_nick, ws.casemap).is_none() {
+                if Self::self_occupant(&ws, chan).is_none() {
                     return Err(Error::BotLeftRoom {
                         channel: self.channel_name.clone(),
                         reason: None,
@@ -166,6 +118,9 @@ impl Room {
 
     pub(crate) fn ensure_any_user_askable(&self, users: &[User]) -> Result<()> {
         self.ensure_bot_in_room_if_tracked()?;
+        if users.is_empty() {
+            return Err(Error::InvalidInput("ask_users requires at least one User"));
+        }
         for u in users {
             if !u.belongs_to(&self.core) {
                 return Err(Error::InvalidInput(
@@ -181,10 +136,7 @@ impl Room {
                 Err(fatal) => return Err(fatal),
             }
         }
-        Err(last_offline_err.unwrap_or(Error::UserLeft {
-            nick: String::new(),
-            reason: None,
-        }))
+        Err(last_offline_err.expect("non-empty users with no askable user must have UserLeft"))
     }
 
     fn ensure_can_moderate(&self) -> Result<(CaseMap, usize)> {
@@ -199,7 +151,7 @@ impl Room {
         }
         if let Some(chan) = ws.channels.get(&key) {
             if chan.names_synced {
-                let Some(self_occ) = chan.member_by_nick(&ws.current_nick, ws.casemap) else {
+                let Some(self_occ) = Self::self_occupant(&ws, chan) else {
                     return Err(Error::BotLeftRoom {
                         channel: self.channel_name.clone(),
                         reason: None,
@@ -257,11 +209,20 @@ impl Room {
         Ok(())
     }
 
-    /// Sends `INVITE <target> <channel>`. Fails immediately with `Err(Error::UserLeft { .. })`
-    /// without sending traffic if a [`User`] target is already known offline.
-    pub fn invite<T: InviteTarget + ?Sized>(&self, target: &T) -> Result<()> {
+    /// Sends `INVITE <user> <channel>`. Fails immediately with `Err(Error::UserLeft { .. })`
+    /// without sending traffic if `user` is already known offline.
+    pub fn invite(&self, user: &User) -> Result<()> {
+        if !user.belongs_to(&self.core) {
+            return Err(Error::InvalidInput(
+                "User handle belongs to a different Bot session",
+            ));
+        }
         self.ensure_bot_in_room_if_tracked()?;
-        let (nick, _) = resolve_invite_target(target, &self.core)?;
+        if let Some(err) = user.quit_error() {
+            return Err(err);
+        }
+        let nick = user.nick();
+        validate_target(&nick, "invite target")?;
         let cm = self.core.casemap();
         let _ = self.core.outbound.enqueue_one(
             Priority::Interactive,
@@ -276,7 +237,7 @@ impl Room {
         let clean = reason.map(sanitize_reason);
         let cm = self.core.casemap();
         let _ = self.core.outbound.enqueue_one(
-            Priority::Background,
+            Priority::Interactive,
             Command::PART(self.channel_name.clone(), clean),
             cm,
         );
@@ -361,8 +322,7 @@ impl Room {
         let Some(chan) = ws.channels.get(&chan_key) else {
             return false;
         };
-        chan.member_by_nick(&ws.current_nick, ws.casemap)
-            .is_some_and(|occ| ws.occupant_is_op(occ))
+        Self::self_occupant(&ws, chan).is_some_and(|occ| ws.occupant_is_op(occ))
     }
 
     pub fn topic(&self) -> Option<String> {
@@ -385,7 +345,7 @@ impl Room {
         validate_target(&nick, "kick target")?;
         let clean = reason.map(sanitize_reason);
         let _ = self.core.outbound.enqueue_one(
-            Priority::Background,
+            Priority::Interactive,
             Command::KICK(self.channel_name.clone(), nick, clean),
             cm,
         );
@@ -416,7 +376,11 @@ impl Room {
         self.voice_many([user])
     }
 
-    pub fn voice_many<'a, I: IntoIterator<Item = &'a User>>(&self, users: I) -> Result<()> {
+    pub fn voice_many<I, U>(&self, users: I) -> Result<()>
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
         self.apply_status_many('+', 'v', users)
     }
 
@@ -424,19 +388,23 @@ impl Room {
         self.devoice_many([user])
     }
 
-    pub fn devoice_many<'a, I: IntoIterator<Item = &'a User>>(&self, users: I) -> Result<()> {
+    pub fn devoice_many<I, U>(&self, users: I) -> Result<()>
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
         self.apply_status_many('-', 'v', users)
     }
 
-    fn apply_status_many<'a, I: IntoIterator<Item = &'a User>>(
-        &self,
-        sign: char,
-        mode_char: char,
-        users: I,
-    ) -> Result<()> {
+    fn apply_status_many<I, U>(&self, sign: char, mode_char: char, users: I) -> Result<()>
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
         let (cm, max_modes) = self.ensure_can_moderate()?;
         let mut nicks = Vec::new();
-        for u in users {
+        for u_item in users {
+            let u = u_item.borrow();
             if !u.belongs_to(&self.core) {
                 return Err(Error::InvalidInput(
                     "User handle belongs to a different Bot session",
@@ -580,6 +548,14 @@ impl Room {
         self.inbox_at(caller)
     }
 
+    /// Opens a channel [`Inbox`] matching only messages and presence events from `user` inside
+    /// this room (symmetric 1-player counterpart to [`Room::inbox_users`] and [`Room::ask_user`]).
+    #[track_caller]
+    pub fn inbox_user(&self, user: &User) -> Inbox {
+        let caller = Location::caller();
+        user.inbox_in_at(self, caller)
+    }
+
     /// Opens a channel [`Inbox`] matching only messages and presence events from `users`
     /// inside this room (ignoring spectators, and terminating with [`Error::UserLeft`] once
     /// all listed users have left or quit).
@@ -587,7 +563,7 @@ impl Room {
     pub fn inbox_users<I, U>(&self, users: I) -> Inbox
     where
         I: IntoIterator<Item = U>,
-        U: std::borrow::Borrow<User>,
+        U: Borrow<User>,
     {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
@@ -615,12 +591,15 @@ impl Room {
             channel_name: self.channel_name.clone(),
         };
         if !all_belong {
-            return Inbox::disconnected_bot_dropped(filter, caller);
+            return Inbox::invalid_session(filter, caller);
         }
         let cm = self.core.casemap();
-        self.core
+        let mut inbox = self
+            .core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller, cm)
+            .subscribe(Arc::clone(&self.core), filter, caller, cm);
+        self.ask_config.apply_to_inbox(&mut inbox);
+        inbox
     }
 
     pub(crate) fn inbox_at(&self, caller: &'static Location<'static>) -> Inbox {
@@ -629,9 +608,12 @@ impl Room {
             rooms: vec![self.channel_name.clone()],
             dm_users: Vec::new(),
         };
-        self.core
+        let mut inbox = self
+            .core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller, cm)
+            .subscribe(Arc::clone(&self.core), filter, caller, cm);
+        self.ask_config.apply_to_inbox(&mut inbox);
+        inbox
     }
 }
 

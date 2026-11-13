@@ -52,36 +52,16 @@ pub fn hand_value(cards: &[u8]) -> u8 {
     sum as u8
 }
 
-/// Recruits 1–4 players via `!join` (`20s` window once the first player joins) and runs a round.
-pub async fn play(room: &Room) -> Result<()> {
-    room.say(
-        "🃏 ".bold()
-            + "Blackjack".bold().cyan()
-            + " — type "
-            + "!join".bold().green()
-            + " to take a seat (up to 4 players, 20s)!",
-    )?;
-
-    let mut inbox = room.inbox();
-    let mut players: Vec<User> = Vec::new();
-    let collect = async {
-        while players.len() < 4 {
-            let msg = inbox.wait_cmd("!join").await?;
-            if !players.iter().any(|u| u.id() == msg.sender.id()) {
-                players.push(msg.sender.clone());
-                room.say(msg.sender.nick().bold() + format!(" took seat #{}!", players.len()))?;
-            }
-        }
-        Ok(())
+/// Recruits 1–4 players via `!join` (`20s` window) and runs a Blackjack round.
+pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
+    let Some(players) =
+        crate::recruit_players(lobby, "Blackjack", 1..=4, Duration::from_secs(20)).await?
+    else {
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-    collect.run_for(Duration::from_secs(20)).await?;
 
-    if players.is_empty() {
-        room.say("Nobody sat down at the Blackjack table.".yellow())?;
-        return Ok(());
-    }
-
-    run_round(room, &players).await
+    run_round(lobby, &players).await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 /// Runs a Blackjack round with random draws.

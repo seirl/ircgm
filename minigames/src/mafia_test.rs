@@ -71,6 +71,15 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     server.flush().await;
 
     // Day vote among survivors (Wolf1, Wolf2, Villager2):
+    // Villager2 typos `Wolv2` first — gets a retry hint rather than losing their ballot!
+    let _ = server.take_messages_to("Villager2");
+    server.dm("Villager2", "!vote Wolv2");
+    server.settle().await;
+    assert!(server
+        .take_messages_to("Villager2")
+        .iter()
+        .any(|m| m.contains("Pick a living player's nick")));
+
     server.dm("Villager2", "!vote Wolf2");
     server.dm("Wolf1", "!vote Wolf2");
     server.settle().await;
@@ -85,6 +94,67 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     assert!(town_msgs
         .iter()
         .any(|m| m.contains("exiled Wolf2 (a Werewolf)! TOWN WINS!")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_cancel_mid_night_restores_room_modes_voices_and_topic_via_raii_drop() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#town", &["Wolf1", "Villager1"]);
+    server.send_line(":irc.srv 332 GM #town :Welcome to #town!\r\n");
+    server.settle().await;
+
+    let room = bot.room("#town").unwrap();
+    let w1 = bot.user("Wolf1").unwrap();
+    let v1 = bot.user("Villager1").unwrap();
+
+    let supervised = tokio::spawn({
+        let bot = bot.clone();
+        let room = room.clone();
+        async move {
+            run_mafia_round(&bot, &room, &[w1], &[], &[v1])
+                .until(room.inbox().on_cmd("!abort"))
+                .await
+        }
+    });
+
+    let graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    server.flush().await;
+    while server.try_recv_sent().is_some() {}
+
+    // Cancel mid-night via `!abort`!
+    server.chat("Villager1", "#town", "!abort");
+    let out = supervised.await.unwrap();
+    assert!(matches!(out, Outcome::Stopped(_)));
+
+    let mut saw_minus_m = false;
+    let mut saw_devoice = false;
+    let mut saw_restored_topic = false;
+    let mut saw_graveyard_part = false;
+    while let Some(cmd) = server.try_recv_sent() {
+        match cmd {
+            Command::Raw(m, args) if m == "MODE" && args == vec!["#town", "-m"] => {
+                saw_minus_m = true;
+            }
+            Command::Raw(m, args)
+                if m == "MODE"
+                    && args.first().map(String::as_str) == Some("#town")
+                    && args.get(1).is_some_and(|s| s.starts_with("-v")) =>
+            {
+                saw_devoice = true;
+            }
+            Command::TOPIC(ch, Some(t)) if ch == "#town" && t == "Welcome to #town!" => {
+                saw_restored_topic = true;
+            }
+            Command::PART(ch, _) if ch == graveyard => {
+                saw_graveyard_part = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_minus_m && saw_devoice && saw_restored_topic && saw_graveyard_part,
+        "expected RAII Drop cleanup (-m={saw_minus_m}, -v={saw_devoice}, topic={saw_restored_topic}, part={saw_graveyard_part})"
+    );
 }
 
 #[tokio::test(start_paused = true)]

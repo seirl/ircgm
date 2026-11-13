@@ -66,15 +66,20 @@ pub struct CoupTurnOutcome {
 }
 
 /// Lobby entrypoint: recruits 2 players and runs an Ambassador Exchange + concurrent Steal round.
-pub async fn play(room: &Room) -> Result<Option<CoupTurnOutcome>> {
+pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
-        crate::recruit_players(room, "Coup: Bluff & Steal", 2, Duration::from_secs(30)).await?
+        crate::recruit_players(lobby, "Coup: Bluff & Steal", 2..=2, Duration::from_secs(30))
+            .await?
     else {
-        return Ok(None);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
 
-    let active = &players[0];
-    let rival = &players[1];
+    let _ = run_coup_round(lobby, &players[0], &players[1]).await?;
+    Ok(crate::PlayOutcome::Completed)
+}
+
+/// Runs a single 2-player Coup Ambassador Exchange + concurrent Captain Steal round.
+pub async fn run_coup_round(room: &Room, active: &User, rival: &User) -> Result<CoupTurnOutcome> {
     room.say(
         active.nick().bold()
             + " claims Ambassador in DM! "
@@ -85,12 +90,13 @@ pub async fn play(room: &Room) -> Result<Option<CoupTurnOutcome>> {
     )?;
 
     let steal_branch = async {
-        let mut inbox = room.inbox();
+        let mut inbox = room.inbox_user(rival);
         let steal_trigger = inbox
-            .wait_for(|m| m.sender.id() == rival.id() && m.is_cmd("!steal"))
+            .wait_cmd("!steal")
             .with_timeout(Duration::from_secs(30))
-            .optional()
-            .await?;
+            .settled()
+            .await?
+            .into_reply();
         match steal_trigger {
             Some(_) => resolve_steal_attempt(room, rival, active).await.map(Some),
             None => Ok(None),
@@ -105,11 +111,11 @@ pub async fn play(room: &Room) -> Result<Option<CoupTurnOutcome>> {
         steal_branch,
     )?;
 
-    Ok(Some(CoupTurnOutcome {
+    Ok(CoupTurnOutcome {
         final_hand: opt_new_hand.unwrap_or(initial_hand),
         exchanged: opt_new_hand.is_some(),
         steal,
-    }))
+    })
 }
 
 /// Multi-step free-text DM wizard where `player` picks 2 cards to keep from `hand + drawn`,
@@ -149,10 +155,7 @@ pub async fn ambassador_exchange_or_cancel(
     }
     .with_timeout(Duration::from_secs(30));
 
-    match wizard
-        .until_ok(player.inbox().into_wait_cmd("!cancel"))
-        .await
-    {
+    match wizard.until(player.inbox().on_cmd("!cancel")).await {
         Outcome::Completed(res) => res.map(Some),
         Outcome::Stopped(_) => {
             player.say("Ambassador exchange cancelled — keeping original hand.".yellow())?;
@@ -193,8 +196,9 @@ pub async fn resolve_steal_attempt(
         .reply_timeout(Duration::from_secs(20))
         .ignore_commands()
         .warn_remaining(Duration::from_secs(5), "⏳ 5s left to block!".yellow())
-        .optional()
-        .await?;
+        .settled()
+        .await?
+        .into_reply();
 
     let resolution = response.unwrap_or(StealResolution::Stolen { coins: 2 });
     match resolution {

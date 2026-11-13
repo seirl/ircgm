@@ -5,6 +5,8 @@ use irc::proto::Message;
 use irc_colors::Text;
 use tokio::time::Instant;
 
+use crate::error::{Error, Result};
+use crate::outbound::OutboundChatKind;
 use crate::room::Room;
 use crate::user::User;
 
@@ -87,18 +89,26 @@ impl ChatMessage {
         Text::parse(&self.raw_text)
     }
 
-    /// Word-boundary command check against plain `self.text` (`"!join"` matches `"!join"`, not `"!joined"`).
+    /// Word-boundary, ASCII case-insensitive command check against plain `self.text`
+    /// (`"!join"` matches `"!join"` and `"!JOIN"`, not `"!joined"`).
     pub fn is_cmd(&self, cmd: &str) -> bool {
         self.cmd_args(cmd).is_some()
     }
 
-    /// Returns trimmed arguments after `cmd` if matched at a word boundary.
+    /// Returns trimmed arguments after `cmd` (matched ASCII case-insensitively at a word boundary),
+    /// including `Some("")` when invoked without arguments.
     pub fn cmd_args(&self, cmd: &str) -> Option<&str> {
         if cmd.is_empty() {
             return None;
         }
         let trimmed = self.text.trim_start();
-        let rest = trimmed.strip_prefix(cmd)?;
+        if trimmed.len() < cmd.len() || !trimmed.is_char_boundary(cmd.len()) {
+            return None;
+        }
+        if !trimmed[..cmd.len()].eq_ignore_ascii_case(cmd) {
+            return None;
+        }
+        let rest = &trimmed[cmd.len()..];
         if rest.is_empty() {
             Some("")
         } else if rest.starts_with(char::is_whitespace) {
@@ -106,6 +116,44 @@ impl ChatMessage {
         } else {
             None
         }
+    }
+
+    /// Returns the non-empty trimmed argument string after `cmd` (`None` if `cmd` did not match
+    /// or was invoked without arguments).
+    pub fn cmd_arg(&self, cmd: &str) -> Option<&str> {
+        self.cmd_args(cmd).filter(|s| !s.is_empty())
+    }
+
+    /// Replies to the channel if this message arrived in a channel (failing with
+    /// [`Error::BotLeftRoom`] if the bot has since left that channel), or directly to
+    /// `self.sender`'s live nickname if this message was a DM (failing with [`Error::UserLeft`]
+    /// if `self.sender` has quit), mirroring `self.kind` (`MessageKind::Notice` sends `NOTICE`;
+    /// `Privmsg | Action` sends `PRIVMSG`).
+    pub fn reply(&self, text: impl Into<Text>) -> Result<()> {
+        let out_kind = match self.kind {
+            MessageKind::Notice => OutboundChatKind::Notice,
+            MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,
+        };
+        match &self.target {
+            Target::Channel(ch) => {
+                let core = self.sender.upgrade_core()?;
+                {
+                    let ws = core.state.read().unwrap();
+                    let key = ws.casemap.fold(ch);
+                    if let Some(lost) = ws.lost_channels.get(&key) {
+                        return Err(Error::BotLeftRoom {
+                            channel: lost.name.clone(),
+                            reason: lost.reason.clone(),
+                        });
+                    }
+                }
+                let _ = core.send_chat_with_receipt(out_kind, ch, text.into())?;
+            }
+            Target::Dm => {
+                let _ = self.sender.send_chat_with_receipt(out_kind, text.into())?;
+            }
+        }
+        Ok(())
     }
 }
 

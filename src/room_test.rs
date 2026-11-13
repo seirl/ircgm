@@ -4,40 +4,43 @@ use super::*;
 use crate::testing::test_harness;
 
 #[tokio::test]
-async fn resolve_invite_target_accepts_user_str_and_string_and_rejects_invalid() {
-    let (bot, server) = test_harness("gm");
+async fn room_invite_and_inbox_user_enforce_session_and_presence() {
+    let (bot, mut server) = test_harness("gm");
     let (other_bot, _other_srv) = test_harness("gm2");
 
+    server.complete_join("#lobby", &["alice", "bob"]);
+    server.settle().await;
+    let room = bot.room("#lobby").unwrap().with_ask_config(
+        &crate::AskConfig::new().ignore_commands().accept_notices(),
+    );
+
     let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
     let foreign = other_bot.user("alice").unwrap();
 
-    let (nick, tr) = resolve_invite_target(&alice, alice.upgrade_core().as_ref().unwrap()).unwrap();
-    assert_eq!(nick, "alice");
-    assert!(tr.is_some());
-
-    let core = bot.room("#lobby").unwrap().core().clone();
-    let (s_nick, s_tr) = resolve_invite_target("bob", &core).unwrap();
-    assert_eq!(s_nick, "bob");
-    assert!(s_tr.is_none());
-
-    let owned = String::from("carol");
-    let (o_nick, o_tr) = resolve_invite_target(&owned, &core).unwrap();
-    assert_eq!(o_nick, "carol");
-    assert!(o_tr.is_none());
+    room.invite(&alice).unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::INVITE("alice".into(), "#lobby".into()))
+    );
 
     // Foreign session User rejected:
-    assert!(matches!(
-        resolve_invite_target(&foreign, &core),
-        Err(Error::InvalidInput(_))
-    ));
+    assert!(matches!(room.invite(&foreign), Err(Error::InvalidInput(_))));
+
+    // `Room::inbox_user` inherits `Room`'s `ask_config` (`ignore_commands` + `accept_notices`)
+    // and ignores other users in the same room:
+    let mut alice_in = room.inbox_user(&alice);
+    server.chat("bob", "#lobby", "bob noise");
+    server.chat("alice", "#lobby", "!ignored_cmd");
+    server.notice("alice", "#lobby", "alice notice");
+    server.settle().await;
+    assert_eq!(alice_in.next_chat().await.unwrap().text, "alice notice");
 
     // Offline User rejected with UserLeft:
     server.quit_user("alice", Some("gone"));
     server.settle().await;
-    assert!(matches!(
-        resolve_invite_target(&alice, &core),
-        Err(Error::UserLeft { .. })
-    ));
+    assert!(matches!(room.invite(&alice), Err(Error::UserLeft { .. })));
+    let _ = bob;
 }
 
 #[tokio::test]

@@ -206,3 +206,43 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     r_quit.wait().await;
     assert_eq!(rx.try_recv().unwrap(), Command::QUIT(Some("bye".into())));
 }
+
+#[tokio::test(start_paused = true)]
+async fn join_followed_by_later_background_part_preserves_join_before_part() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _task) = OutboundSink::new(RawTransport::Test(tx), 1, Duration::from_secs(8));
+    let cm = CaseMap::Rfc1459;
+
+    // Consume burst = 1 slot at t = 0:
+    sink.enqueue_one(
+        Priority::Interactive,
+        Command::PRIVMSG("#lobby".into(), "warmup".into()),
+        cm,
+    )
+    .wait()
+    .await;
+    let _ = rx.try_recv().unwrap();
+
+    // Now rate-limited: enqueue `JOIN #c` (Interactive), THEN `PART #c` (Background):
+    let r_join = sink.enqueue_one(
+        Priority::Interactive,
+        Command::JOIN("#c".into(), None, None),
+        cm,
+    );
+    let r_part = sink.enqueue_one(
+        Priority::Background,
+        Command::PART("#c".into(), None),
+        cm,
+    );
+
+    tokio::time::advance(Duration::from_secs(8)).await;
+    r_join.wait().await;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Command::JOIN("#c".into(), None, None)
+    );
+
+    tokio::time::advance(Duration::from_secs(8)).await;
+    r_part.wait().await;
+    assert_eq!(rx.try_recv().unwrap(), Command::PART("#c".into(), None));
+}

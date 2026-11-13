@@ -43,7 +43,7 @@ fn is_services_pseudoclient(nick: &str) -> bool {
     SERVICES.iter().any(|s| nick.eq_ignore_ascii_case(s))
 }
 
-fn extract_numeric(cmd: &Command) -> Option<(u16, &[String])> {
+pub(crate) fn extract_numeric(cmd: &Command) -> Option<(u16, &[String])> {
     match cmd {
         Command::Response(resp, args) => Some((*resp as u16, args.as_slice())),
         Command::Raw(raw_cmd, args)
@@ -111,6 +111,7 @@ pub(crate) async fn run_pump(
                 Some(Ok(msg)) => {
                     consecutive_ready += 1;
                     seq += 1;
+                    let msg = crate::state::normalize_inbound_message(msg);
                     process_message(&core, msg, seq, &mut reg);
                 }
                 Some(Err(err)) => {
@@ -254,31 +255,13 @@ fn process_message(
             });
             core.inboxes.dispatch(&wire, Some(&chan), cm);
         }
-        Command::ChannelMODE(chan, _) => {
-            let (cm, is_chan) = {
-                let mut ws = core.state.write().unwrap();
-                ws.observe_self_prefix(msg.prefix.as_ref());
-                let is_c = ws.is_channel_name(chan);
-                ws.apply_mode_message(&msg);
-                (ws.casemap, is_c)
-            };
-            let chan_owned = chan.clone();
-            let raw = Arc::new(msg);
-            let wire = Arc::new(WireEvent {
-                seq,
-                raw,
-                kind: WireKind::RawOnly,
-            });
-            core.inboxes
-                .dispatch(&wire, is_chan.then_some(chan_owned.as_str()), cm);
-        }
         Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("MODE") && !args.is_empty() => {
             let chan_owned = args[0].clone();
             let (cm, is_chan) = {
                 let mut ws = core.state.write().unwrap();
                 ws.observe_self_prefix(msg.prefix.as_ref());
                 let is_c = ws.is_channel_name(&chan_owned);
-                ws.apply_mode_message(&msg);
+                ws.apply_mode_message(&msg, &core.users);
                 (ws.casemap, is_c)
             };
             let raw = Arc::new(msg);
@@ -327,16 +310,20 @@ fn handle_privmsg(
         return;
     };
 
-    // Check self-echo & unwatched channel under WorldState lock:
+    // Check self-echo & unwatched channel under WorldState read lock (upgrading only if self host needs recording):
     let (cm, is_self, is_chan, chan_in_ws) = {
-        let mut ws = core.state.write().unwrap();
+        let ws = core.state.read().unwrap();
         let is_self = ws.casemap.str_eq(nick, &ws.current_nick);
-        if is_self {
-            ws.observe_self_prefix(msg.prefix.as_ref());
-        }
+        let needs_self_update =
+            is_self && (ws.self_ident.is_none() || ws.self_host.is_none());
         let is_chan = ws.is_channel_name(target);
         let chan_in_ws = is_chan && ws.channels.contains_key(&ws.casemap.fold(target));
-        (ws.casemap, is_self, is_chan, chan_in_ws)
+        let cm = ws.casemap;
+        drop(ws);
+        if needs_self_update {
+            core.state.write().unwrap().observe_self_prefix(msg.prefix.as_ref());
+        }
+        (cm, is_self, is_chan, chan_in_ws)
     };
 
     if is_self {
@@ -422,17 +409,21 @@ fn handle_notice(
     tags: &ParsedTags,
 ) {
     let (cm, is_chan, chan_in_ws, is_self) = {
-        let mut ws = core.state.write().unwrap();
+        let ws = core.state.read().unwrap();
         let is_self = match &msg.prefix {
             Some(Prefix::Nickname(nick, _, _)) => ws.casemap.str_eq(nick, &ws.current_nick),
             _ => false,
         };
-        if is_self {
-            ws.observe_self_prefix(msg.prefix.as_ref());
-        }
+        let needs_self_update =
+            is_self && (ws.self_ident.is_none() || ws.self_host.is_none());
         let is_chan = ws.is_channel_name(target);
         let chan_in_ws = is_chan && ws.channels.contains_key(&ws.casemap.fold(target));
-        (ws.casemap, is_chan, chan_in_ws, is_self)
+        let cm = ws.casemap;
+        drop(ws);
+        if needs_self_update {
+            core.state.write().unwrap().observe_self_prefix(msg.prefix.as_ref());
+        }
+        (cm, is_chan, chan_in_ws, is_self)
     };
 
     if is_self {
@@ -570,7 +561,7 @@ fn handle_part(
     let (cm, self_left) = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(msg.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, nick, track.id, reason.clone());
+        let left = ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq);
         (ws.casemap, left)
     };
 
@@ -614,7 +605,7 @@ fn handle_kick(
     let (cm, self_left) = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(msg.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone());
+        let left = ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq);
         (ws.casemap, left)
     };
 
@@ -769,7 +760,7 @@ fn handle_numeric(
             let chan_hint = args.get(1).map(String::as_str);
             let cm = {
                 let mut ws = core.state.write().unwrap();
-                ws.apply_mode_message(msg);
+                ws.apply_mode_message(msg, &core.users);
                 ws.casemap
             };
             dispatch_raw(core, msg, seq, chan_hint, cm);
@@ -871,7 +862,7 @@ fn handle_numeric(
                 .cloned()
                 .unwrap_or_else(|| format!("IRC error {code}"));
 
-            let is_chan = core.state.read().unwrap().is_channel_name(&target);
+            let is_chan = code == 403 || core.state.read().unwrap().is_channel_name(&target);
             let (target_user_id, quit_track_id) = if !is_chan {
                 core.users.resolve_send_error(&target, code, seq, &message)
             } else {

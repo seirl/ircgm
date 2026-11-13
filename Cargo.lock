@@ -376,7 +376,6 @@ dependencies = [
  "chrono",
  "fastrand",
  "futures",
- "futures-core",
  "futures-util",
  "irc",
  "irc-colors",

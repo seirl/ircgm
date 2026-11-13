@@ -7,14 +7,10 @@
 
 use ircgm::prelude::*;
 
-async fn ping_loop(bot: &Bot, room: &Room) -> Result<()> {
+async fn ping_loop(room: &Room) -> Result<()> {
     let mut inbox = room.inbox().accept_notices();
-    while let Outcome::Completed(msg) = inbox
-        .wait_cmd("!ping")
-        .until(bot.shutdown_requested())
-        .await
-    {
-        bot.reply(&msg?, "pong".green().bold())?;
+    while let Ok(msg) = inbox.wait_cmd("!ping").await {
+        msg.reply("pong".green().bold())?;
     }
     Ok(())
 }
@@ -28,10 +24,10 @@ async fn admin_loop(bot: &Bot, room: &Room) -> Result<()> {
     {
         let msg = msg?;
         if msg.account.as_deref() != Some("admin") {
-            bot.reply(&msg, "Only admins may run !quit.".red())?;
+            msg.reply("Only admins may run !quit.".red())?;
             continue;
         }
-        bot.reply(&msg, "Shutting down!".yellow())?;
+        msg.reply("Shutting down!".yellow())?;
         bot.quit(Some("Requested by admin")).await?;
         break;
     }
@@ -51,6 +47,12 @@ async fn main() -> Result<()> {
     let bot = Bot::connect(irc_cfg).await?;
     let lobby = bot.join("#lobby").await?;
 
-    tokio::try_join!(ping_loop(&bot, &lobby), admin_loop(&bot, &lobby))?;
+    tokio::try_join!(
+        async {
+            let _ = ping_loop(&lobby).until(bot.shutdown_requested()).await;
+            Ok(())
+        },
+        admin_loop(&bot, &lobby),
+    )?;
     Ok(())
 }

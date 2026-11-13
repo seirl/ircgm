@@ -26,7 +26,7 @@
 //!   Runs both early-exiting (`Ok(())`) and infinite (`loop { ... }`) phase blocks without
 //!   `Infallible` or `Ok::<_, Error>(())` turbofish annotations.
 //! - **Unlocked [`ircgm::BreakoutOptions`] + [`Event::Joined`] / [`Event::Parted`] seat rush:**
-//!   Creates `#bunker-xxxxxx` with `modes(None)` so players can self-join, counts live occupancy
+//!   Creates `#bunker-xxxxxx` with [`ircgm::BreakoutOptions::no_modes`] so players can self-join, counts live occupancy
 //!   from `JOIN` / `PART` / `QUIT` events, locks the door with [`Room::set_mode`] (`"+i"`), and
 //!   kicks survivors back to `#lobby` via RAII [`Breakout`] drop.
 
@@ -138,22 +138,22 @@ const DEFAULT_DIRECTIVES: &[Directive] = &[
     },
 ];
 
-/// Lobby entrypoint: recruits 3 players and runs IRC Simon Says ending in a Bunker Rush finale!
-pub async fn play(bot: &Bot, room: &Room) -> Result<Option<Vec<User>>> {
+/// Lobby entrypoint: recruits 2–4 players and runs IRC Simon Says ending in a Bunker Rush finale!
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
-        crate::recruit_players(room, "IRC Simon Says", 3, Duration::from_secs(30)).await?
+        crate::recruit_players(lobby, "IRC Simon Says", 2..=4, Duration::from_secs(30)).await?
     else {
-        return Ok(None);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-    run_simon_says(
+    let _ = run_simon_says(
         bot,
-        room,
+        lobby,
         &players,
         DEFAULT_DIRECTIVES,
         Duration::from_secs(10),
     )
-    .await
-    .map(Some)
+    .await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 async fn run_bunker_rush_round(
@@ -167,7 +167,7 @@ async fn run_bunker_rush_round(
     let bunker = bot
         .breakout_with(
             BreakoutOptions::new(crate::breakout_slug(lobby, "bunker"))
-                .modes(None::<&str>)
+                .no_modes()
                 .kick_reason("All clear — back to #lobby!"),
         )
         .await?;
