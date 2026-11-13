@@ -59,6 +59,7 @@ async fn blackjack_round_handles_hit_stand_timeout_dealer_settlement_and_mid_han
     game.await.unwrap().unwrap();
     let msgs = server.take_messages_to("#bj");
     assert!(msgs.iter().any(|m| m == "Alice draws 4 (total 20)!"));
+    assert!(msgs.iter().any(|m| m == "Alice stands on 20."));
     assert!(msgs
         .iter()
         .any(|m| m == "Bobby: ⏳ too slow, auto-standing!"));

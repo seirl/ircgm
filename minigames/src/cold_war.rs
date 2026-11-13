@@ -23,8 +23,9 @@
 //!   (`#usa-xxxxxx` and `#ussr-xxxxxx`) in lockstep via `tokio::try_join!`.
 //! - **Multi-channel styled relay ([`Bot::inbox_rooms`] + [`ChatMessage::to_styled`]):** Streams
 //!   chat from both war rooms in wire order while preserving each player's mIRC colors/bold/italics.
-//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + `.optional()`
-//!   decisions in separate private rooms after closing the relay phase.
+//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + `.settled()`
+//!   decisions in separate private rooms with [`Verdict::accept_ack`] so the faster premier gets
+//!   immediate in-bunker confirmation while waiting for their counterpart.
 
 use std::time::Duration;
 
@@ -92,9 +93,15 @@ pub async fn run_cold_war(
                 if msg.is_cmd("!ready") {
                     if msg.is_in(&usa) {
                         usa_ready = true;
+                        if !ussr_ready {
+                            usa.say("✔ Ready logged — waiting on Moscow...".green())?;
+                        }
                         ussr.say("[HOTLINE] Washington is ready to issue final orders.".yellow())?;
                     } else {
                         ussr_ready = true;
+                        if !usa_ready {
+                            ussr.say("✔ Ready logged — waiting on Washington...".green())?;
+                        }
                         usa.say("[HOTLINE] Moscow is ready to issue final orders.".yellow())?;
                     }
                     continue;
@@ -119,10 +126,20 @@ pub async fn run_cold_war(
     }
 
     // Phase 2: Simultaneous secret orders in each private war room:
-    let parse_order = |m: &ChatMessage| match m.text.trim() {
-        "!stand_down" => Some(Order::StandDown),
-        "!launch" => Some(Order::Launch),
-        _ => None,
+    let parse_order = |m: &ChatMessage| {
+        if m.is_cmd("!stand_down") {
+            Verdict::accept_ack(
+                Order::StandDown,
+                "✔ Stand-down order authenticated — awaiting counterpart...".green(),
+            )
+        } else if m.is_cmd("!launch") {
+            Verdict::accept_ack(
+                Order::Launch,
+                "✔ Launch key authenticated — awaiting counterpart...".red().bold(),
+            )
+        } else {
+            Verdict::reject("Issue `!stand_down` or `!launch`.".yellow())
+        }
     };
 
     let (usa_turn, ussr_turn) = tokio::try_join!(

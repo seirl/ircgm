@@ -42,10 +42,24 @@ async fn cold_war_relays_hotline_banter_and_resolves_betrayal_in_breakout_rooms(
         .iter()
         .any(|m| m == "[USSR] <Khrushchev> Agreed, comrade!"));
 
-    // Kennedy stands down while Khrushchev launches!
+    let _ = server.take_messages_to(&usa_chan);
+    let _ = server.take_messages_to(&ussr_chan);
+
+    // Kennedy stands down first -> gets immediate in-bunker ack even while USSR hasn't answered yet!
     server.chat("Kennedy", &usa_chan, "!stand_down");
+    server.settle().await;
+    assert!(server
+        .take_messages_to(&usa_chan)
+        .iter()
+        .any(|m| m.contains("Stand-down order authenticated")));
+
+    // Khrushchev launches!
     server.chat("Khrushchev", &ussr_chan, "!launch");
     server.settle().await;
+    assert!(server
+        .take_messages_to(&ussr_chan)
+        .iter()
+        .any(|m| m.contains("Launch key authenticated")));
 
     let outcome = game.await.unwrap().unwrap();
     assert_eq!(outcome, ColdWarOutcome::UssrFirstStrike);

@@ -25,7 +25,7 @@ async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
     let ask_task = tokio::spawn(async move {
         alice_c
             .ask("Pick 1..=3:", |m| match m.text.trim().parse::<u8>() {
-                Ok(n @ 1..=3) => Verdict::Accept(n),
+                Ok(n @ 1..=3) => Verdict::accept(n),
                 _ => Verdict::reject("Invalid! Pick 1, 2, or 3."),
             })
             .config(&cfg_c)
@@ -77,6 +77,112 @@ async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
     server.dm("Alice", "yes");
     server.settle().await;
     assert!(opt_task.await.unwrap().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broadcasts_on_huddle() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#lobby", &["Alice", "Bob"]);
+    server.settle().await;
+
+    let room = bot.room("#lobby").unwrap();
+    let alice = bot.user("Alice").unwrap();
+    let bob = bot.user("Bob").unwrap();
+
+    // 1. Two concurrent `alice.ask(...)` calls: `accept_ack` on Task 1 is enqueued while Task 1
+    //    still holds `ExclusiveDm`, strictly preceding Task 2's prompt on the wire!
+    let a1 = alice.clone();
+    let t1 = tokio::spawn(async move {
+        a1.ask("Prompt #1", |m| {
+            if m.text.trim() == "first" {
+                Verdict::accept_ack("one", "✔ Ack #1")
+            } else {
+                Verdict::ignore()
+            }
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+
+    let a2 = alice.clone();
+    let t2 = tokio::spawn(async move {
+        a2.ask("Prompt #2", |m| {
+            if m.text.trim() == "second" {
+                Verdict::accept_ack("two", "✔ Ack #2")
+            } else {
+                Verdict::ignore()
+            }
+        })
+        .await
+    });
+    server.flush().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["Prompt #1"]);
+
+    server.dm("Alice", "first");
+    server.settle().await;
+    // `✔ Ack #1` MUST precede `Prompt #2`!
+    assert_eq!(
+        server.take_messages_to("Alice"),
+        vec!["✔ Ack #1", "Prompt #2"]
+    );
+    assert_eq!(t1.await.unwrap().unwrap(), "one");
+
+    server.dm("Alice", "second");
+    server.settle().await;
+    assert_eq!(server.take_messages_to("Alice"), vec!["✔ Ack #2"]);
+    assert_eq!(t2.await.unwrap().unwrap(), "two");
+
+    // 2. `Room::ask` with `Verdict::accept_ack` acks in the channel:
+    let r = room.clone();
+    let r_task = tokio::spawn(async move {
+        r.ask("Type !ready:", |m| {
+            if m.is_cmd("!ready") {
+                Verdict::accept_ack(m.sender.nick(), format!("✔ {} is ready!", m.sender.nick()))
+            } else {
+                Verdict::ignore()
+            }
+        })
+        .await
+    });
+    server.flush().await;
+    let _ = server.take_messages_to("#lobby");
+    server.chat("Bob", "#lobby", "!ready");
+    server.settle().await;
+    assert_eq!(r_task.await.unwrap().unwrap(), "Bob");
+    assert_eq!(server.take_messages_to("#lobby"), vec!["✔ Bob is ready!"]);
+
+    // 3. `Huddle::ask` with `Verdict::accept_ack` broadcasts the ack to all huddle members:
+    let h_bot = bot.clone();
+    let h_alice = alice.clone();
+    let h_bob = bob.clone();
+    let h_task = tokio::spawn(async move {
+        let mut huddle = h_bot.huddle([&h_alice, &h_bob]).await?;
+        huddle
+            .ask("Who takes watch?", |m| {
+                m.cmd_arg("!watch").map_or_else(Verdict::ignore, |who| {
+                    Verdict::accept_ack(
+                        who.to_owned(),
+                        format!("✔ {} assigned {} to watch!", m.sender.nick(), who),
+                    )
+                })
+            })
+            .await
+    });
+    server.flush().await;
+    let _ = server.take_messages_to("Alice");
+    let _ = server.take_messages_to("Bob");
+
+    server.dm("Alice", "!watch Bob");
+    server.settle().await;
+    assert_eq!(h_task.await.unwrap().unwrap(), "Bob");
+    assert_eq!(
+        server.take_messages_to("Alice"),
+        vec!["✔ Alice assigned Bob to watch!"]
+    );
+    assert_eq!(
+        server.take_messages_to("Bob"),
+        vec!["✔ Alice assigned Bob to watch!"]
+    );
 }
 
 #[tokio::test(start_paused = true)]

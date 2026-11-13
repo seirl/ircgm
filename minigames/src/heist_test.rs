@@ -54,8 +54,15 @@ async fn hacker_breach_cool_nitrogen_and_synced_keys_succeed_and_teardown_vault(
     tokio::time::advance(Duration::from_secs(25)).await;
     assert!(!game.is_finished());
 
-    // Both turn their keys!
+    // Alice turns alpha first -> gets immediate `#vault` confirmation while waiting on Bob!
+    let _ = srv.take_messages_to(&vault);
     srv.chat("Alice", &vault, "!turn alpha");
+    srv.settle().await;
+    assert!(srv
+        .take_messages_to(&vault)
+        .iter()
+        .any(|m| m.contains("Alpha key engaged!")));
+
     srv.chat("Bob", &vault, "!turn omega");
 
     let outcome = (&mut game).await.unwrap().unwrap();

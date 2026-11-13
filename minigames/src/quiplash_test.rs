@@ -46,10 +46,11 @@ async fn quiplash_handles_validation_reject_pm_block_716_warning_timeout_and_vot
     server.dm("Dan", "Help I am trapped in a bakery");
     server.settle().await;
 
-    assert!(server
-        .take_messages_to("Alice")
+    let alice_dms = server.take_messages_to("Alice");
+    assert!(alice_dms
         .iter()
         .any(|m| m.contains("between 1 and 80 characters")));
+    assert!(alice_dms.iter().any(|m| m.contains("Quip locked in!")));
 
     // Advance 35s -> Carol gets 10s warning; advance 10s -> Carol times out and voting begins!
     tokio::time::advance(Duration::from_secs(35)).await;
@@ -120,6 +121,10 @@ async fn tied_quips_trigger_wire_fair_dm_tiebreaker_race() {
 
     let winner = vote.await.unwrap().unwrap().unwrap();
     assert_eq!(winner.0, dan);
+    assert!(server
+        .take_messages_to("Alice")
+        .iter()
+        .any(|m| m.contains("Dan buzzed in first with 102!")));
     assert!(server
         .take_messages_to("#quip")
         .iter()

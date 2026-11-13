@@ -4,7 +4,7 @@
 //! 1. Three players join in `#lobby` (or pass `(User, prompt)` assignments to [`collect_quips`]).
 //! 2. **Quip Phase (`45s`):** The bot simultaneously DMs each player a fill-in-the-blank prompt
 //!    ([`FuturesUnordered`] over `player.ask(...)`):
-//!    - Empty or `> 80`-char answers receive validation feedback via [`Verdict::Reject`] without
+//!    - Empty or `> 80`-char answers receive validation feedback via [`Verdict::reject`] without
 //!      resetting the `45s` timer.
 //!    - Players who haven't answered yet get a `10s` countdown warning (`warn_remaining`).
 //!    - If a player blocks DMs (`+g` `716` / `+R` `486`), [`Turn::Unreachable`] isolates that
@@ -17,8 +17,9 @@
 //!    answer on the wire (`ChatMessage::seq`) breaks the tie!
 //!
 //! ## Library Mechanics Showcased
-//! - **Concurrent per-player DM [`ircgm::Ask`]s (`FuturesUnordered`):** Inline [`Verdict::Reject`]
-//!   validation (preserving remaining timeout) and `warn_remaining` countdown warnings.
+//! - **Concurrent per-player DM [`ircgm::Ask`]s (`FuturesUnordered`):** Inline [`Verdict::reject`]
+//!   validation (preserving remaining timeout), [`Verdict::accept_ack`] in-DM confirmation, and
+//!   `warn_remaining` countdown warnings.
 //! - **PM-block bounce isolation (`+g` `716` / `+R` `486`):** [`ircgm::GameFutureExt::settled`] maps
 //!   server DM rejection numerics to [`Turn::Unreachable`].
 //! - **Identity-safe channel ballot collection:** [`Inbox::wait_map`] + [`UserId`] keys block
@@ -84,7 +85,10 @@ pub async fn collect_quips(
                                     "Keep your answer between 1 and 80 characters!".yellow(),
                                 )
                             } else {
-                                Verdict::Accept(quip.to_owned())
+                                Verdict::accept_ack(
+                                    quip.to_owned(),
+                                    "✔ Quip locked in! Watch the channel for voting.".green(),
+                                )
                             }
                         },
                     )
@@ -149,7 +153,16 @@ pub async fn tiebreaker_buzz_in(
     )?;
     huddle
         .ask("⚡ Tiebreaker! What is 17 * 6? (20s)", |m| {
-            (m.text.trim() == "102").then(|| m.sender.clone())
+            if m.text.trim() == "102" {
+                Verdict::accept_ack(
+                    m.sender.clone(),
+                    "⚡ ".yellow().bold()
+                        + m.sender.nick().bold().green()
+                        + " buzzed in first with 102!",
+                )
+            } else {
+                Verdict::reject("Nope — try again! (17 * 6)".yellow())
+            }
         })
         .reply_timeout(Duration::from_secs(20))
         .no_timeout_message()
@@ -190,14 +203,26 @@ pub async fn vote_on_quips(
     let collect = async {
         loop {
             let msg = inbox.wait_cmd("!pick").await?;
-            if let Some(choice) = msg
+            match msg
                 .cmd_arg("!pick")
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| (1..=submissions.len()).contains(&n))
             {
-                let idx = choice - 1;
-                if submissions[idx].0 != msg.sender {
-                    ballots.insert(msg.sender.id(), idx);
+                Some(choice) => {
+                    let idx = choice - 1;
+                    if submissions[idx].0 != msg.sender {
+                        ballots.insert(msg.sender.id(), idx);
+                        msg.sender
+                            .notice(format!("✔ Vote recorded for quip #{choice}!").green())?;
+                    } else {
+                        msg.sender
+                            .notice("You can't vote for your own quip!".yellow())?;
+                    }
+                }
+                None => {
+                    msg.sender.notice(
+                        format!("Pick a quip number from 1 to {}!", submissions.len()).yellow(),
+                    )?;
                 }
             }
         }

@@ -3,13 +3,19 @@ use crate::testing::test_harness;
 
 #[test]
 fn into_verdict_converts_option_and_preserves_verdict() {
-    assert_eq!(Some(42).into_verdict(), Verdict::Accept(42));
-    assert_eq!(None::<i32>.into_verdict(), Verdict::Ignore);
+    assert_eq!(Some(42).into_verdict(), Verdict::accept(42));
+    assert_eq!(None::<i32>.into_verdict(), Verdict::ignore());
+
+    let ack: Verdict<i32> = Verdict::accept_ack(7, "Locked in!");
+    assert_eq!(
+        ack.into_verdict().0,
+        VerdictInner::Accept(7, Some(Text::from("Locked in!")))
+    );
 
     let rej: Verdict<i32> = Verdict::reject("Invalid number");
     assert_eq!(
-        rej.into_verdict(),
-        Verdict::Reject(Text::from("Invalid number"))
+        rej.into_verdict().0,
+        VerdictInner::Reject(Text::from("Invalid number"))
     );
 }
 

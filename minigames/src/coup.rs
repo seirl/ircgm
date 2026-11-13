@@ -106,10 +106,15 @@ pub async fn run_coup_round(room: &Room, active: &User, rival: &User) -> Result<
     let initial_hand = [Role::Duke, Role::Contessa];
     let court_draw = [Role::Captain, Role::Ambassador];
 
-    let (opt_new_hand, steal) = tokio::try_join!(
-        ambassador_exchange_or_cancel(active, initial_hand, court_draw),
-        steal_branch,
-    )?;
+    let exchange_branch = async {
+        let out = ambassador_exchange_or_cancel(active, initial_hand, court_draw).await?;
+        if out.is_some() {
+            room.say("🃏 ".cyan() + active.nick().bold() + " completed their Ambassador exchange.")?;
+        }
+        Ok::<_, Error>(out)
+    };
+
+    let (opt_new_hand, steal) = tokio::try_join!(exchange_branch, steal_branch)?;
 
     Ok(CoupTurnOutcome {
         final_hand: opt_new_hand.unwrap_or(initial_hand),
@@ -143,7 +148,19 @@ pub async fn ambassador_exchange_or_cancel(
                 Some((idx, role)) => {
                     pool.remove(idx);
                     kept.push(role);
-                    dm.say(format!("Kept {} ({}/2).", role.label(), kept.len()))?;
+                    if kept.len() == 2 {
+                        dm.say(
+                            format!(
+                                "✔ Kept {} (2/2) — exchange complete: [{}, {}]!",
+                                role.label(),
+                                kept[0].label(),
+                                kept[1].label()
+                            )
+                            .green(),
+                        )?;
+                    } else {
+                        dm.say(format!("✔ Kept {} (1/2) — pick 1 more card:", role.label()))?;
+                    }
                 }
                 None => {
                     let rem: Vec<&str> = pool.iter().map(|r| r.label()).collect();
@@ -185,9 +202,18 @@ pub async fn resolve_steal_attempt(
                 thief.nick()
             ),
             |m| match m.text.trim().to_ascii_lowercase().as_str() {
-                "block captain" => Verdict::Accept(StealResolution::Blocked(Role::Captain)),
-                "block ambassador" => Verdict::Accept(StealResolution::Blocked(Role::Ambassador)),
-                "allow" => Verdict::Accept(StealResolution::Stolen { coins: 2 }),
+                "block captain" => Verdict::accept_ack(
+                    StealResolution::Blocked(Role::Captain),
+                    "✔ Blocking steal with Captain!".cyan(),
+                ),
+                "block ambassador" => Verdict::accept_ack(
+                    StealResolution::Blocked(Role::Ambassador),
+                    "✔ Blocking steal with Ambassador!".cyan(),
+                ),
+                "allow" => Verdict::accept_ack(
+                    StealResolution::Stolen { coins: 2 },
+                    "✔ Allowing the steal.".yellow(),
+                ),
                 _ => Verdict::reject(
                     "Reply `block captain`, `block ambassador`, or `allow`.".yellow(),
                 ),

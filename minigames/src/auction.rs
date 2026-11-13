@@ -138,9 +138,9 @@ pub async fn run_auction(
                     } else {
                         msg.sender.say("You already used your appraisal!".yellow())?;
                     }
-                } else if let Some(arg) = msg.cmd_arg("!proxy") {
-                    match arg.parse::<u32>() {
-                        Ok(max_amt) if max_amt >= min_required_bid(high_bid.as_ref()) => {
+                } else if msg.is_cmd("!proxy") {
+                    match msg.cmd_arg("!proxy").and_then(|a| a.parse::<u32>().ok()) {
+                        Some(max_amt) if max_amt >= min_required_bid(high_bid.as_ref()) => {
                             if let Some(slot) =
                                 proxies.iter_mut().find(|(u, _)| u == &msg.sender)
                             {
@@ -155,7 +155,7 @@ pub async fn run_auction(
                         _ => {
                             msg.sender.say(
                                 format!(
-                                    "Proxy ceiling must be at least {}g.",
+                                    "Usage: `!proxy <max_gold>` (at least {}g).",
                                     min_required_bid(high_bid.as_ref())
                                 )
                                 .yellow(),
@@ -163,22 +163,20 @@ pub async fn run_auction(
                         }
                     }
                 }
-            } else if msg.is_in(room) {
-                if let Some(arg) = msg.cmd_arg("!bid") {
-                    let needed = min_required_bid(high_bid.as_ref());
-                    match arg.parse::<u32>() {
-                        Ok(amt) if amt >= needed => {
-                            high_bid = Some((msg.sender.clone(), amt));
-                            room.say(
-                                "💰 ".green()
-                                    + msg.sender.nick().bold()
-                                    + format!(" bids {amt}g!"),
-                            )?;
-                            apply_proxies(room, &mut high_bid, &proxies)?;
-                        }
-                        _ => {
-                            room.say(format!("Minimum bid is {needed}g!").yellow())?;
-                        }
+            } else if msg.is_in(room) && msg.is_cmd("!bid") {
+                let needed = min_required_bid(high_bid.as_ref());
+                match msg.cmd_arg("!bid").and_then(|a| a.parse::<u32>().ok()) {
+                    Some(amt) if amt >= needed => {
+                        high_bid = Some((msg.sender.clone(), amt));
+                        room.say(
+                            "💰 ".green()
+                                + msg.sender.nick().bold()
+                                + format!(" bids {amt}g!"),
+                        )?;
+                        apply_proxies(room, &mut high_bid, &proxies)?;
+                    }
+                    _ => {
+                        room.say(format!("Minimum bid is `!bid {needed}`!").yellow())?;
                     }
                 }
             }

@@ -26,27 +26,48 @@ mod private {
     impl<T> Sealed for super::Verdict<T> {}
 }
 
-/// Tri-state result for [`Ask`] matchers that want to send validation feedback
-/// without restarting the reply timer or leaving the `Ask` loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict<T> {
-    /// Accepts `T` and resolves the `Ask` with `Ok(T)`.
-    Accept(T),
-    /// Sends validation feedback `Text` to the `Ask`'s target and keeps waiting
-    /// **without** resetting the reply timer.
+enum VerdictInner<T> {
+    Accept(T, Option<Text>),
     Reject(Text),
-    /// Silently ignores this message and keeps waiting.
     Ignore,
 }
 
+/// Outcome returned by [`Ask`] matchers that want to send inline acknowledgment or
+/// validation feedback without restarting the reply timer or leaving the `Ask` loop.
+///
+/// Construct with [`Verdict::accept`], [`Verdict::accept_ack`], [`Verdict::reject`], or
+/// [`Verdict::ignore`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verdict<T>(VerdictInner<T>);
+
 impl<T> Verdict<T> {
+    /// Accepts `val` silently and resolves the [`Ask`] with `Ok(val)`.
+    pub fn accept(val: T) -> Self {
+        Self(VerdictInner::Accept(val, None))
+    }
+
+    /// Accepts `val`, immediately enqueues `msg` to the prompt's target (in-channel for
+    /// [`Room`], in-DM while [`ExclusiveDm`] is still held for [`User`]/[`ExclusiveDm`], or
+    /// broadcast to all members for [`Huddle`]), and resolves the [`Ask`] with `Ok(val)`.
+    pub fn accept_ack(val: T, msg: impl Into<Text>) -> Self {
+        Self(VerdictInner::Accept(val, Some(msg.into())))
+    }
+
+    /// Sends validation feedback `msg` to the responder and keeps waiting without resetting the
+    /// reply timer.
     pub fn reject(msg: impl Into<Text>) -> Self {
-        Self::Reject(msg.into())
+        Self(VerdictInner::Reject(msg.into()))
+    }
+
+    /// Silently ignores this message and keeps waiting.
+    pub const fn ignore() -> Self {
+        Self(VerdictInner::Ignore)
     }
 }
 
-/// Sealed trait implemented for both `Option<T>` (`Some(v) -> Accept(v)`, `None -> Ignore`)
-/// and [`Verdict<T>`].
+/// Sealed trait implemented for both `Option<T>` (`Some(v) -> Verdict::accept(v)`,
+/// `None -> Verdict::ignore()`) and [`Verdict<T>`].
 pub trait IntoVerdict: private::Sealed {
     type Output;
     fn into_verdict(self) -> Verdict<Self::Output>;
@@ -57,8 +78,8 @@ impl<T> IntoVerdict for Option<T> {
 
     fn into_verdict(self) -> Verdict<T> {
         match self {
-            Some(v) => Verdict::Accept(v),
-            None => Verdict::Ignore,
+            Some(v) => Verdict::accept(v),
+            None => Verdict::ignore(),
         }
     }
 }
@@ -607,16 +628,24 @@ where
             }
             err
         },
-        |msg| match matcher(msg).into_verdict() {
-            Verdict::Accept(val) => {
-                tracing::debug!(sender = %msg.nick, seq = msg.seq, "ask reply accepted");
+        |msg| match matcher(msg).into_verdict().0 {
+            VerdictInner::Accept(val, ack) => {
+                tracing::debug!(
+                    sender = %msg.nick,
+                    seq = msg.seq,
+                    has_ack = ack.is_some(),
+                    "ask reply accepted"
+                );
+                if let Some(ack_msg) = ack {
+                    sender.send_broadcast_or_target(ack_msg);
+                }
                 Some(val)
             }
-            Verdict::Reject(feedback) => {
+            VerdictInner::Reject(feedback) => {
                 sender.send_reject(&msg.sender, feedback);
                 None
             }
-            Verdict::Ignore => {
+            VerdictInner::Ignore => {
                 sender.handle_ignore(msg);
                 None
             }

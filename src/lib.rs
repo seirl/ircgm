@@ -4,7 +4,8 @@
 //! - [`Bot`] manages the IRC connection pump, registration barrier, priority outbound flood scheduler,
 //!   and session-scoped [`Room`], [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
 //! - [`Ask`] and [`AskConfig`] provide ergonomic prompts with post-write-receipt reply clocks,
-//!   inline [`Verdict::Reject`] validation, countdown warnings, and per-player timeout callouts.
+//!   inline [`Verdict::reject`] validation, [`Verdict::accept_ack`] confirmations, countdown
+//!   warnings, and per-player timeout callouts.
 //! - [`GameFutureExt`] composes any prompt or multi-step `async fn` with `.until()`, `.or_until()`,
 //!   `.with_timeout()`, `.optional()`, and `.settled()` ([`Turn`]).
 //!
@@ -34,7 +35,7 @@
 //!         match room
 //!             .ask_user(player, player.nick().bold() + ": pick a number 1..=5!", |m| {
 //!                 match m.text.trim().parse::<u8>() {
-//!                     Ok(n @ 1..=5) => Verdict::Accept(n),
+//!                     Ok(n @ 1..=5) => Verdict::accept(n),
 //!                     _ => Verdict::reject("Enter a number between 1 and 5!".yellow()),
 //!                 }
 //!             })

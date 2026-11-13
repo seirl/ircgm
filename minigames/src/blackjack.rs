@@ -114,10 +114,18 @@ pub async fn run_round_with_shoe(
                 .ask_user(
                     player,
                     player.nick().bold() + format!(" (total {total}): `hit` or `stand`?"),
-                    |m| match m.text.trim() {
-                        "hit" => Some(Move::Hit),
-                        "stand" => Some(Move::Stand),
-                        _ => None,
+                    |m| {
+                        let word = m.text.trim();
+                        if word.eq_ignore_ascii_case("hit") {
+                            Verdict::accept(Move::Hit)
+                        } else if word.eq_ignore_ascii_case("stand") {
+                            Verdict::accept_ack(
+                                Move::Stand,
+                                player.nick().bold() + format!(" stands on {total}."),
+                            )
+                        } else {
+                            Verdict::ignore()
+                        }
                     },
                 )
                 .settled()

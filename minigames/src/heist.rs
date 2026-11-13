@@ -6,7 +6,7 @@
 //! 2. **Phase 1 — Vault Door Breach Race (`tokio::select!`):** Both specialists work simultaneously;
 //!    whichever cracks their mechanism first opens the blast door and cancels the other's puzzle:
 //!    - **Hacker (Private DM [`ExclusiveDm`]):** Converts `0x2A` to decimal (`42`), then enters
-//!      `override` (`30s` per step, with [`Verdict::Reject`] hints on wrong answers).
+//!      `override` (`30s` per step, with [`Verdict::reject`] hints on wrong answers).
 //!    - **Safecracker (Vault Channel [`Room::ask_user`]):** Sets 3 pins in order (`!tension`,
 //!      `!rake`, `!set`, `20s` per pin).
 //! 3. **Phase 2 — Live Laser Alarm & Dual-Key Extraction (`20s` virtual fuse):**
@@ -86,14 +86,21 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
 
     dm.ask("💻 Step 1/2 — Convert `0x2A` to decimal:", |m| {
         match m.text.trim() {
-            "42" => Verdict::Accept(()),
+            "42" => Verdict::accept(()),
             _ => Verdict::reject("Hint: 2 * 16 + 10.".yellow()),
         }
     })
     .await?;
 
     dm.ask("💻 Step 2/2 — Type `override` to cut door power:", |m| {
-        m.text.trim().eq_ignore_ascii_case("override").then_some(())
+        if m.text.trim().eq_ignore_ascii_case("override") {
+            Verdict::accept_ack(
+                (),
+                "🔓 Door power severed! Return to the vault channel!".green(),
+            )
+        } else {
+            Verdict::reject("Type `override` to sever door power.".yellow())
+        }
     })
     .await
 }
@@ -197,14 +204,33 @@ pub async fn run_heist(
 
     let (rate_tx, mut rate_rx) = watch::channel(1.0_f64);
     let dual_keys = async {
-        tokio::try_join!(
-            vault
-                .inbox_user(hacker)
-                .into_wait_for(|m| m.cmd_arg("!turn") == Some("alpha")),
-            vault
-                .inbox_user(safecracker)
-                .into_wait_for(|m| m.cmd_arg("!turn") == Some("omega")),
-        )?;
+        let turn_alpha = async {
+            let mut inbox = vault.inbox_user(hacker);
+            loop {
+                let (_msg, key) = inbox.wait_cmd_arg("!turn").await?;
+                if key.eq_ignore_ascii_case("alpha") {
+                    vault.say("🔑 Alpha key engaged!".cyan().bold())?;
+                    return Ok::<(), Error>(());
+                }
+                vault.say(
+                    hacker.nick().bold() + ": your cylinder takes `!turn alpha`!".yellow(),
+                )?;
+            }
+        };
+        let turn_omega = async {
+            let mut inbox = vault.inbox_user(safecracker);
+            loop {
+                let (_msg, key) = inbox.wait_cmd_arg("!turn").await?;
+                if key.eq_ignore_ascii_case("omega") {
+                    vault.say("🔑 Omega key engaged!".cyan().bold())?;
+                    return Ok::<(), Error>(());
+                }
+                vault.say(
+                    safecracker.nick().bold() + ": your cylinder takes `!turn omega`!".yellow(),
+                )?;
+            }
+        };
+        tokio::try_join!(turn_alpha, turn_omega)?;
         Ok::<HeistOutcome, Error>(HeistOutcome::ExtractedDualKeys)
     };
 

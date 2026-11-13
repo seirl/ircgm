@@ -395,7 +395,7 @@ fn is_admin_msg(msg: &ChatMessage, admins: &[String]) -> bool {
 enum StopReason {
     Shutdown,
     Admin(Box<ChatMessage>),
-    Aborted(User),
+    Aborted(Box<ChatMessage>),
 }
 
 async fn busy_lobby_responder(lobby: &Room, active_slug: &str, starter: &User) -> Result<()> {
@@ -523,7 +523,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
             let starter_gone =
                 !starter_for_abort.is_online() || !lobby_for_abort.has_user(&starter_for_abort);
             if is_starter || (starter_gone && m.is_in(&lobby_for_abort)) {
-                Some(StopReason::Aborted(m.sender.clone()))
+                Some(StopReason::Aborted(Box::new(m.clone())))
             } else {
                 None
             }
@@ -590,11 +590,14 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                     lobby.say(format!("🛑 `{slug}` was stopped by an admin.").yellow())?;
                 }
             }
-            Outcome::Stopped(StopReason::Aborted(who)) => {
-                tracing::info!(game = slug, by = %who.nick(), "minigame aborted");
+            Outcome::Stopped(StopReason::Aborted(abort_msg)) => {
+                tracing::info!(game = slug, by = %abort_msg.sender.nick(), "minigame aborted");
+                if abort_msg.is_dm() {
+                    abort_msg.reply(format!("🛑 Aborted `{slug}`.").yellow())?;
+                }
                 lobby.say(
                     "🛑 ".yellow()
-                        + who.nick().bold()
+                        + abort_msg.sender.nick().bold()
                         + format!(" aborted `{slug}` — lobby is open!").yellow(),
                 )?;
             }

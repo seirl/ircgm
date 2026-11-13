@@ -55,14 +55,20 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     server.dm("Wolf2", "!kill Villager1");
     server.settle().await;
 
-    assert!(server
-        .take_messages_to("Wolf1")
+    let w1_dms = server.take_messages_to("Wolf1");
+    assert!(w1_dms
         .iter()
         .any(|m| m.contains("Pick a living non-Werewolf townsfolk!")));
-    assert!(server
-        .take_messages_to("Wolf2")
+    assert!(w1_dms
+        .iter()
+        .any(|m| m.contains("Wolf2 locked in Villager1!")));
+    let w2_dms = server.take_messages_to("Wolf2");
+    assert!(w2_dms
         .iter()
         .any(|m| m.contains("[Wolves] <Wolf1> let's bite Villager1")));
+    assert!(w2_dms
+        .iter()
+        .any(|m| m.contains("Wolf2 locked in Villager1!")));
 
     // 5s bodyguard window (`0` guards) + 3s AFK `#graveyard` `invite_available` window:
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -83,6 +89,10 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     server.dm("Villager2", "!vote Wolf2");
     server.dm("Wolf1", "!vote Wolf2");
     server.settle().await;
+    assert!(server
+        .take_messages_to("Villager2")
+        .iter()
+        .any(|m| m.contains("Secret ballot cast for Wolf2!")));
     tokio::time::advance(Duration::from_secs(45)).await;
 
     let winner = game.await.unwrap().unwrap();
@@ -187,8 +197,13 @@ async fn offline_bodyguard_skipped_by_available_and_online_bodyguard_saves_wolf_
     // Wolf1 bites Villager1, and online Guard2 DMs `!protect Villager1` within 5s!
     server.dm("Wolf1", "!kill Villager1");
     server.settle().await;
+    let _ = server.take_messages_to("Guard2");
     server.dm("Guard2", "!protect Villager1");
     server.settle().await;
+    assert!(server
+        .take_messages_to("Guard2")
+        .iter()
+        .any(|m| m.contains("Moving to protect Villager1!")));
 
     // Both Guard2 and saved Villager1 vote out Wolf1!
     server.dm("Guard2", "!vote Wolf1");

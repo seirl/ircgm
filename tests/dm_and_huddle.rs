@@ -218,10 +218,10 @@ async fn exclusive_many_available_and_huddle_semantics() {
 
         let ask_fut = pack.ask("Who to bite?", |m| {
             let Some(target) = m.cmd_args("!kill") else {
-                return Verdict::Ignore;
+                return Verdict::ignore();
             };
             if villager.eq_nick(target) {
-                Verdict::Accept((m.sender.clone(), target.to_owned()))
+                Verdict::accept((m.sender.clone(), target.to_owned()))
             } else {
                 Verdict::reject("Invalid target!")
             }

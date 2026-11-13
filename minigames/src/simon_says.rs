@@ -187,7 +187,13 @@ async fn run_bunker_rush_round(
             while inside.len() < seats {
                 match ev_in.next_event().await? {
                     Event::Joined { user, .. } if living_ids.contains(&user.id()) => {
-                        inside.insert(user.id());
+                        if inside.insert(user.id()) {
+                            bunker.say(
+                                "🛡️ ".green()
+                                    + user.nick().bold()
+                                    + format!(" claimed bunker seat {}/{seats}!", inside.len()),
+                            )?;
+                        }
                     }
                     Event::Parted { user, .. }
                     | Event::Kicked { user, .. }
@@ -273,8 +279,14 @@ pub async fn run_simon_says(
             let collect = async {
                 loop {
                     let uid = inbox.wait_event_map(any_player_activity).await?;
-                    if living_ids.contains(&uid) {
-                        tricked.insert(uid);
+                    if living_ids.contains(&uid) && tricked.insert(uid) {
+                        if let Some(flincher) = living.iter().find(|u| u.id() == uid) {
+                            room.say(
+                                "💥 ".red()
+                                    + flincher.nick().bold()
+                                    + " flinched — Simon didn't say!",
+                            )?;
+                        }
                     }
                 }
             };

@@ -58,6 +58,10 @@ async fn concurrent_steal_queues_behind_ambassador_exchange_without_interleaving
     assert_eq!(kept, Some([Role::Captain, Role::Ambassador]));
     assert_eq!(steal, StealResolution::Blocked(Role::Ambassador));
     assert!(srv
+        .take_messages_to("Alice")
+        .iter()
+        .any(|m| m.contains("Blocking steal with Ambassador")));
+    assert!(srv
         .take_messages_to("#lobby")
         .iter()
         .any(|m| m.contains("blocks the steal claiming Ambassador")));
