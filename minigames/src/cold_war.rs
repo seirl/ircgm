@@ -23,7 +23,7 @@
 //!   (`#usa-xxxxxx` and `#ussr-xxxxxx`) in lockstep via `tokio::try_join!`.
 //! - **Multi-channel styled relay ([`Bot::inbox_rooms`] + [`ChatMessage::to_styled`]):** Streams
 //!   chat from both war rooms in wire order while preserving each player's mIRC colors/bold/italics.
-//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + [`ircgm::Ask::optional`]
+//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + [`Answer::ok`]
 //!   decisions in separate private rooms with [`AskMatch::accept_say`] so the faster premier gets
 //!   immediate in-bunker confirmation while waiting for their counterpart.
 
@@ -143,25 +143,23 @@ pub async fn run_cold_war(
         }
     };
 
-    let (usa_opt, ussr_opt) = tokio::try_join!(
+    let (usa_ans, ussr_ans) = tokio::try_join!(
         usa.ask_user(
             usa_premier,
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
-        .reply_timeout(Duration::from_secs(15))
-        .optional(),
+        .reply_timeout(Duration::from_secs(15)),
         ussr.ask_user(
             ussr_premier,
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
-        .reply_timeout(Duration::from_secs(15))
-        .optional(),
+        .reply_timeout(Duration::from_secs(15)),
     )?;
 
-    let usa_order = usa_opt.unwrap_or(Order::StandDown);
-    let ussr_order = ussr_opt.unwrap_or(Order::StandDown);
+    let usa_order = usa_ans.ok().unwrap_or(Order::StandDown);
+    let ussr_order = ussr_ans.ok().unwrap_or(Order::StandDown);
 
     let outcome = match (usa_order, ussr_order) {
         (Order::StandDown, Order::StandDown) => {

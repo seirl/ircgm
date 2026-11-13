@@ -25,12 +25,12 @@ fn into_ask_match_and_answer_conversions() {
     assert_eq!(ok_ans.as_ok(), Some(&7));
     assert_eq!(ok_ans.clone().ok(), Some(7));
     assert_eq!(ok_ans.clone().unwrap(), 7);
-    assert_eq!(ok_ans.into_result().unwrap(), 7);
+    assert_eq!(ok_ans.required().unwrap(), 7);
 
     let to_ans = Answer::from_result(Err::<u32, Error>(Error::TimedOut)).unwrap();
     assert!(to_ans.is_timed_out());
     assert_eq!(to_ans.clone().ok(), None);
-    assert!(matches!(to_ans.into_result(), Err(Error::TimedOut)));
+    assert!(matches!(to_ans.required(), Err(Error::TimedOut)));
 
     let left_ans = Answer::from_result(Err::<u32, Error>(Error::UserLeft {
         nick: "Bob".into(),
@@ -39,7 +39,7 @@ fn into_ask_match_and_answer_conversions() {
     .unwrap();
     assert!(left_ans.is_left());
     assert_eq!(left_ans.clone().ok(), None);
-    assert!(matches!(left_ans.into_result(), Err(Error::UserLeft { .. })));
+    assert!(matches!(left_ans.required(), Err(Error::UserLeft { .. })));
 
     let unreach_ans = Answer::from_result(Err::<u32, Error>(Error::UserUnreachable {
         nick: "Alice".into(),
@@ -57,7 +57,7 @@ fn into_ask_match_and_answer_conversions() {
         }
     );
     assert!(matches!(
-        unreach_ans.into_result(),
+        unreach_ans.required(),
         Err(Error::UserUnreachable { code: 716, .. })
     ));
 

@@ -255,7 +255,7 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     assert_eq!(r3.unwrap(), Answer::TimedOut);
     assert_eq!(e3, Duration::from_secs(18));
 
-    // Single-timer override on `ExclusiveDm::ask` + `.required()`:
+    // Single-timer override on `ExclusiveDm::ask` + `Answer::required()`:
     let (bot2, server2) = test_harness("GM");
     server2.complete_join("#r", &["Alice"]);
     server2.settle().await;
@@ -279,13 +279,13 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
         let a1 = dm
             .ask("120s prompt", |m| Some(m.text.clone()))
             .reply_timeout(Duration::from_secs(120))
-            .required()
-            .await?;
+            .await?
+            .required()?;
         let a2 = dm
             .ask("unbounded prompt", |m| Some(m.text.clone()))
             .no_reply_timeout()
-            .required()
-            .await?;
+            .await?
+            .required()?;
         Ok::<_, Error>((a1, a2))
     };
     let (_, asks_res) = tokio::join!(answer_later, asks);
@@ -294,7 +294,7 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     assert_eq!(a2, "after_400s");
     drop(dm);
 
-    // Combinator table: default `Answer`, `optional()`, `required()`, and `with_timeout().none_on_timeout()`
+    // Combinator table: default `Answer`, `Answer::ok()`, `Answer::required()`, and `with_timeout().none_on_timeout()`
     let (bot3, mut server3) = test_harness("GM");
     server3.complete_join("#tab", &["Alice"]);
     server3.settle().await;
@@ -311,9 +311,9 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
 
     let r = room_msg
         .ask("Q1", |_| Option::<()>::None)
-        .optional()
         .await
-        .unwrap();
+        .unwrap()
+        .ok();
     assert_eq!(r, None);
     assert_eq!(
         server3.take_messages_to("#tab"),
@@ -330,9 +330,9 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     let r = room_msg
         .ask("Q3", |_| Option::<()>::None)
         .no_timeout_message()
-        .optional()
         .await
-        .unwrap();
+        .unwrap()
+        .ok();
     assert_eq!(r, None);
     assert_eq!(server3.take_messages_to("#tab"), vec!["Q3"]);
 
@@ -351,8 +351,9 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
 
     let r_req = room_silent
         .ask("Q6", |_| Option::<()>::None)
-        .required()
         .await
+        .unwrap()
+        .required()
         .unwrap_err();
     assert!(matches!(r_req, Error::TimedOut));
     assert_eq!(server3.take_messages_to("#tab"), vec!["Q6"]);
@@ -447,7 +448,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
 }
 
 #[tokio::test]
-async fn answer_unreachable_pm_block_optional_required_and_fatal_disconnect_propagation() {
+async fn answer_unreachable_pm_block_ok_required_and_fatal_disconnect_propagation() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#game", &["P1", "P2", "P3"]);
     server.settle().await;
@@ -487,35 +488,27 @@ async fn answer_unreachable_pm_block_optional_required_and_fatal_disconnect_prop
         Answer::Unreachable { ref nick, code: 716, .. } if nick == "P3"
     ));
 
-    // `.optional()` maps `Unreachable` to `Ok(None)`, while `.required()` promotes it to `Err(UserUnreachable)`:
+    // `Answer::ok()` maps `Unreachable` to `None`, while `Answer::required()` promotes it to `Err(UserUnreachable)`:
     let p2_opt = p2.clone();
-    let opt_unreach = tokio::spawn(async move {
-        p2_opt
-            .ask("Optional?", |m| Some(m.text.clone()))
-            .optional()
-            .await
-    });
+    let opt_unreach =
+        tokio::spawn(async move { p2_opt.ask("Optional?", |m| Some(m.text.clone())).await });
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("P2");
     server.send_line(":irc.srv 486 GM P2 :blocked\r\n");
     server.settle().await;
-    assert_eq!(opt_unreach.await.unwrap().unwrap(), None);
+    assert_eq!(opt_unreach.await.unwrap().unwrap().ok(), None);
 
     let p3_req = p3.clone();
-    let req_unreach = tokio::spawn(async move {
-        p3_req
-            .ask("Required?", |m| Some(m.text.clone()))
-            .required()
-            .await
-    });
+    let req_unreach =
+        tokio::spawn(async move { p3_req.ask("Required?", |m| Some(m.text.clone())).await });
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("P3");
     server.send_line(":irc.srv 716 GM P3 :blocked\r\n");
     server.settle().await;
     assert!(matches!(
-        req_unreach.await.unwrap(),
+        req_unreach.await.unwrap().unwrap().required(),
         Err(Error::UserUnreachable { ref nick, code: 716, .. }) if nick == "P3"
     ));
 
@@ -550,8 +543,9 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
 
     let absent_req_err = room
         .ask_user(&bob, "Bob required?", |_| Some(()))
-        .required()
         .await
+        .unwrap()
+        .required()
         .unwrap_err();
     assert!(matches!(absent_req_err, Error::UserLeft { ref nick, .. } if nick == "Bob"));
     assert!(server.try_recv_sent().is_none());

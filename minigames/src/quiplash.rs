@@ -149,7 +149,7 @@ pub async fn tiebreaker_buzz_in(
             .yellow()
             .bold(),
     )?;
-    huddle
+    Ok(huddle
         .ask("⚡ Tiebreaker! What is 17 * 6? (20s)", |m| {
             if m.text.trim() == "102" {
                 AskMatch::accept_say(
@@ -166,8 +166,8 @@ pub async fn tiebreaker_buzz_in(
         })
         .reply_timeout(Duration::from_secs(20))
         .no_timeout_message()
-        .optional()
-        .await
+        .await?
+        .ok())
 }
 
 /// Posts anonymous quips in `room`, collects `!pick <1..=N>` votes for `20s`, and breaks ties via DM buzz-in.

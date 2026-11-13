@@ -39,7 +39,7 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
         .ignore_commands()
         .no_timeout_message();
 
-    let (opt_block, opt_card) = tokio::try_join!(
+    let (ans_block, ans_card) = tokio::try_join!(
         player
             .ask(
                 "Bob played Steal on you! Play Block? (yes/no, 20s)",
@@ -50,8 +50,7 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
                 }
             )
             .config(&prompt_cfg)
-            .warn_remaining(Duration::from_secs(5), "⏳ 5 seconds left!".yellow())
-            .optional(),
+            .warn_remaining(Duration::from_secs(5), "⏳ 5 seconds left!".yellow()),
         player
             .ask(
                 "Discard a card (1, 2, or 3):",
@@ -62,11 +61,10 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
                     _ => AskMatch::reject("Please reply with 1, 2, or 3.".yellow()),
                 }
             )
-            .config(&prompt_cfg)
-            .optional(),
+            .config(&prompt_cfg),
     )?;
 
-    Ok((opt_block.unwrap_or(false), opt_card))
+    Ok((ans_block.ok().unwrap_or(false), ans_card.ok()))
 }
 
 #[tokio::main(flavor = "current_thread")]

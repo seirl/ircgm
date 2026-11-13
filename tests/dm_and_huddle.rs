@@ -144,9 +144,9 @@ async fn stale_inbox_cleared_between_exclusive_dm_asks() {
     let res1 = dm
         .ask("Question 1?", |m| Some(m.text.clone()))
         .reply_timeout(Duration::from_secs(5))
-        .optional()
         .await
-        .unwrap();
+        .unwrap()
+        .ok();
     assert!(res1.is_none());
     let _ = server.take_messages_to("Alice");
 

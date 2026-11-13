@@ -90,8 +90,8 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
             _ => AskMatch::reject("Hint: 2 * 16 + 10.".yellow()),
         }
     })
-    .required()
-    .await?;
+    .await?
+    .required()?;
 
     dm.ask("💻 Step 2/2 — Type `override` to cut door power:", |m| {
         if m.text.trim().eq_ignore_ascii_case("override") {
@@ -103,8 +103,8 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
             AskMatch::reject("Type `override` to sever door power.".yellow())
         }
     })
+    .await?
     .required()
-    .await
 }
 
 /// Safecracker's 3-step vault channel lockpick sequence.
@@ -121,8 +121,8 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
                 |m| m.is_cmd(cmd).then_some(()),
             )
             .reply_timeout(Duration::from_secs(20))
-            .required()
-            .await?;
+            .await?
+            .required()?;
     }
     Ok(())
 }

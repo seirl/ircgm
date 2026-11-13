@@ -149,28 +149,29 @@ pub async fn werewolf_pack_kill(
         return Ok(None);
     }
 
-    pack.ask(
-        "🐺 Whisper here to deliberate, or `!kill <nick>` to strike (30s):",
-        |m| {
-            let Some(target) = m.cmd_arg("!kill") else {
-                return AskMatch::ignore();
-            };
-            match townsfolk.iter().find(|u| u.eq_nick(target)) {
-                Some(victim) => AskMatch::accept_say(
-                    victim.clone(),
-                    irc_format!(
-                        "{} {} locked in {}!",
-                        "🐺".bold(),
-                        m.sender.nick().bold(),
-                        victim.nick().bold().red(),
+    Ok(pack
+        .ask(
+            "🐺 Whisper here to deliberate, or `!kill <nick>` to strike (30s):",
+            |m| {
+                let Some(target) = m.cmd_arg("!kill") else {
+                    return AskMatch::ignore();
+                };
+                match townsfolk.iter().find(|u| u.eq_nick(target)) {
+                    Some(victim) => AskMatch::accept_say(
+                        victim.clone(),
+                        irc_format!(
+                            "{} {} locked in {}!",
+                            "🐺".bold(),
+                            m.sender.nick().bold(),
+                            victim.nick().bold().red(),
+                        ),
                     ),
-                ),
-                None => AskMatch::reject("Pick a living non-Werewolf townsfolk!".yellow()),
-            }
-        },
-    )
-    .optional()
-    .await
+                    None => AskMatch::reject("Pick a living non-Werewolf townsfolk!".yellow()),
+                }
+            },
+        )
+        .await?
+        .ok())
 }
 
 /// Collects simultaneous secret `!vote <nick>` DMs from all `alive` players before a shared deadline,
@@ -215,8 +216,8 @@ pub async fn collect_secret_votes(
                 })
                 .reply_deadline(deadline)
                 .no_timeout_message()
-                .optional()
-                .await?;
+                .await?
+                .ok();
             Ok::<_, Error>((voter.clone(), pick))
         }
     }))
@@ -275,8 +276,8 @@ pub async fn run_mafia_round(
                     )
                     .reply_timeout(Duration::from_secs(5))
                     .no_timeout_message()
-                    .optional()
-                    .await?;
+                    .await?
+                    .ok();
                 match pick {
                     Some(saved) => Ok::<(User, User), Error>((guard, saved)),
                     None => std::future::pending().await,

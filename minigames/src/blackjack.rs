@@ -89,8 +89,8 @@ pub async fn run_round_with_shoe(
         "Seated players: anyone type `!deal` to cut the deck!",
         |m| m.is_cmd("!deal").then_some(()),
     )
-    .required()
-    .await?;
+    .await?
+    .required()?;
 
     let mut dealer = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
     let mut standing_hands: Vec<(User, u8)> = Vec::new();

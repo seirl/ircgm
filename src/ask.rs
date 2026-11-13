@@ -96,8 +96,8 @@ impl<T> IntoAskMatch for AskMatch<T> {
 /// Outcome of an [`Ask`] prompt, separating normal player/prompt outcomes (`Ok`, `TimedOut`,
 /// `Left`, `Unreachable`) from fatal session or channel [`Error`]s.
 ///
-/// Use [`Ask::optional`] (or [`Answer::ok`]) when any non-answer should map to `None`, or
-/// [`Ask::required`] (or [`Answer::into_result`]) when non-answers should fail with `Err`.
+/// Use [`Answer::ok`] when any non-answer should map to `None`, or [`Answer::required`] when
+/// non-answers should fail with `Err`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer<T> {
     Ok(T),
@@ -135,8 +135,8 @@ impl<T> Answer<T> {
     }
 
     /// Inverse of [`Answer::from_result`]: promotes `TimedOut`, `Left`, and `Unreachable` into
-    /// `Err(Error::...)`.
-    pub fn into_result(self) -> Result<T> {
+    /// `Err(Error::...)` so `?` short-circuits sequential multi-step prompts.
+    pub fn required(self) -> Result<T> {
         match self {
             Answer::Ok(val) => Ok(val),
             Answer::TimedOut => Err(Error::TimedOut),
@@ -549,10 +549,10 @@ enum AskState<'a, F, O> {
 /// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`Room::ask_users`],
 /// [`User::ask`], [`ExclusiveDm::ask`], and [`Huddle::ask`].
 ///
-/// By default, awaiting an `Ask` resolves to `Result<Answer<T>>` so timeouts, player departures,
-/// and DM bounces must be handled explicitly while broken sessions/channels propagate via `?`.
-/// Call [`Ask::optional`] to map any non-answer to `Ok(None)`, or [`Ask::required`] to promote
-/// non-answers into `Err(Error::...)`.
+/// Awaiting an `Ask` resolves to `Result<Answer<T>>` so timeouts, player departures, and DM
+/// bounces are handled explicitly while broken sessions/channels propagate via `?`. Chain
+/// `.await?.ok()` to collapse any non-answer into `Option<T>`, or `.await?.required()?` to
+/// promote non-answers into `Err(Error::...)`.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Ask<'a, F, R: IntoAskMatch> {
     state: AskState<'a, F, R::Output>,
@@ -645,18 +645,6 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
     /// Suppresses any inherited timeout message on this prompt.
     pub fn no_timeout_message(self) -> Self {
         self.map_cfg(AskConfig::no_timeout_message)
-    }
-
-    /// Collapses non-answers (`TimedOut`, `Left`, `Unreachable`) into `Ok(None)` and
-    /// `Answer::Ok(val)` into `Ok(Some(val))`, preserving session/channel errors as `Err`.
-    pub fn optional(self) -> AskOptional<'a, F, R> {
-        AskOptional { ask: self }
-    }
-
-    /// Promotes non-answers (`TimedOut`, `Left`, `Unreachable`) into `Err(Error::...)` so `?`
-    /// short-circuits sequential multi-step prompts.
-    pub fn required(self) -> AskRequired<'a, F, R> {
-        AskRequired { ask: self }
     }
 }
 
@@ -963,16 +951,19 @@ where
     }
 }
 
-impl<'a, F, R> Ask<'a, F, R>
+impl<'a, F, R> Future for Ask<'a, F, R>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<R::Output>> {
-        if matches!(self.state, AskState::Unstarted(_)) {
+    type Output = Result<Answer<R::Output>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if matches!(this.state, AskState::Unstarted(_)) {
             let AskState::Unstarted(unstarted) =
-                std::mem::replace(&mut self.state, AskState::Done)
+                std::mem::replace(&mut this.state, AskState::Done)
             else {
                 unreachable!()
             };
@@ -984,77 +975,20 @@ where
             } = *unstarted;
             let span = make_span(&cfg, &source);
             let fut = run_ask(cfg, source, prompt, matcher).instrument(span);
-            self.state = AskState::Running(Box::pin(fut));
+            this.state = AskState::Running(Box::pin(fut));
         }
 
-        match &mut self.state {
-            AskState::Running(fut) => {
-                let poll_res = fut.as_mut().poll(cx);
-                if poll_res.is_ready() {
-                    self.state = AskState::Done;
+        match &mut this.state {
+            AskState::Running(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(res) => {
+                    this.state = AskState::Done;
+                    Poll::Ready(Answer::from_result(res))
                 }
-                poll_res
-            }
+                Poll::Pending => Poll::Pending,
+            },
             AskState::Done => panic!("Ask polled after completion"),
             AskState::Unstarted(_) => unreachable!(),
         }
-    }
-}
-
-impl<'a, F, R> Future for Ask<'a, F, R>
-where
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    type Output = Result<Answer<R::Output>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.get_mut().poll_raw(cx) {
-            Poll::Ready(res) => Poll::Ready(Answer::from_result(res)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Future returned by [`Ask::optional`], resolving to `Result<Option<T>>`.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct AskOptional<'a, F, R: IntoAskMatch> {
-    ask: Ask<'a, F, R>,
-}
-
-impl<'a, F, R> Future for AskOptional<'a, F, R>
-where
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    type Output = Result<Option<R::Output>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.get_mut().ask.poll_raw(cx) {
-            Poll::Ready(res) => Poll::Ready(Answer::from_result(res).map(Answer::ok)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Future returned by [`Ask::required`], resolving to `Result<T>`.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct AskRequired<'a, F, R: IntoAskMatch> {
-    ask: Ask<'a, F, R>,
-}
-
-impl<'a, F, R> Future for AskRequired<'a, F, R>
-where
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    type Output = Result<R::Output>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().ask.poll_raw(cx)
     }
 }
 

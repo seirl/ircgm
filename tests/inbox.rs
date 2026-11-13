@@ -214,7 +214,6 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
         r_def
             .ask("Default ask", |m| (m.text == "via_notice").then_some(()))
             .reply_timeout(Duration::from_millis(30))
-            .optional()
             .await
     });
     let r_acc = room.clone();
@@ -236,7 +235,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
         t2.await.unwrap().unwrap(),
         Answer::Ok(MessageKind::Notice)
     );
-    assert_eq!(t1.await.unwrap().unwrap(), None);
+    assert_eq!(t1.await.unwrap().unwrap().ok(), None);
 }
 
 #[tokio::test]

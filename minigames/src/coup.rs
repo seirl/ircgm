@@ -230,8 +230,8 @@ pub async fn resolve_steal_attempt(
         .reply_timeout(Duration::from_secs(20))
         .ignore_commands()
         .warn_remaining(Duration::from_secs(5), "⏳ 5s left to block!".yellow())
-        .optional()
-        .await?;
+        .await?
+        .ok();
 
     let resolution = response.unwrap_or(StealResolution::Stolen { coins: 2 });
     match resolution {
