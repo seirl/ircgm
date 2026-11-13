@@ -111,7 +111,11 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
         vault
             .ask_user(
                 safecracker,
-                format!("🔓 Pin {}/3 — {} type `{cmd}`:", idx + 1, safecracker.nick()),
+                irc_format!(
+                    "🔓 Pin {}/3 — {} type `{cmd}`:",
+                    idx + 1,
+                    safecracker.nick().bold(),
+                ),
                 |m| m.is_cmd(cmd).then_some(()),
             )
             .reply_timeout(Duration::from_secs(20))
@@ -121,7 +125,7 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
 }
 
 /// Lobby entrypoint: recruits 2 thieves (`Hacker` + `Safecracker`) and runs Co-op Vault Heist.
-pub async fn play(bot: &Bot, lobby: &Room) -> Result< crate::PlayOutcome > {
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
         crate::recruit_players(lobby, "Co-op Vault Heist", 2..=2, Duration::from_secs(30)).await?
     else {
@@ -153,15 +157,13 @@ pub async fn run_heist(
                 .timeout_message("🚨 Too slow on the tumblers!".yellow()),
         );
 
-    lobby.say(
-        "🏦 Vault located! ".bold()
-            + hacker.nick().bold()
-            + " & "
-            + safecracker.nick().bold()
-            + ": accept your invite to "
-            + vault.name().cyan().bold()
-            + "!",
-    )?;
+    lobby.say(irc_format!(
+        "{} {} & {}: accept your invite to {}!",
+        "🏦 Vault located!".bold(),
+        hacker.nick().bold(),
+        safecracker.nick().bold(),
+        vault.name().cyan().bold(),
+    ))?;
     vault
         .invite_and_wait([hacker, safecracker], Duration::from_secs(30))
         .await?;
@@ -194,13 +196,11 @@ pub async fn run_heist(
     }
 
     // Phase 2: 20s variable-rate laser alarm + synchronized dual-key extraction!
-    vault.say(
-        "🚨 LASER ALARM (20s)! Sync `!turn alpha` ("
-            + hacker.nick().bold()
-            + ") + `!turn omega` ("
-            + safecracker.nick().bold()
-            + "), or use `!cool` / `!cut red|blue`!",
-    )?;
+    vault.say(irc_format!(
+        "🚨 LASER ALARM (20s)! Sync `!turn alpha` ({}) + `!turn omega` ({}), or use `!cool` / `!cut red|blue`!",
+        hacker.nick().bold(),
+        safecracker.nick().bold(),
+    ))?;
 
     let (rate_tx, mut rate_rx) = watch::channel(1.0_f64);
     let dual_keys = async {
@@ -212,9 +212,11 @@ pub async fn run_heist(
                     vault.say("🔑 Alpha key engaged!".cyan().bold())?;
                     return Ok::<(), Error>(());
                 }
-                vault.say(
-                    hacker.nick().bold() + ": your cylinder takes `!turn alpha`!".yellow(),
-                )?;
+                vault.say(irc_format!(
+                    "{}: {}",
+                    hacker.nick().bold(),
+                    "your cylinder takes `!turn alpha`!".yellow(),
+                ))?;
             }
         };
         let turn_omega = async {
@@ -225,9 +227,11 @@ pub async fn run_heist(
                     vault.say("🔑 Omega key engaged!".cyan().bold())?;
                     return Ok::<(), Error>(());
                 }
-                vault.say(
-                    safecracker.nick().bold() + ": your cylinder takes `!turn omega`!".yellow(),
-                )?;
+                vault.say(irc_format!(
+                    "{}: {}",
+                    safecracker.nick().bold(),
+                    "your cylinder takes `!turn omega`!".yellow(),
+                ))?;
             }
         };
         tokio::try_join!(turn_alpha, turn_omega)?;
@@ -244,10 +248,10 @@ pub async fn run_heist(
                 cooled = true;
                 current_rate *= 0.5;
                 let _ = rate_tx.send(current_rate);
-                vault.say(
-                    "❄️ Liquid nitrogen sprayed on the sensor — alarm slowed to "
-                        + format!("{current_rate}x!").cyan().bold(),
-                )?;
+                vault.say(irc_format!(
+                    "❄️ Liquid nitrogen sprayed on the sensor — alarm slowed to {}",
+                    format_args!("{current_rate}x!").cyan().bold(),
+                ))?;
             } else if let Some(arg) = msg.cmd_arg("!cut") {
                 if let Some(wire) = Wire::parse(arg) {
                     if wire == safe_wire {
@@ -255,10 +259,11 @@ pub async fn run_heist(
                     }
                     current_rate *= 2.0;
                     let _ = rate_tx.send(current_rate);
-                    vault.say(
-                        "⚡ TRIPWIRE! Alarm speed doubled to ".red().bold()
-                            + format!("{current_rate}x!").yellow().bold(),
-                    )?;
+                    vault.say(irc_format!(
+                        "{} {}",
+                        "⚡ TRIPWIRE! Alarm speed doubled to".red().bold(),
+                        format_args!("{current_rate}x!").yellow().bold(),
+                    ))?;
                 }
             }
         }
@@ -272,33 +277,28 @@ pub async fn run_heist(
 
     match outcome {
         HeistOutcome::ExtractedDualKeys => {
-            lobby.say(
-                "💎 HEIST COMPLETE! ".green().bold()
-                    + hacker.nick().bold()
-                    + " & "
-                    + safecracker.nick().bold()
-                    + " turned both keys and escaped with the diamonds!",
-            )?;
+            lobby.say(irc_format!(
+                "{} {} & {} turned both keys and escaped with the diamonds!",
+                "💎 HEIST COMPLETE!".green().bold(),
+                hacker.nick().bold(),
+                safecracker.nick().bold(),
+            ))?;
         }
         HeistOutcome::DisarmedWire => {
-            lobby.say(
-                "✂️ HEIST COMPLETE! ".green().bold()
-                    + hacker.nick().bold()
-                    + " & "
-                    + safecracker.nick().bold()
-                    + " cut the alarm wire and emptied the vault!",
-            )?;
+            lobby.say(irc_format!(
+                "{} {} & {} cut the alarm wire and emptied the vault!",
+                "✂️ HEIST COMPLETE!".green().bold(),
+                hacker.nick().bold(),
+                safecracker.nick().bold(),
+            ))?;
         }
         HeistOutcome::CaughtByAlarm => {
-            lobby.say(
-                "🚓 BUSTED! Security locked down the vault on "
-                    .red()
-                    .bold()
-                    + hacker.nick().bold()
-                    + " & "
-                    + safecracker.nick().bold()
-                    + "!",
-            )?;
+            lobby.say(irc_format!(
+                "{} {} & {}!",
+                "🚓 BUSTED! Security locked down the vault on".red().bold(),
+                hacker.nick().bold(),
+                safecracker.nick().bold(),
+            ))?;
         }
     }
 

@@ -353,7 +353,17 @@ dependencies = [
 name = "irc-colors"
 version = "0.1.0"
 dependencies = [
+ "irc-colors-macros",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "irc-colors-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use irc_colors::Text;
+use irc_colors::{irc_format, Text};
 
 use crate::ask::{Ask, AskConfig, AskSource, IntoVerdict};
 use crate::bot::BotCore;
@@ -70,11 +70,9 @@ impl<'a> HuddleSender<'a> {
         if !self.relay_commands && self.core.is_command_text(&msg.text) {
             return Ok(());
         }
-        let base = match self.relay_prefix {
-            Some(p) => p.clone(),
-            None => Text::new(),
-        };
-        let rendered = base + "<" + &msg.nick + "> " + msg.to_styled();
+        let empty = Text::new();
+        let prefix = self.relay_prefix.as_ref().unwrap_or(&empty);
+        let rendered = irc_format!("{prefix}<{}> {}", msg.nick, msg.to_styled());
         let sender_id = msg.sender.id();
         for g in self.guards {
             if g.user().id() == sender_id {

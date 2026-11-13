@@ -361,19 +361,16 @@ fn send_games_catalog(lobby: &Room) -> Result<()> {
         .map(|(slug, desc)| format!("{slug} ({desc})"))
         .collect();
     let mid = entries.len().div_ceil(2);
-    lobby.say(
-        "🎮 ".bold()
-            + "Minigames".bold().cyan()
-            + " — start any game with "
-            + "!play <name>".bold().green()
-            + ", "
-            + "!<name>".bold().green()
-            + ", or "
-            + "!random".bold().green()
-            + " (`!abort` cancels):",
-    )?;
-    lobby.say(format!("  • {}", entries[..mid].join(" | ")))?;
-    lobby.say(format!("  • {}", entries[mid..].join(" | ")))?;
+    lobby.say(irc_format!(
+        "{} {} — start any game with {}, {}, or {} (`!abort` cancels):",
+        "🎮".bold(),
+        "Minigames".bold().cyan(),
+        "!play <name>".bold().green(),
+        "!<name>".bold().green(),
+        "!random".bold().green(),
+    ))?;
+    lobby.say(format_args!("  • {}", entries[..mid].join(" | ")))?;
+    lobby.say(format_args!("  • {}", entries[mid..].join(" | ")))?;
     Ok(())
 }
 
@@ -405,11 +402,10 @@ async fn busy_lobby_responder(lobby: &Room, active_slug: &str, starter: &User) -
         match classify_lobby_command(&msg) {
             Some(LobbyAction::ListGames) => {
                 send_games_catalog(lobby)?;
-                lobby.say(
-                    format!("⏳ Currently running `{active_slug}` (started by ")
-                        + starter.nick().bold()
-                        + ").",
-                )?;
+                lobby.say(irc_format!(
+                    "⏳ Currently running `{active_slug}` (started by {}).",
+                    starter.nick().bold(),
+                ))?;
             }
             Some(
                 LobbyAction::PlayUsage
@@ -423,7 +419,7 @@ async fn busy_lobby_responder(lobby: &Room, active_slug: &str, starter: &User) -
                     "type `!abort`".to_owned()
                 };
                 lobby.say(
-                    format!("⏳ `{active_slug}` is already running ({abort_hint} to cancel)!")
+                    format_args!("⏳ `{active_slug}` is already running ({abort_hint} to cancel)!")
                         .yellow(),
                 )?;
             }
@@ -434,19 +430,15 @@ async fn busy_lobby_responder(lobby: &Room, active_slug: &str, starter: &User) -
 
 /// Runs the single-lobby minigames loop until `bot.shutdown_requested()` or fatal disconnect.
 pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) -> Result<()> {
-    lobby.say(
-        "🎮 ".bold()
-            + "Minigames bot ready!".bold().green()
-            + " Anyone can start: "
-            + "!play <game>".bold().cyan()
-            + ", "
-            + "!random".bold().cyan()
-            + ", or "
-            + "!games".bold().cyan()
-            + " ("
-            + game_slug_list()
-            + ").",
-    )?;
+    lobby.say(irc_format!(
+        "{} {} Anyone can start: {}, {}, or {} ({}).",
+        "🎮".bold(),
+        "Minigames bot ready!".bold().green(),
+        "!play <game>".bold().cyan(),
+        "!random".bold().cyan(),
+        "!games".bold().cyan(),
+        game_slug_list(),
+    ))?;
 
     loop {
         // Open a fresh lobby inbox only while idle so messages sent during an active game
@@ -466,28 +458,28 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                 continue;
             }
             Some(LobbyAction::PlayUsage) => {
-                lobby.say(
-                    "Usage: ".bold()
-                        + "`!play <game>` or `!random` — games: "
-                        + game_slug_list(),
-                )?;
+                lobby.say(irc_format!(
+                    "{} `!play <game>` or `!random` — games: {}",
+                    "Usage:".bold(),
+                    game_slug_list(),
+                ))?;
                 continue;
             }
             Some(LobbyAction::UnknownGame(bad)) => {
                 lobby.say(
-                    format!("Unknown game `{bad}` — available: {}.", game_slug_list()).yellow(),
+                    format_args!("Unknown game `{bad}` — available: {}.", game_slug_list())
+                        .yellow(),
                 )?;
                 continue;
             }
             Some(LobbyAction::StartRandom) => {
                 let (picked, _) = GAMES[fastrand::usize(..GAMES.len())];
-                lobby.say(
-                    "🎲 ".bold()
-                        + idle_msg.sender.nick().bold()
-                        + " rolled "
-                        + picked.bold().cyan()
-                        + "!",
-                )?;
+                lobby.say(irc_format!(
+                    "{} {} rolled {}!",
+                    "🎲".bold(),
+                    idle_msg.sender.nick().bold(),
+                    picked.bold().cyan(),
+                ))?;
                 picked
             }
             Some(LobbyAction::StartGame(picked)) => picked,
@@ -548,17 +540,17 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
         match outcome {
             Outcome::Completed(Ok(Some(PlayOutcome::Completed))) => {
                 tracing::info!(game = slug, "minigame completed");
-                lobby.say(
-                    "🏁 ".bold()
-                        + slug.bold().cyan()
-                        + " finished — lobby is open! Type `!play <game>`, `!random`, or `!games`.",
-                )?;
+                lobby.say(irc_format!(
+                    "{} {} finished — lobby is open! Type `!play <game>`, `!random`, or `!games`.",
+                    "🏁".bold(),
+                    slug.bold().cyan(),
+                ))?;
             }
             Outcome::Completed(Ok(Some(PlayOutcome::NotEnoughPlayers))) => {
                 tracing::info!(game = slug, "minigame ended: not enough players");
             }
             Outcome::Completed(Ok(None)) => {
-                lobby.say(format!("Unknown game `{slug}` — try `!games`.").yellow())?;
+                lobby.say(format_args!("Unknown game `{slug}` — try `!games`.").yellow())?;
             }
             Outcome::Completed(Err(err)) => {
                 let lost_lobby = matches!(
@@ -578,28 +570,29 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                     ""
                 };
                 lobby.say(
-                    format!("⚠️ `{slug}` ended early: {err}{auth_hint} — lobby is open again!")
+                    format_args!("⚠️ `{slug}` ended early: {err}{auth_hint} — lobby is open again!")
                         .yellow(),
                 )?;
             }
             Outcome::Stopped(StopReason::Shutdown) => break,
             Outcome::Stopped(StopReason::Admin(admin_msg)) => {
                 tracing::info!(game = slug, admin = %admin_msg.nick, "minigame stopped by admin");
-                admin_msg.reply(format!("🛑 Stopped `{slug}`.").yellow())?;
+                admin_msg.reply(format_args!("🛑 Stopped `{slug}`.").yellow())?;
                 if admin_msg.is_dm() {
-                    lobby.say(format!("🛑 `{slug}` was stopped by an admin.").yellow())?;
+                    lobby.say(format_args!("🛑 `{slug}` was stopped by an admin.").yellow())?;
                 }
             }
             Outcome::Stopped(StopReason::Aborted(abort_msg)) => {
                 tracing::info!(game = slug, by = %abort_msg.sender.nick(), "minigame aborted");
                 if abort_msg.is_dm() {
-                    abort_msg.reply(format!("🛑 Aborted `{slug}`.").yellow())?;
+                    abort_msg.reply(format_args!("🛑 Aborted `{slug}`.").yellow())?;
                 }
-                lobby.say(
-                    "🛑 ".yellow()
-                        + abort_msg.sender.nick().bold()
-                        + format!(" aborted `{slug}` — lobby is open!").yellow(),
-                )?;
+                lobby.say(irc_format!(
+                    "{} {} {}",
+                    "🛑".yellow(),
+                    abort_msg.sender.nick().bold(),
+                    format_args!("aborted `{slug}` — lobby is open!").yellow(),
+                ))?;
             }
         }
     }

@@ -80,14 +80,12 @@ pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
 
 /// Runs a single 2-player Coup Ambassador Exchange + concurrent Captain Steal round.
 pub async fn run_coup_round(room: &Room, active: &User, rival: &User) -> Result<CoupTurnOutcome> {
-    room.say(
-        active.nick().bold()
-            + " claims Ambassador in DM! "
-            + rival.nick().bold()
-            + " may type "
-            + "!steal".bold().yellow()
-            + " in #lobby to raid their treasury!",
-    )?;
+    room.say(irc_format!(
+        "{} claims Ambassador in DM! {} may type {} in #lobby to raid their treasury!",
+        active.nick().bold(),
+        rival.nick().bold(),
+        "!steal".bold().yellow(),
+    ))?;
 
     let steal_branch = async {
         let mut inbox = room.inbox_user(rival);
@@ -109,7 +107,11 @@ pub async fn run_coup_round(room: &Room, active: &User, rival: &User) -> Result<
     let exchange_branch = async {
         let out = ambassador_exchange_or_cancel(active, initial_hand, court_draw).await?;
         if out.is_some() {
-            room.say("🃏 ".cyan() + active.nick().bold() + " completed their Ambassador exchange.")?;
+            room.say(irc_format!(
+                "{} {} completed their Ambassador exchange.",
+                "🃏".cyan(),
+                active.nick().bold(),
+            ))?;
         }
         Ok::<_, Error>(out)
     };
@@ -134,7 +136,7 @@ pub async fn ambassador_exchange_or_cancel(
         let mut pool = vec![hand[0], hand[1], drawn[0], drawn[1]];
         let mut dm = player.exclusive().await?.with_ignore_commands();
         let pool_names: Vec<&str> = pool.iter().map(|r| r.label()).collect();
-        dm.say(format!(
+        dm.say(format_args!(
             "🃏 Ambassador Exchange — pool: [{}]. Send 2 messages naming the 2 cards to keep (or `!cancel`):",
             pool_names.join(", ")
         ))?;
@@ -150,21 +152,27 @@ pub async fn ambassador_exchange_or_cancel(
                     kept.push(role);
                     if kept.len() == 2 {
                         dm.say(
-                            format!(
+                            format_args!(
                                 "✔ Kept {} (2/2) — exchange complete: [{}, {}]!",
                                 role.label(),
                                 kept[0].label(),
-                                kept[1].label()
+                                kept[1].label(),
                             )
                             .green(),
                         )?;
                     } else {
-                        dm.say(format!("✔ Kept {} (1/2) — pick 1 more card:", role.label()))?;
+                        dm.say(format_args!(
+                            "✔ Kept {} (1/2) — pick 1 more card:",
+                            role.label(),
+                        ))?;
                     }
                 }
                 None => {
                     let rem: Vec<&str> = pool.iter().map(|r| r.label()).collect();
-                    dm.say(format!("Choose an available card from [{}]!", rem.join(", ")).yellow())?;
+                    dm.say(
+                        format_args!("Choose an available card from [{}]!", rem.join(", "))
+                            .yellow(),
+                    )?;
                 }
             }
         }
@@ -187,19 +195,18 @@ pub async fn resolve_steal_attempt(
     thief: &User,
     target: &User,
 ) -> Result<StealResolution> {
-    room.say(
-        "🪙 ".bold()
-            + thief.nick().bold()
-            + " attempts to STEAL 2 coins from "
-            + target.nick().bold()
-            + "!",
-    )?;
+    room.say(irc_format!(
+        "{} {} attempts to STEAL 2 coins from {}!",
+        "🪙".bold(),
+        thief.nick().bold(),
+        target.nick().bold(),
+    ))?;
 
     let response = target
         .ask(
-            format!(
+            irc_format!(
                 "{} is stealing 2 coins from you! Reply `block captain`, `block ambassador`, or `allow` (20s):",
-                thief.nick()
+                thief.nick().bold(),
             ),
             |m| match m.text.trim().to_ascii_lowercase().as_str() {
                 "block captain" => Verdict::accept_ack(
@@ -229,18 +236,20 @@ pub async fn resolve_steal_attempt(
     let resolution = response.unwrap_or(StealResolution::Stolen { coins: 2 });
     match resolution {
         StealResolution::Blocked(role) => {
-            room.say(
-                target.nick().bold()
-                    + format!(" blocks the steal claiming {}!", role.label()).cyan().bold(),
-            )?;
+            room.say(irc_format!(
+                "{} {}",
+                target.nick().bold(),
+                format_args!("blocks the steal claiming {}!", role.label())
+                    .cyan()
+                    .bold(),
+            ))?;
         }
         StealResolution::Stolen { coins } => {
-            room.say(
-                thief.nick().bold()
-                    + format!(" steals {coins} coins from ")
-                    + target.nick().bold()
-                    + "!",
-            )?;
+            room.say(irc_format!(
+                "{} steals {coins} coins from {}!",
+                thief.nick().bold(),
+                target.nick().bold(),
+            ))?;
         }
     }
     Ok(resolution)

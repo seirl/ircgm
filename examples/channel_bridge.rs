@@ -26,11 +26,19 @@ async fn main() -> Result<()> {
         };
 
         if msg.is_in(&usa) {
-            ussr.say(
-                "[USA] ".light_blue().bold() + "<" + (&msg.nick).bold() + "> " + msg.to_styled(),
-            )?;
+            ussr.say(irc_format!(
+                "{} <{}> {}",
+                "[USA]".light_blue().bold(),
+                msg.nick.as_str().bold(),
+                msg.to_styled(),
+            ))?;
         } else {
-            usa.say("[USSR] ".red().bold() + "<" + (&msg.nick).bold() + "> " + msg.to_styled())?;
+            usa.say(irc_format!(
+                "{} <{}> {}",
+                "[USSR]".red().bold(),
+                msg.nick.as_str().bold(),
+                msg.to_styled(),
+            ))?;
         }
     }
 

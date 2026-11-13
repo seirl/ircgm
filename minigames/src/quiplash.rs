@@ -77,7 +77,7 @@ pub async fn collect_quips(
             async move {
                 let turn = player
                     .ask(
-                        "Prompt: ".bold().cyan() + *secret_prompt + " (45s, max 80 chars)",
+                        irc_format!("{} {secret_prompt} (45s, max 80 chars)", "Prompt:".bold().cyan()),
                         |m| {
                             let quip = m.text.trim();
                             if quip.is_empty() || quip.len() > 80 {
@@ -110,25 +110,24 @@ pub async fn collect_quips(
         match turn {
             Turn::Reply(quip) => {
                 submissions.push((player.clone(), quip));
-                room.say(
-                    "✔ ".green().bold()
-                        + player.nick().bold()
-                        + format!(" locked in! ({}/{total})", submissions.len()),
-                )?;
+                room.say(irc_format!(
+                    "{} {} locked in! ({}/{total})",
+                    "✔".green().bold(),
+                    player.nick().bold(),
+                    submissions.len(),
+                ))?;
             }
             Turn::TimedOut => {
-                room.say(player.nick().bold().yellow() + " ran out of time!")?;
+                room.say(irc_format!("{} ran out of time!", player.nick().bold().yellow()))?;
             }
             Turn::Left { nick, .. } => {
-                room.say(nick.bold() + " disconnected.")?;
+                room.say(irc_format!("{} disconnected.", nick.bold()))?;
             }
             Turn::Unreachable { code, .. } => {
-                room.say(
-                    player.nick().bold().red()
-                        + format!(
-                            " couldn't receive DMs ({code:?} — check `/umode -g` / NickServ)!"
-                        ),
-                )?;
+                room.say(irc_format!(
+                    "{} couldn't receive DMs ({code:?} — check `/umode -g` / NickServ)!",
+                    player.nick().bold().red(),
+                ))?;
             }
         }
     }
@@ -156,9 +155,11 @@ pub async fn tiebreaker_buzz_in(
             if m.text.trim() == "102" {
                 Verdict::accept_ack(
                     m.sender.clone(),
-                    "⚡ ".yellow().bold()
-                        + m.sender.nick().bold().green()
-                        + " buzzed in first with 102!",
+                    irc_format!(
+                        "{} {} buzzed in first with 102!",
+                        "⚡".yellow().bold(),
+                        m.sender.nick().bold().green(),
+                    ),
                 )
             } else {
                 Verdict::reject("Nope — try again! (17 * 6)".yellow())
@@ -183,19 +184,18 @@ pub async fn vote_on_quips(
     }
     if submissions.len() == 1 {
         let winner = submissions[0].clone();
-        room.say(
-            "🏆 ".bold()
-                + winner.0.nick().bold().green()
-                + " wins by default with: \""
-                + winner.1.as_str().italic()
-                + "\"!",
-        )?;
+        room.say(irc_format!(
+            "{} {} wins by default with: \"{}\"!",
+            "🏆".bold(),
+            winner.0.nick().bold().green(),
+            winner.1.as_str().italic(),
+        ))?;
         return Ok(Some(winner));
     }
 
     room.say("🗳️ Vote for the funniest answer with `!pick <number>` (20s):".bold())?;
     for (idx, (_author, quip)) in submissions.iter().enumerate() {
-        room.say(format!("  #{}: \"{}\"", idx + 1, quip))?;
+        room.say(format_args!("  #{}: \"{quip}\"", idx + 1))?;
     }
 
     let mut inbox = room.inbox();
@@ -213,7 +213,7 @@ pub async fn vote_on_quips(
                     if submissions[idx].0 != msg.sender {
                         ballots.insert(msg.sender.id(), idx);
                         msg.sender
-                            .notice(format!("✔ Vote recorded for quip #{choice}!").green())?;
+                            .notice(format_args!("✔ Vote recorded for quip #{choice}!").green())?;
                     } else {
                         msg.sender
                             .notice("You can't vote for your own quip!".yellow())?;
@@ -221,7 +221,8 @@ pub async fn vote_on_quips(
                 }
                 None => {
                     msg.sender.notice(
-                        format!("Pick a quip number from 1 to {}!", submissions.len()).yellow(),
+                        format_args!("Pick a quip number from 1 to {}!", submissions.len())
+                            .yellow(),
                     )?;
                 }
             }
@@ -265,13 +266,12 @@ pub async fn vote_on_quips(
     };
 
     let winner = submissions[best_idx].clone();
-    room.say(
-        "🏆 ".bold()
-            + winner.0.nick().bold().green()
-            + format!(" wins Quiplash ({top_votes} votes) with: \"")
-            + winner.1.as_str()
-            + "\"!",
-    )?;
+    room.say(irc_format!(
+        "{} {} wins Quiplash ({top_votes} votes) with: \"{}\"!",
+        "🏆".bold(),
+        winner.0.nick().bold().green(),
+        winner.1,
+    ))?;
     Ok(Some(winner))
 }
 

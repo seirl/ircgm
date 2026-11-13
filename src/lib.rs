@@ -33,19 +33,23 @@
 //!
 //!         let player = &trigger.sender;
 //!         match room
-//!             .ask_user(player, player.nick().bold() + ": pick a number 1..=5!", |m| {
-//!                 match m.text.trim().parse::<u8>() {
+//!             .ask_user(
+//!                 player,
+//!                 irc_format!("{}: pick a number 1..=5!", player.nick().bold()),
+//!                 |m| match m.text.trim().parse::<u8>() {
 //!                     Ok(n @ 1..=5) => Verdict::accept(n),
 //!                     _ => Verdict::reject("Enter a number between 1 and 5!".yellow()),
-//!                 }
-//!             })
+//!                 },
+//!             )
 //!             .reply_timeout(Duration::from_secs(15))
 //!             .settled()
 //!             .await?
 //!         {
 //!             Turn::Reply(3) => room.say("🎉 Spot on!".green().bold())?,
-//!             Turn::Reply(n) => room.say(format!("Nope ({n})—it was 3!"))?,
-//!             Turn::TimedOut => room.say(player.nick().bold() + " ran out of time!".yellow())?,
+//!             Turn::Reply(n) => room.say(format_args!("Nope ({n})—it was 3!"))?,
+//!             Turn::TimedOut => {
+//!                 room.say(irc_format!("{} {}", player.nick().bold(), "ran out of time!".yellow()))?
+//!             }
 //!             Turn::Left { .. } | Turn::Unreachable { .. } => {}
 //!         }
 //!     }
@@ -57,7 +61,7 @@
 #![forbid(unsafe_code)]
 
 pub use irc;
-pub use irc_colors::{self, Text};
+pub use irc_colors::{self, irc_format, Text};
 
 mod ask;
 mod bot;
@@ -76,7 +80,9 @@ pub mod testing;
 mod user;
 
 pub mod fmt {
-    pub use irc_colors::{Color, ColorValue, Colorize, Span, Style, Text};
+    pub use irc_colors::{
+        irc_format, Color, ColorValue, Colorize, ExtendedColor, Span, Style, Text,
+    };
 }
 
 pub mod future {
@@ -88,9 +94,9 @@ pub mod future {
 
 pub mod prelude {
     pub use crate::{
-        fmt::Colorize as _, AskConfig, Bot, Breakout, ChatMessage, Error, Event, ExclusiveDm,
-        GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result, Room, Text,
-        Turn, User, UserId, Verdict,
+        fmt::Colorize as _, irc_format, AskConfig, Bot, Breakout, ChatMessage, Error, Event,
+        ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result,
+        Room, Text, Turn, User, UserId, Verdict,
     };
 }
 

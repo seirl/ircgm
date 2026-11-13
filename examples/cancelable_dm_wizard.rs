@@ -56,7 +56,9 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
             .ask(
                 "Discard a card (1, 2, or 3):",
                 |m| match m.text.trim().parse::<usize>() {
-                    Ok(n @ 1..=3) => Verdict::accept_ack(n, format!("✔ Discarded card #{n}.").green()),
+                    Ok(n @ 1..=3) => {
+                        Verdict::accept_ack(n, format_args!("✔ Discarded card #{n}.").green())
+                    }
                     _ => Verdict::reject("Please reply with 1, 2, or 3.".yellow()),
                 }
             )
@@ -83,7 +85,11 @@ async fn main() -> Result<()> {
 
     let trigger = lobby.inbox().into_wait_cmd("!loadout").await?;
     if let Some(items) = pick_loadout_or_cancel(&trigger.sender).await? {
-        lobby.say(trigger.sender.nick().bold() + " packed: " + items.join(", "))?;
+        lobby.say(irc_format!(
+            "{} packed: {}",
+            trigger.sender.nick().bold(),
+            items.join(", "),
+        ))?;
     }
 
     let _ = resolve_simultaneous_triggers(&trigger.sender).await?;

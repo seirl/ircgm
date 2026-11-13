@@ -14,7 +14,7 @@ chrono = "0.4"
 fastrand = "2"
 futures-util = "0.3"
 irc = "1"
-irc-colors = { version = "0.1", path = "../irc-colors" }
+irc-colors = { version = "0.1", path = "../irc-colors", features = ["format"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"

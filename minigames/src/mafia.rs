@@ -158,11 +158,12 @@ pub async fn werewolf_pack_kill(
             match townsfolk.iter().find(|u| u.eq_nick(target)) {
                 Some(victim) => Verdict::accept_ack(
                     victim.clone(),
-                    "🐺 ".bold()
-                        + m.sender.nick().bold()
-                        + " locked in "
-                        + victim.nick().bold().red()
-                        + "!",
+                    irc_format!(
+                        "{} {} locked in {}!",
+                        "🐺".bold(),
+                        m.sender.nick().bold(),
+                        victim.nick().bold().red(),
+                    ),
                 ),
                 None => Verdict::reject("Pick a living non-Werewolf townsfolk!".yellow()),
             }
@@ -179,12 +180,11 @@ pub async fn collect_secret_votes(
     room: &Room,
     alive: &[User],
 ) -> Result<Vec<(User, Option<User>)>> {
-    let roster: Vec<String> = alive.iter().map(User::nick).collect();
+    let roster = Text::join(alive.iter().map(|u| u.nick().bold()), ", ");
     room.say("🗳️ Day vote! Survivors, check your DMs to cast `!vote <nick>` (45s).")?;
     let deadline = Instant::now() + Duration::from_secs(45);
-    let prompt = format!(
-        "🗳️ Secret Day Ballot — reply `!vote <nick>` within 45s (alive: {}):",
-        roster.join(", ")
+    let prompt = irc_format!(
+        "🗳️ Secret Day Ballot — reply `!vote <nick>` within 45s (alive: {roster}):"
     );
 
     try_join_all(alive.iter().map(|voter| {
@@ -203,9 +203,11 @@ pub async fn collect_secret_votes(
                     match alive.iter().find(|u| u.eq_nick(target)) {
                         Some(target_user) => Verdict::accept_ack(
                             target_user.clone(),
-                            "✔ Secret ballot cast for ".green()
-                                + target_user.nick().bold()
-                                + "!",
+                            irc_format!(
+                                "{} {}!",
+                                "✔ Secret ballot cast for".green(),
+                                target_user.nick().bold(),
+                            ),
                         ),
                         None => Verdict::reject(
                             "Pick a living player's nick with `!vote <nick>`!".yellow(),
@@ -261,9 +263,11 @@ pub async fn run_mafia_round(
                             match townsfolk.iter().find(|u| u.eq_nick(target)) {
                                 Some(protected) => Verdict::accept_ack(
                                     protected.clone(),
-                                    "🛡️ Moving to protect ".cyan()
-                                        + protected.nick().bold()
-                                        + "!",
+                                    irc_format!(
+                                        "{} {}!",
+                                        "🛡️ Moving to protect".cyan(),
+                                        protected.nick().bold(),
+                                    ),
                                 ),
                                 None => Verdict::reject(
                                     "Pick a living townsfolk with `!protect <nick>`!".yellow(),
@@ -296,11 +300,11 @@ pub async fn run_mafia_round(
         if saved_victim {
             room.say("☀️ Dawn breaks! 🛡️ A Bodyguard thwarted the Werewolves' attack!".cyan().bold())?;
         } else {
-            room.say(
-                "☀️ Dawn breaks! ".yellow()
-                    + victim.nick().bold().red()
-                    + " was devoured in the night!",
-            )?;
+            room.say(irc_format!(
+                "{} {} was devoured in the night!",
+                "☀️ Dawn breaks!".yellow(),
+                victim.nick().bold().red(),
+            ))?;
             alive.retain(|u| u != &victim);
             if room.bot_is_op() {
                 let _ = room.devoice(&victim);
@@ -332,18 +336,18 @@ pub async fn run_mafia_round(
     let winner = if let [exiled] = leaders.as_slice() {
         let was_wolf = wolves.contains(exiled);
         if was_wolf {
-            room.say(
-                "🎉 The town exiled ".green().bold()
-                    + exiled.nick().bold()
-                    + " (a Werewolf)! TOWN WINS!",
-            )?;
+            room.say(irc_format!(
+                "{} {} (a Werewolf)! TOWN WINS!",
+                "🎉 The town exiled".green().bold(),
+                exiled.nick().bold(),
+            ))?;
             MafiaWinner::Town
         } else {
-            room.say(
-                "🐺 The town exiled ".red().bold()
-                    + exiled.nick().bold()
-                    + " (an innocent Townsfolk)! WEREWOLVES WIN!",
-            )?;
+            room.say(irc_format!(
+                "{} {} (an innocent Townsfolk)! WEREWOLVES WIN!",
+                "🐺 The town exiled".red().bold(),
+                exiled.nick().bold(),
+            ))?;
             MafiaWinner::Werewolves
         }
     } else {

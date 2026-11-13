@@ -56,7 +56,7 @@ pub async fn run_supervised_deliberation(bot: &Bot, room: &Room) -> Result<()> {
             match cmd {
                 AdminCmd::Speed(factor) => {
                     let _ = speed_tx.send(factor);
-                    msg.reply(format!("Speed set to {factor}x."))?;
+                    msg.reply(format_args!("Speed set to {factor}x."))?;
                 }
                 AdminCmd::Stop => {
                     msg.reply("Stopping deliberation.")?;

@@ -76,13 +76,13 @@ pub async fn recruit_players(
     };
 
     let mut inbox = room.inbox();
-    room.say(
-        "🎲 ".bold()
-            + game_title.bold().cyan()
-            + format!(" — {count_desc}! Type ")
-            + "!join".bold().green()
-            + format!(" ({}s):", join_window.as_secs()),
-    )?;
+    room.say(irc_format!(
+        "{} {} — {count_desc}! Type {} ({}s):",
+        "🎲".bold(),
+        game_title.bold().cyan(),
+        "!join".bold().green(),
+        join_window.as_secs(),
+    ))?;
 
     let mut seen = HashSet::with_capacity(max_players);
     let mut players = Vec::with_capacity(max_players);
@@ -91,10 +91,11 @@ pub async fn recruit_players(
             let msg = inbox.wait_cmd("!join").await?;
             if seen.insert(msg.sender.id()) {
                 players.push(msg.sender.clone());
-                room.say(
-                    msg.sender.nick().bold()
-                        + format!(" joined! ({}/{max_players})", players.len()),
-                )?;
+                room.say(irc_format!(
+                    "{} joined! ({}/{max_players})",
+                    msg.sender.nick().bold(),
+                    players.len(),
+                ))?;
             }
         }
         Ok(())
@@ -104,7 +105,7 @@ pub async fn recruit_players(
     if players.len() >= min_players {
         Ok(Some(players))
     } else {
-        room.say(format!("Not enough players joined for {game_title}.").yellow())?;
+        room.say(format_args!("Not enough players joined for {game_title}.").yellow())?;
         Ok(None)
     }
 }

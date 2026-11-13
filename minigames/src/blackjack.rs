@@ -79,7 +79,7 @@ pub async fn run_round_with_shoe(
         &AskConfig::new()
             .reply_timeout(Duration::from_secs(30))
             .timeout_message_fn(|ctx| match ctx.user {
-                Some(u) => u.nick().bold().yellow() + ": ⏳ too slow, auto-standing!",
+                Some(u) => irc_format!("{}: ⏳ too slow, auto-standing!", u.nick().bold().yellow()),
                 None => "⏳ Time's up!".yellow(),
             }),
     );
@@ -94,18 +94,18 @@ pub async fn run_round_with_shoe(
     let mut dealer = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
     let mut standing_hands: Vec<(User, u8)> = Vec::new();
 
-    room.say(format!("Dealer shows [{} , ?].", dealer[0]))?;
+    room.say(format_args!("Dealer shows [{} , ?].", dealer[0]))?;
 
     for player in players {
         let mut cards = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
         loop {
             let total = hand_value(&cards);
             if total > 21 {
-                room.say(player.nick().bold().red() + format!(" BUSTS with {total}!"))?;
+                room.say(irc_format!("{} BUSTS with {total}!", player.nick().bold().red()))?;
                 break;
             }
             if total == 21 {
-                room.say(player.nick().bold().green() + " hits 21!")?;
+                room.say(irc_format!("{} hits 21!", player.nick().bold().green()))?;
                 standing_hands.push((player.clone(), total));
                 break;
             }
@@ -113,7 +113,7 @@ pub async fn run_round_with_shoe(
             match room
                 .ask_user(
                     player,
-                    player.nick().bold() + format!(" (total {total}): `hit` or `stand`?"),
+                    irc_format!("{} (total {total}): `hit` or `stand`?", player.nick().bold()),
                     |m| {
                         let word = m.text.trim();
                         if word.eq_ignore_ascii_case("hit") {
@@ -121,7 +121,7 @@ pub async fn run_round_with_shoe(
                         } else if word.eq_ignore_ascii_case("stand") {
                             Verdict::accept_ack(
                                 Move::Stand,
-                                player.nick().bold() + format!(" stands on {total}."),
+                                irc_format!("{} stands on {total}.", player.nick().bold()),
                             )
                         } else {
                             Verdict::ignore()
@@ -134,17 +134,18 @@ pub async fn run_round_with_shoe(
                 Turn::Reply(Move::Hit) => {
                     let card = draw_card(&mut shoe);
                     cards.push(card);
-                    room.say(
-                        player.nick().bold()
-                            + format!(" draws {card} (total {})!", hand_value(&cards)),
-                    )?;
+                    room.say(irc_format!(
+                        "{} draws {card} (total {})!",
+                        player.nick().bold(),
+                        hand_value(&cards),
+                    ))?;
                 }
                 Turn::Reply(Move::Stand) | Turn::TimedOut => {
                     standing_hands.push((player.clone(), total));
                     break;
                 }
                 Turn::Left { nick, .. } => {
-                    room.say(nick.bold() + " left the table—hand folded.")?;
+                    room.say(irc_format!("{} left the table—hand folded.", nick.bold()))?;
                     break;
                 }
                 Turn::Unreachable { .. } => break,
@@ -157,7 +158,7 @@ pub async fn run_round_with_shoe(
             dealer.push(draw_card(&mut shoe));
         }
         let dealer_total = hand_value(&dealer);
-        room.say(format!("Dealer finishes with {dealer_total}."))?;
+        room.say(format_args!("Dealer finishes with {dealer_total}."))?;
 
         for (player, score) in standing_hands {
             let outcome = if dealer_total > 21 || score > dealer_total {
@@ -167,7 +168,7 @@ pub async fn run_round_with_shoe(
             } else {
                 "loses.".red()
             };
-            room.say(player.nick().bold() + format!(" ({score}) ") + outcome)?;
+            room.say(irc_format!("{} ({score}) {outcome}", player.nick().bold()))?;
         }
     }
 

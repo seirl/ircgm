@@ -174,9 +174,9 @@ async fn run_bunker_rush_round(
 
     let mut ev_in = bunker.inbox();
     let prefix = if simon_says { "Simon says: " } else { "" };
-    lobby.action(format!(
+    lobby.action(format_args!(
         "cranks the siren! {prefix}`/join {}` ({seats} seat(s))!",
-        bunker.name()
+        bunker.name(),
     ))?;
 
     let living_ids: HashSet<UserId> = living.iter().map(User::id).collect();
@@ -188,11 +188,12 @@ async fn run_bunker_rush_round(
                 match ev_in.next_event().await? {
                     Event::Joined { user, .. } if living_ids.contains(&user.id()) => {
                         if inside.insert(user.id()) {
-                            bunker.say(
-                                "🛡️ ".green()
-                                    + user.nick().bold()
-                                    + format!(" claimed bunker seat {}/{seats}!", inside.len()),
-                            )?;
+                            bunker.say(irc_format!(
+                                "{} {} claimed bunker seat {}/{seats}!",
+                                "🛡️".green(),
+                                user.nick().bold(),
+                                inside.len(),
+                            ))?;
                         }
                     }
                     Event::Parted { user, .. }
@@ -256,7 +257,11 @@ pub async fn run_simon_says(
         }
 
         let living_ids: HashSet<UserId> = living.iter().map(User::id).collect();
-        room.say("📣 ".cyan().bold() + directive.prompt_text(room.name()).bold())?;
+        room.say(irc_format!(
+            "{} {}",
+            "📣".cyan().bold(),
+            directive.prompt_text(room.name()).bold(),
+        ))?;
 
         let deadline = Instant::now() + round_window;
         if directive.simon_says {
@@ -281,11 +286,11 @@ pub async fn run_simon_says(
                     let uid = inbox.wait_event_map(any_player_activity).await?;
                     if living_ids.contains(&uid) && tricked.insert(uid) {
                         if let Some(flincher) = living.iter().find(|u| u.id() == uid) {
-                            room.say(
-                                "💥 ".red()
-                                    + flincher.nick().bold()
-                                    + " flinched — Simon didn't say!",
-                            )?;
+                            room.say(irc_format!(
+                                "{} {} flinched — Simon didn't say!",
+                                "💥".red(),
+                                flincher.nick().bold(),
+                            ))?;
                         }
                     }
                 }
@@ -298,8 +303,11 @@ pub async fn run_simon_says(
     if living.is_empty() {
         room.say("💀 Everyone was eliminated in Simon Says!".yellow())?;
     } else {
-        let names: Vec<String> = living.iter().map(User::nick).collect();
-        room.say("🏆 Simon Says survivors: ".green().bold() + names.join(", ").bold())?;
+        let survivors = Text::join(living.iter().map(|u| u.nick().bold()), ", ".bold());
+        room.say(irc_format!(
+            "{} {survivors}",
+            "🏆 Simon Says survivors:".green().bold(),
+        ))?;
     }
     Ok(living)
 }

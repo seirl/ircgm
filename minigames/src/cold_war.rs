@@ -66,13 +66,12 @@ pub async fn run_cold_war(
     let usa = bot.breakout(&crate::breakout_slug(lobby, "usa")).await?;
     let ussr = bot.breakout(&crate::breakout_slug(lobby, "ussr")).await?;
 
-    lobby.say(
-        "☎️ ".bold()
-            + usa_premier.nick().bold().light_blue()
-            + " (USA) and "
-            + ussr_premier.nick().bold().red()
-            + " (USSR): report to your war rooms!",
-    )?;
+    lobby.say(irc_format!(
+        "{} {} (USA) and {} (USSR): report to your war rooms!",
+        "☎️".bold(),
+        usa_premier.nick().bold().light_blue(),
+        ussr_premier.nick().bold().red(),
+    ))?;
 
     tokio::try_join!(
         usa.invite_and_wait([usa_premier], Duration::from_secs(20)),
@@ -107,17 +106,19 @@ pub async fn run_cold_war(
                     continue;
                 }
                 if msg.is_in(&usa) {
-                    ussr.say(
-                        "[USA] ".light_blue().bold()
-                            + "<"
-                            + (&msg.nick).bold()
-                            + "> "
-                            + msg.to_styled(),
-                    )?;
+                    ussr.say(irc_format!(
+                        "{} <{}> {}",
+                        "[USA]".light_blue().bold(),
+                        msg.nick.as_str().bold(),
+                        msg.to_styled(),
+                    ))?;
                 } else {
-                    usa.say(
-                        "[USSR] ".red().bold() + "<" + (&msg.nick).bold() + "> " + msg.to_styled(),
-                    )?;
+                    usa.say(irc_format!(
+                        "{} <{}> {}",
+                        "[USSR]".red().bold(),
+                        msg.nick.as_str().bold(),
+                        msg.to_styled(),
+                    ))?;
                 }
             }
             Ok(())
@@ -164,37 +165,37 @@ pub async fn run_cold_war(
 
     let outcome = match (usa_order, ussr_order) {
         (Order::StandDown, Order::StandDown) => {
-            lobby.say(
-                "🕊️ PEACE PREVAILS! Both ".green().bold()
-                    + usa_premier.nick().bold()
-                    + " and "
-                    + ussr_premier.nick().bold()
-                    + " stood down!",
-            )?;
+            lobby.say(irc_format!(
+                "{} {} and {} stood down!",
+                "🕊️ PEACE PREVAILS! Both".green().bold(),
+                usa_premier.nick().bold(),
+                ussr_premier.nick().bold(),
+            ))?;
             ColdWarOutcome::Peace
         }
         (Order::Launch, Order::StandDown) => {
-            lobby.say(
-                "🚀 FIRST STRIKE! "
-                    + usa_premier.nick().bold().light_blue()
-                    + " launched while "
-                    + ussr_premier.nick().bold()
-                    + " stood down!",
-            )?;
+            lobby.say(irc_format!(
+                "🚀 FIRST STRIKE! {} launched while {} stood down!",
+                usa_premier.nick().bold().light_blue(),
+                ussr_premier.nick().bold(),
+            ))?;
             ColdWarOutcome::UsaFirstStrike
         }
         (Order::StandDown, Order::Launch) => {
-            lobby.say(
-                "🚀 FIRST STRIKE! "
-                    + ussr_premier.nick().bold().red()
-                    + " launched while "
-                    + usa_premier.nick().bold()
-                    + " stood down!",
-            )?;
+            lobby.say(irc_format!(
+                "🚀 FIRST STRIKE! {} launched while {} stood down!",
+                ussr_premier.nick().bold().red(),
+                usa_premier.nick().bold(),
+            ))?;
             ColdWarOutcome::UssrFirstStrike
         }
         (Order::Launch, Order::Launch) => {
-            lobby.say("☢️ MUTUALLY ASSURED DESTRUCTION! Both superpowers launched!".bold().white().on_red())?;
+            lobby.say(
+                "☢️ MUTUALLY ASSURED DESTRUCTION! Both superpowers launched!"
+                    .bold()
+                    .white()
+                    .on_red(),
+            )?;
             ColdWarOutcome::MutuallyAssuredDestruction
         }
     };

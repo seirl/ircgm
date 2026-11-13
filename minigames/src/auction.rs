@@ -87,13 +87,12 @@ fn apply_proxies(
         // If the current leader ALSO has a proxy ceiling >= `needed`, escalate straight to the contest!
         let next_amt = needed.min(*proxy_max);
         *high_bid = Some((proxy_user.clone(), next_amt));
-        room.say(
-            "🕵️ Auto-proxy raises the bid to ".cyan()
-                + format!("{next_amt}g").bold()
-                + " for "
-                + proxy_user.nick().bold()
-                + "!",
-        )?;
+        room.say(irc_format!(
+            "{} {} for {}!",
+            "🕵️ Auto-proxy raises the bid to".cyan(),
+            format_args!("{next_amt}g").bold(),
+            proxy_user.nick().bold(),
+        ))?;
     }
     Ok(())
 }
@@ -111,11 +110,11 @@ pub async fn run_auction(
     let scope = InboxScope::new().room(room).dms_from(players);
     let mut inbox = bot.inbox_scope(scope);
 
-    room.say(
-        "🔨 AUCTION OPEN: ".yellow().bold()
-            + item_name.bold()
-            + format!(" (min {OPENING_MIN}g, +{MIN_INCREMENT}g increments — `#lobby`: `!bid <g>` | DM: `!appraise`, `!proxy <max>`)!"),
-    )?;
+    room.say(irc_format!(
+        "{} {} (min {OPENING_MIN}g, +{MIN_INCREMENT}g increments — `#lobby`: `!bid <g>` | DM: `!appraise`, `!proxy <max>`)!",
+        "🔨 AUCTION OPEN:".yellow().bold(),
+        item_name.bold(),
+    ))?;
 
     let deadline = Instant::now() + duration;
     let mut high_bid: Option<(User, u32)> = None;
@@ -132,7 +131,7 @@ pub async fn run_auction(
             if msg.is_dm() {
                 if msg.is_cmd("!appraise") {
                     if appraised.insert(msg.sender.id()) {
-                        msg.sender.say(format!(
+                        msg.sender.say(format_args!(
                             "🔍 Secret Appraisal: {item_name} is genuinely worth {true_value}g!"
                         ))?;
                     } else {
@@ -149,14 +148,14 @@ pub async fn run_auction(
                                 proxies.push((msg.sender.clone(), max_amt));
                             }
                             msg.sender
-                                .say(format!("✅ Secret proxy ceiling set to {max_amt}g."))?;
+                                .say(format_args!("✅ Secret proxy ceiling set to {max_amt}g."))?;
                             apply_proxies(room, &mut high_bid, &proxies)?;
                         }
                         _ => {
                             msg.sender.say(
-                                format!(
+                                format_args!(
                                     "Usage: `!proxy <max_gold>` (at least {}g).",
-                                    min_required_bid(high_bid.as_ref())
+                                    min_required_bid(high_bid.as_ref()),
                                 )
                                 .yellow(),
                             )?;
@@ -168,15 +167,15 @@ pub async fn run_auction(
                 match msg.cmd_arg("!bid").and_then(|a| a.parse::<u32>().ok()) {
                     Some(amt) if amt >= needed => {
                         high_bid = Some((msg.sender.clone(), amt));
-                        room.say(
-                            "💰 ".green()
-                                + msg.sender.nick().bold()
-                                + format!(" bids {amt}g!"),
-                        )?;
+                        room.say(irc_format!(
+                            "{} {} bids {amt}g!",
+                            "💰".green(),
+                            msg.sender.nick().bold(),
+                        ))?;
                         apply_proxies(room, &mut high_bid, &proxies)?;
                     }
                     _ => {
-                        room.say(format!("Minimum bid is `!bid {needed}`!").yellow())?;
+                        room.say(format_args!("Minimum bid is `!bid {needed}`!").yellow())?;
                     }
                 }
             }
@@ -188,11 +187,11 @@ pub async fn run_auction(
     match high_bid {
         Some((winner, winning_bid)) => {
             let net_profit = i64::from(true_value) - i64::from(winning_bid);
-            room.say(
-                "🔨 SOLD to ".green().bold()
-                    + winner.nick().bold()
-                    + format!(" for {winning_bid}g! True value: {true_value}g (net {net_profit:+}g)."),
-            )?;
+            room.say(irc_format!(
+                "{} {} for {winning_bid}g! True value: {true_value}g (net {net_profit:+}g).",
+                "🔨 SOLD to".green().bold(),
+                winner.nick().bold(),
+            ))?;
             Ok(Some(AuctionWinner {
                 winner,
                 winning_bid,
