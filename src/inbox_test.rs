@@ -128,25 +128,31 @@ async fn registry_tracks_channel_interest_and_deduplicates_multi_match_events() 
 }
 
 #[tokio::test]
-async fn consuming_into_combinators_resolve_and_unsubscribe_on_completion() {
+async fn wait_combinators_and_lossy_on_triggers_resolve_cleanly() {
     let (bot, server) = test_harness("gm");
     server.complete_join("#lobby", &["alice", "bob", "carol"]);
     server.settle().await;
     let room = bot.room("#lobby").unwrap();
 
-    let wait_cmd_fut = room.inbox().into_wait_cmd("!go");
+    let mut cmd_inbox = room.inbox();
     server.chat("alice", "#lobby", "not yet");
     server.chat("bob", "#lobby", "!go now");
-    let cmd_msg = wait_cmd_fut.await.unwrap();
+    let cmd_msg = cmd_inbox.wait_cmd("!go").await.unwrap();
     assert_eq!(cmd_msg.nick, "bob");
     assert_eq!(cmd_msg.cmd_args("!go"), Some("now"));
+    drop(cmd_inbox);
 
-    let wait_map_fut = room
-        .inbox()
-        .into_wait_map(|m| m.cmd_arg("!bet")?.parse::<u32>().ok());
+    let mut map_inbox = room.inbox();
     server.chat("alice", "#lobby", "!bet nope");
     server.chat("alice", "#lobby", "!bet 250");
-    assert_eq!(wait_map_fut.await.unwrap(), 250);
+    assert_eq!(
+        map_inbox
+            .wait_map(|m| m.cmd_arg("!bet")?.parse::<u32>().ok())
+            .await
+            .unwrap(),
+        250
+    );
+    drop(map_inbox);
 
     // `wait_cmd` and `wait_cmd_arg` match even when `.ignore_commands()` is active on the inbox:
     let mut room_ignored = room.inbox().ignore_commands();

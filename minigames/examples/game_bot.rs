@@ -495,14 +495,12 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
 
         let admin_list = admins.to_vec();
         let lobby_for_admin = lobby.clone();
-        let admin_stop = bot
-            .inbox()
-            .on_for(move |m| {
-                is_admin_msg(m, &admin_list)
-                    && m.is_cmd("!stop")
-                    && (m.is_dm() || m.is_in(&lobby_for_admin))
-            })
-            .map_output(|m| StopReason::Admin(Box::new(m)));
+        let admin_stop = bot.inbox().on_map(move |m| {
+            (is_admin_msg(m, &admin_list)
+                && m.is_cmd("!stop")
+                && (m.is_dm() || m.is_in(&lobby_for_admin)))
+                .then(|| StopReason::Admin(Box::new(m.clone())))
+        });
 
         let abort_scope = InboxScope::new().room(lobby).dm_from(&starter);
         let starter_for_abort = starter.clone();

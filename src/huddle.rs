@@ -125,8 +125,7 @@ impl Huddle {
         mut inbox: Inbox,
         ask_config: AskConfig,
     ) -> Self {
-        inbox.idle_timeout = Some(std::time::Duration::from_secs(300));
-        ask_config.apply_to_inbox(&mut inbox);
+        ask_config.apply_to_locked_inbox(&mut inbox);
         Self {
             core,
             guards,
@@ -205,7 +204,7 @@ impl Huddle {
 
     pub fn set_ask_config(&mut self, cfg: &AskConfig) {
         self.ask_config = cfg.clone();
-        cfg.apply_to_inbox(&mut self.inbox);
+        cfg.apply_to_locked_inbox(&mut self.inbox);
     }
 
     pub fn ignore_commands(mut self) -> Self {

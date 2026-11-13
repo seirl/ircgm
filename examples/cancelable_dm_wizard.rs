@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     let bot = Bot::connect(irc_cfg).await?;
     let lobby = bot.room("#lobby")?;
 
-    let trigger = lobby.inbox().into_wait_cmd("!loadout").await?;
+    let trigger = lobby.inbox().wait_cmd("!loadout").await?;
     if let Some(items) = pick_loadout_or_cancel(&trigger.sender).await? {
         lobby.say(irc_format!(
             "{} packed: {}",

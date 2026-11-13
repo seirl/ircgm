@@ -335,9 +335,14 @@ impl AskConfig {
         self
     }
 
-    pub(crate) fn apply_to_inbox(&self, inbox: &mut Inbox) {
+    pub(crate) fn apply_flags_to_inbox(&self, inbox: &mut Inbox) {
         inbox.ignore_commands = self.ignore_commands;
         inbox.accept_notices = self.accept_notices;
+    }
+
+    pub(crate) fn apply_to_locked_inbox(&self, inbox: &mut Inbox) {
+        self.apply_flags_to_inbox(inbox);
+        inbox.read_limit = self.time_limit;
     }
 }
 

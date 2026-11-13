@@ -78,10 +78,10 @@ async fn external_supervisor_cancels_running_minigame_and_tears_down_breakout_on
         let alice = alice.clone();
         let bob = bob.clone();
         async move {
-            let admin_stop = bot
-                .inbox()
-                .on_for(|m| m.account.as_deref() == Some("staff") && m.is_cmd("!stop"))
-                .map_output(|_| ExternalStop::AdminStop);
+            let admin_stop = bot.inbox().on_map(|m| {
+                (m.account.as_deref() == Some("staff") && m.is_cmd("!stop"))
+                    .then_some(ExternalStop::AdminStop)
+            });
 
             let starter_abort = alice
                 .inbox()

@@ -5,11 +5,11 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use irc::proto::Message;
 use tokio::sync::mpsc;
 
+use crate::ask::TimeLimit;
 use crate::bot::BotCore;
 use crate::casemap::{CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
@@ -313,7 +313,7 @@ impl InboxRegistry {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
-            idle_timeout: None,
+            read_limit: TimeLimit::None,
             latched_departure: None,
             last_user_departure: None,
             departed_users,
@@ -583,7 +583,7 @@ pub struct Inbox {
     lag_policy: LagPolicy,
     pub(crate) ignore_commands: bool,
     pub(crate) accept_notices: bool,
-    pub(crate) idle_timeout: Option<Duration>,
+    pub(crate) read_limit: TimeLimit,
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
@@ -618,7 +618,7 @@ impl Inbox {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
-            idle_timeout: None,
+            read_limit: TimeLimit::None,
             latched_departure: None,
             last_user_departure: None,
             departed_users: HashSet::new(),
@@ -666,10 +666,14 @@ impl Inbox {
         }
     }
 
-    async fn next_wire(&mut self, use_idle_timeout: bool) -> Result<Arc<WireEvent>> {
-        match self.idle_timeout.filter(|_| use_idle_timeout) {
-            None => poll_fn(|cx| self.poll_next_wire(cx)).await,
-            Some(dur) => tokio::time::timeout(dur, poll_fn(|cx| self.poll_next_wire(cx)))
+    async fn next_wire_with(&mut self, limit: TimeLimit) -> Result<Arc<WireEvent>> {
+        let next = poll_fn(|cx| self.poll_next_wire(cx));
+        match limit {
+            TimeLimit::None => next.await,
+            TimeLimit::Duration(dur) => tokio::time::timeout(dur, next)
+                .await
+                .map_err(|_| Error::TimedOut)?,
+            TimeLimit::Deadline(dl) => tokio::time::timeout_at(dl, next)
                 .await
                 .map_err(|_| Error::TimedOut)?,
         }
@@ -687,13 +691,13 @@ impl Inbox {
         B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        self.wait_reply_map_inner(false, ignore_commands, accept_notices, check_bounce, f)
+        self.wait_reply_map_inner(TimeLimit::None, ignore_commands, accept_notices, check_bounce, f)
             .await
     }
 
     async fn wait_reply_map_inner<B, F, T>(
         &mut self,
-        use_idle_timeout: bool,
+        read_limit: TimeLimit,
         ignore_commands: bool,
         accept_notices: bool,
         mut check_bounce: B,
@@ -704,7 +708,7 @@ impl Inbox {
         F: FnMut(&ChatMessage) -> Option<T>,
     {
         loop {
-            let wire = self.next_wire(use_idle_timeout).await?;
+            let wire = self.next_wire_with(read_limit).await?;
             match &wire.kind {
                 WireKind::SendError {
                     target,
@@ -755,7 +759,7 @@ impl Inbox {
         F: FnMut(&ChatMessage) -> Option<T>,
     {
         self.wait_reply_map_inner(
-            true,
+            self.read_limit,
             self.ignore_commands,
             self.accept_notices,
             |_, _, _, _| None,
@@ -775,7 +779,7 @@ impl Inbox {
     /// `self.ignore_commands` so explicit command waits never deadlock on command-skipping inboxes.
     pub async fn wait_cmd(&mut self, cmd: &str) -> Result<ChatMessage> {
         self.wait_reply_map_inner(
-            true,
+            self.read_limit,
             false,
             self.accept_notices,
             |_, _, _, _| None,
@@ -787,7 +791,7 @@ impl Inbox {
     /// Waits for `cmd` followed by non-empty arguments, returning `(msg, trimmed_arg_string)`.
     pub async fn wait_cmd_arg(&mut self, cmd: &str) -> Result<(ChatMessage, String)> {
         self.wait_reply_map_inner(
-            true,
+            self.read_limit,
             false,
             self.accept_notices,
             |_, _, _, _| None,
@@ -804,28 +808,6 @@ impl Inbox {
         self.wait_event_map(|ev| Some(ev.clone())).await
     }
 
-    /// Consuming one-shot variant of [`Inbox::wait_map`] that owns this [`Inbox`] inside the
-    /// returned future.
-    pub async fn into_wait_map<F, T>(mut self, f: F) -> Result<T>
-    where
-        F: FnMut(&ChatMessage) -> Option<T>,
-    {
-        self.wait_map(f).await
-    }
-
-    /// Consuming one-shot variant of [`Inbox::wait_for`].
-    pub async fn into_wait_for<P>(mut self, pred: P) -> Result<ChatMessage>
-    where
-        P: FnMut(&ChatMessage) -> bool,
-    {
-        self.wait_for(pred).await
-    }
-
-    /// Consuming one-shot variant of [`Inbox::wait_cmd`].
-    pub async fn into_wait_cmd(mut self, cmd: &str) -> Result<ChatMessage> {
-        self.wait_cmd(cmd).await
-    }
-
     /// Lossy supervision stop-trigger: enables `.lossy()` internally (so burst lag logs a warning
     /// and keeps listening rather than killing the trigger) and parks `Pending` if the watched
     /// scope closes or disconnects (so a departing user never triggers a false stop in `.until()`).
@@ -836,7 +818,7 @@ impl Inbox {
         self.lag_policy = LagPolicy::Lossy;
         match self
             .wait_reply_map_inner(
-                false,
+                TimeLimit::None,
                 self.ignore_commands,
                 self.accept_notices,
                 |_, _, _, _| None,
@@ -852,19 +834,11 @@ impl Inbox {
         }
     }
 
-    /// Lossy supervision stop-trigger matching `pred` (for `.until(...)` / `.or_until(...)`).
-    pub async fn on_for<P>(self, mut pred: P) -> ChatMessage
-    where
-        P: FnMut(&ChatMessage) -> bool,
-    {
-        self.on_map(move |m| pred(m).then(|| m.clone())).await
-    }
-
     /// Lossy supervision stop-trigger matching word-boundary `cmd` (ASCII case-insensitive),
     /// always accepting commands even if `ignore_commands` was set.
     pub async fn on_cmd(mut self, cmd: &str) -> ChatMessage {
         self.ignore_commands = false;
-        self.on_for(|m| m.is_cmd(cmd)).await
+        self.on_map(|m| m.is_cmd(cmd).then(|| m.clone())).await
     }
 
     /// Waits for and transforms the next matching high-level [`Event`] in this inbox.
@@ -873,7 +847,7 @@ impl Inbox {
         F: FnMut(&Event) -> Option<T>,
     {
         loop {
-            let wire = self.next_wire(true).await?;
+            let wire = self.next_wire_with(self.read_limit).await?;
             if let Some(ev) = wire.to_public_event() {
                 if let Some(val) = f(&ev) {
                     return Ok(val);
@@ -883,7 +857,7 @@ impl Inbox {
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        let wire = self.next_wire(true).await?;
+        let wire = self.next_wire_with(self.read_limit).await?;
         Ok(Arc::clone(&wire.raw))
     }
 
@@ -892,7 +866,7 @@ impl Inbox {
         F: FnMut(&Message) -> Option<T>,
     {
         loop {
-            let wire = self.next_wire(true).await?;
+            let wire = self.next_wire_with(self.read_limit).await?;
             if let Some(val) = f(&wire.raw) {
                 return Ok(val);
             }

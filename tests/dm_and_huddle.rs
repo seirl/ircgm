@@ -283,16 +283,39 @@ async fn exclusive_many_available_and_huddle_semantics() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn exclusive_dm_inbox_enforces_300s_idle_safety_timeout() {
+async fn exclusive_dm_inbox_enforces_ask_config_read_timeout() {
     let (bot, server) = test_harness("GM");
     server.complete_join("#lobby", &["BouncerUser"]);
     server.settle().await;
 
     let bouncer = bot.user("BouncerUser").unwrap();
-    let mut dm = bouncer.exclusive().await.unwrap();
 
-    let start = tokio::time::Instant::now();
-    let res = dm.inbox().next_chat().await;
-    assert!(matches!(res, Err(Error::TimedOut)));
-    assert_eq!(start.elapsed(), Duration::from_secs(300));
+    // 1. Default `AskConfig` enforces the 300s AFK bouncer safety timeout on direct `dm.inbox()` reads:
+    {
+        let mut dm = bouncer.exclusive().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let res = dm.inbox().next_chat().await;
+        assert!(matches!(res, Err(Error::TimedOut)));
+        assert_eq!(start.elapsed(), Duration::from_secs(300));
+    }
+
+    // 2. `with_ask_config` overrides `dm.inbox()`'s read timeout (including `reply_timeout` and `no_reply_timeout`):
+    {
+        let short_cfg = AskConfig::new().reply_timeout(Duration::from_secs(12));
+        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&short_cfg);
+        let start = tokio::time::Instant::now();
+        let res = dm.inbox().next_chat().await;
+        assert!(matches!(res, Err(Error::TimedOut)));
+        assert_eq!(start.elapsed(), Duration::from_secs(12));
+    }
+    {
+        let untimed_cfg = AskConfig::new().no_reply_timeout();
+        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&untimed_cfg);
+        let wait_fut = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            server.dm("BouncerUser", "back from dinner");
+        };
+        let (msg, ()) = tokio::join!(dm.inbox().next_chat(), wait_fut);
+        assert_eq!(msg.unwrap().text, "back from dinner");
+    }
 }

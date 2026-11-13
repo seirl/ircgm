@@ -594,7 +594,7 @@ impl Room {
             .core
             .inboxes
             .subscribe(Arc::clone(&self.core), filter, caller, cm);
-        self.ask_config.apply_to_inbox(&mut inbox);
+        self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
     }
 
@@ -608,7 +608,7 @@ impl Room {
             .core
             .inboxes
             .subscribe(Arc::clone(&self.core), filter, caller, cm);
-        self.ask_config.apply_to_inbox(&mut inbox);
+        self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
     }
 }

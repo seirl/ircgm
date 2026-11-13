@@ -23,7 +23,7 @@
 //!     loop {
 //!         let trigger = match room
 //!             .inbox()
-//!             .into_wait_cmd("!guess")
+//!             .wait_cmd("!guess")
 //!             .until(bot.shutdown_requested())
 //!             .await
 //!         {

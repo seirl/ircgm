@@ -72,7 +72,7 @@ impl ExclusiveDm {
 
     pub fn set_ask_config(&mut self, cfg: &AskConfig) {
         self.ask_config = cfg.clone();
-        cfg.apply_to_inbox(&mut self.inbox);
+        cfg.apply_to_locked_inbox(&mut self.inbox);
     }
 
     pub fn ignore_commands(mut self) -> Self {
@@ -188,9 +188,8 @@ pub(crate) async fn acquire_single_dm_guard(
         caller,
         cm,
     );
-    inbox.idle_timeout = Some(Duration::from_secs(300));
     let ask_config = (*core.ask_config).clone();
-    ask_config.apply_to_inbox(&mut inbox);
+    ask_config.apply_to_locked_inbox(&mut inbox);
 
     Ok(ExclusiveDm {
         core,

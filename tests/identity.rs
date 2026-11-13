@@ -195,14 +195,14 @@ async fn user_id_keys_and_consuming_inbox_combinators() {
     assert_ne!(alice_rejoined.id(), alice_id);
     assert!(seen.insert(alice_rejoined.id()));
 
-    let stop_fut = bot.inbox().on_for(|m| m.is_cmd("!stop"));
+    let stop_fut = bot.inbox().on_cmd("!stop");
     let abort_fut = bob.inbox().on_cmd("!abort");
 
     let work = async move {
         let first = room.inbox().next_chat().await?;
         let mapped = room
             .inbox()
-            .into_wait_map(|m| m.cmd_args("!pick").map(str::to_owned))
+            .wait_map(|m| m.cmd_args("!pick").map(str::to_owned))
             .await?;
         Ok::<_, Error>((first.text, mapped))
     };

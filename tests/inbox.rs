@@ -132,7 +132,7 @@ async fn oneshot_non_backlog_and_inbox_dms_filtering() {
     let room = bot.room("#lobby").unwrap();
 
     let r_wait = room.clone();
-    let wait_task = tokio::spawn(async move { r_wait.inbox().into_wait_cmd("!heist").await });
+    let wait_task = tokio::spawn(async move { r_wait.inbox().wait_cmd("!heist").await });
     tokio::task::yield_now().await;
     server.chat("Alice", "#lobby", "!heist");
     server.settle().await;
