@@ -62,8 +62,16 @@ async fn virtual_clock_with_timeout_and_with_deadline() {
 }
 
 #[tokio::test]
-async fn optional_and_settled_mappings() {
-    let t_out = async { Err::<u32, Error>(Error::TimedOut) }.optional().await;
+async fn none_on_timeout_maps_timed_out_and_preserves_other_errors() {
+    let ok_val = async { Ok::<u32, Error>(7) }
+        .none_on_timeout()
+        .await
+        .unwrap();
+    assert_eq!(ok_val, Some(7));
+
+    let t_out = async { Err::<u32, Error>(Error::TimedOut) }
+        .none_on_timeout()
+        .await;
     assert_eq!(t_out.unwrap(), None);
 
     let u_left = async {
@@ -72,70 +80,12 @@ async fn optional_and_settled_mappings() {
             reason: Some("Quit".into()),
         })
     }
-    .optional()
+    .none_on_timeout()
     .await;
     assert!(matches!(u_left, Err(Error::UserLeft { .. })));
 
-    let s_ok = async { Ok::<u32, Error>(7) }.settled().await.unwrap();
-    assert_eq!(s_ok, Turn::Reply(7));
-    assert_eq!(s_ok.as_reply(), Some(&7));
-    assert_eq!(s_ok.into_reply(), Some(7));
-
-    let s_to = async { Err::<u32, Error>(Error::TimedOut) }
-        .settled()
-        .await
-        .unwrap();
-    assert!(s_to.is_timed_out());
-    assert_eq!(s_to.into_reply(), None);
-
-    let s_left = async {
-        Err::<u32, Error>(Error::UserLeft {
-            nick: "Bob".into(),
-            reason: None,
-        })
-    }
-    .settled()
-    .await
-    .unwrap();
-    assert!(s_left.is_left());
-
-    let s_unreach = async {
-        Err::<u32, Error>(Error::UserUnreachable {
-            nick: "Alice".into(),
-            code: 716,
-            message: "is in +g mode".into(),
-        })
-    }
-    .settled()
-    .await
-    .unwrap();
-    assert!(s_unreach.is_unreachable());
-    assert_eq!(
-        s_unreach,
-        Turn::Unreachable {
-            target: "Alice".into(),
-            code: 716,
-            message: "is in +g mode".into(),
-        }
-    );
-
-    // Channel send failure (404 / 403) is NOT swallowed into `Turn::Unreachable`:
-    let chan_err = async {
-        Err::<u32, Error>(Error::ChannelSendFailed {
-            channel: "#lobby".into(),
-            code: 404,
-            message: "Cannot send to channel".into(),
-        })
-    }
-    .settled()
-    .await;
-    assert!(matches!(
-        chan_err,
-        Err(Error::ChannelSendFailed { ref channel, code: 404, .. }) if channel == "#lobby"
-    ));
-
     let res_disc = async { Err::<u32, Error>(Error::Disconnected(DisconnectReason::Eof)) }
-        .settled()
+        .none_on_timeout()
         .await;
     assert!(matches!(
         res_disc,
@@ -147,7 +97,7 @@ async fn optional_and_settled_mappings() {
         skipped: 5,
         opened_at: Location::caller(),
     };
-    let res_lag = async { Err::<u32, Error>(err_lag) }.settled().await;
+    let res_lag = async { Err::<u32, Error>(err_lag) }.none_on_timeout().await;
     assert!(matches!(res_lag, Err(Error::Lagged { skipped: 5, .. })));
 }
 

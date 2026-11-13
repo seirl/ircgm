@@ -1,22 +1,79 @@
 use super::*;
+use crate::error::DisconnectReason;
 use crate::testing::test_harness;
 
 #[test]
-fn into_verdict_converts_option_and_preserves_verdict() {
-    assert_eq!(Some(42).into_verdict(), Verdict::accept(42));
-    assert_eq!(None::<i32>.into_verdict(), Verdict::ignore());
+fn into_ask_match_and_answer_conversions() {
+    assert_eq!(Some(42).into_ask_match(), AskMatch::accept(42));
+    assert_eq!(None::<i32>.into_ask_match(), AskMatch::ignore());
 
-    let ack: Verdict<i32> = Verdict::accept_ack(7, "Locked in!");
+    let ack: AskMatch<i32> = AskMatch::accept_say(7, "Locked in!");
     assert_eq!(
-        ack.into_verdict().0,
-        VerdictInner::Accept(7, Some(Text::from("Locked in!")))
+        ack.into_ask_match().0,
+        AskMatchInner::Accept(7, Some(Text::from("Locked in!")))
     );
 
-    let rej: Verdict<i32> = Verdict::reject("Invalid number");
+    let rej: AskMatch<i32> = AskMatch::reject("Invalid number");
     assert_eq!(
-        rej.into_verdict().0,
-        VerdictInner::Reject(Text::from("Invalid number"))
+        rej.into_ask_match().0,
+        AskMatchInner::Reject(Text::from("Invalid number"))
     );
+
+    let ok_ans = Answer::from_result(Ok::<u32, Error>(7)).unwrap();
+    assert_eq!(ok_ans, Answer::Ok(7));
+    assert!(ok_ans.is_ok());
+    assert_eq!(ok_ans.as_ok(), Some(&7));
+    assert_eq!(ok_ans.clone().ok(), Some(7));
+    assert_eq!(ok_ans.clone().unwrap(), 7);
+    assert_eq!(ok_ans.into_result().unwrap(), 7);
+
+    let to_ans = Answer::from_result(Err::<u32, Error>(Error::TimedOut)).unwrap();
+    assert!(to_ans.is_timed_out());
+    assert_eq!(to_ans.clone().ok(), None);
+    assert!(matches!(to_ans.into_result(), Err(Error::TimedOut)));
+
+    let left_ans = Answer::from_result(Err::<u32, Error>(Error::UserLeft {
+        nick: "Bob".into(),
+        reason: Some("Quit".into()),
+    }))
+    .unwrap();
+    assert!(left_ans.is_left());
+    assert_eq!(left_ans.clone().ok(), None);
+    assert!(matches!(left_ans.into_result(), Err(Error::UserLeft { .. })));
+
+    let unreach_ans = Answer::from_result(Err::<u32, Error>(Error::UserUnreachable {
+        nick: "Alice".into(),
+        code: 716,
+        message: "is in +g mode".into(),
+    }))
+    .unwrap();
+    assert!(unreach_ans.is_unreachable());
+    assert_eq!(
+        unreach_ans,
+        Answer::Unreachable {
+            nick: "Alice".into(),
+            code: 716,
+            message: "is in +g mode".into(),
+        }
+    );
+    assert!(matches!(
+        unreach_ans.into_result(),
+        Err(Error::UserUnreachable { code: 716, .. })
+    ));
+
+    // Channel and session errors remain `Err`:
+    assert!(matches!(
+        Answer::from_result(Err::<u32, Error>(Error::ChannelSendFailed {
+            channel: "#lobby".into(),
+            code: 404,
+            message: "Cannot send".into(),
+        })),
+        Err(Error::ChannelSendFailed { code: 404, .. })
+    ));
+    assert!(matches!(
+        Answer::from_result(Err::<u32, Error>(Error::Disconnected(DisconnectReason::Eof))),
+        Err(Error::Disconnected(DisconnectReason::Eof))
+    ));
 }
 
 #[test]

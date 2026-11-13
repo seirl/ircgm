@@ -38,7 +38,7 @@ async fn single_batch_privmsg_rename_steal_quit_preserves_stamped_identity() {
     server.send_line(":Alice2!u@h QUIT :bye\r\n");
     server.settle().await;
 
-    let hit_msg = ask_task.await.unwrap().unwrap();
+    let hit_msg = ask_task.await.unwrap().unwrap().unwrap();
     assert_eq!(hit_msg.text, "hit");
     assert_eq!(hit_msg.nick, "Alice");
     assert_eq!(hit_msg.sender, alice);
@@ -257,7 +257,7 @@ async fn dynamic_casemapping_rekey_rfc1459_netsplit_and_accounts() {
     let no_match = room_in
         .next_chat()
         .with_timeout(Duration::from_millis(10))
-        .optional()
+        .none_on_timeout()
         .await
         .unwrap();
     assert!(no_match.is_none());

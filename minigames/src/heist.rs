@@ -6,7 +6,7 @@
 //! 2. **Phase 1 — Vault Door Breach Race (`tokio::select!`):** Both specialists work simultaneously;
 //!    whichever cracks their mechanism first opens the blast door and cancels the other's puzzle:
 //!    - **Hacker (Private DM [`ExclusiveDm`]):** Converts `0x2A` to decimal (`42`), then enters
-//!      `override` (`30s` per step, with [`Verdict::reject`] hints on wrong answers).
+//!      `override` (`30s` per step, with [`AskMatch::reject`] hints on wrong answers).
 //!    - **Safecracker (Vault Channel [`Room::ask_user`]):** Sets 3 pins in order (`!tension`,
 //!      `!rake`, `!set`, `20s` per pin).
 //! 3. **Phase 2 — Live Laser Alarm & Dual-Key Extraction (`20s` virtual fuse):**
@@ -86,22 +86,24 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
 
     dm.ask("💻 Step 1/2 — Convert `0x2A` to decimal:", |m| {
         match m.text.trim() {
-            "42" => Verdict::accept(()),
-            _ => Verdict::reject("Hint: 2 * 16 + 10.".yellow()),
+            "42" => AskMatch::accept(()),
+            _ => AskMatch::reject("Hint: 2 * 16 + 10.".yellow()),
         }
     })
+    .required()
     .await?;
 
     dm.ask("💻 Step 2/2 — Type `override` to cut door power:", |m| {
         if m.text.trim().eq_ignore_ascii_case("override") {
-            Verdict::accept_ack(
+            AskMatch::accept_say(
                 (),
                 "🔓 Door power severed! Return to the vault channel!".green(),
             )
         } else {
-            Verdict::reject("Type `override` to sever door power.".yellow())
+            AskMatch::reject("Type `override` to sever door power.".yellow())
         }
     })
+    .required()
     .await
 }
 
@@ -119,6 +121,7 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
                 |m| m.is_cmd(cmd).then_some(()),
             )
             .reply_timeout(Duration::from_secs(20))
+            .required()
             .await?;
     }
     Ok(())
@@ -169,23 +172,23 @@ pub async fn run_heist(
         .await?;
 
     // Phase 1: Hacker (DM) vs Safecracker (#vault) race to open the outer blast door!
-    // Using `.settled()?` isolates per-player timeouts/departures while propagating fatal
+    // `Answer::from_result(...)` isolates per-player timeouts/departures while propagating fatal
     // `Error::Disconnected` / `Error::BotLeftRoom` immediately.
     let breached = tokio::select! {
-        res = hack_terminal(hacker).settled() => {
-            if matches!(res?, Turn::Reply(())) {
+        res = hack_terminal(hacker) => {
+            if Answer::from_result(res)?.is_ok() {
                 vault.say("🔓 Hacker bypassed the outer vault door via DM!".green().bold())?;
                 true
             } else {
-                matches!(crack_tumblers(&vault, safecracker).settled().await?, Turn::Reply(()))
+                Answer::from_result(crack_tumblers(&vault, safecracker).await)?.is_ok()
             }
         }
-        res = crack_tumblers(&vault, safecracker).settled() => {
-            if matches!(res?, Turn::Reply(())) {
+        res = crack_tumblers(&vault, safecracker) => {
+            if Answer::from_result(res)?.is_ok() {
                 vault.say("🔓 Safecracker picked the outer vault door!".green().bold())?;
                 true
             } else {
-                matches!(hack_terminal(hacker).settled().await?, Turn::Reply(()))
+                Answer::from_result(hack_terminal(hacker).await)?.is_ok()
             }
         }
     };

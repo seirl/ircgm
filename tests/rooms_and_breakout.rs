@@ -181,7 +181,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     server.chat("U1", "#c", "yep");
     server.settle().await;
 
-    chat_ask.await.unwrap().unwrap();
+    assert_eq!(chat_ask.await.unwrap().unwrap(), Answer::Ok(()));
     assert!(logs.text().contains("482 ERR_CHANOPRIVSNEEDED"));
     let saw_482 = raw_in
         .wait_raw_map(|raw| {

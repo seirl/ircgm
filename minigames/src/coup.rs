@@ -89,12 +89,13 @@ pub async fn run_coup_round(room: &Room, active: &User, rival: &User) -> Result<
 
     let steal_branch = async {
         let mut inbox = room.inbox_user(rival);
-        let steal_trigger = inbox
-            .wait_cmd("!steal")
-            .with_timeout(Duration::from_secs(30))
-            .settled()
-            .await?
-            .into_reply();
+        let steal_trigger = Answer::from_result(
+            inbox
+                .wait_cmd("!steal")
+                .with_timeout(Duration::from_secs(30))
+                .await,
+        )?
+        .ok();
         match steal_trigger {
             Some(_) => resolve_steal_attempt(room, rival, active).await.map(Some),
             None => Ok(None),
@@ -209,19 +210,19 @@ pub async fn resolve_steal_attempt(
                 thief.nick().bold(),
             ),
             |m| match m.text.trim().to_ascii_lowercase().as_str() {
-                "block captain" => Verdict::accept_ack(
+                "block captain" => AskMatch::accept_say(
                     StealResolution::Blocked(Role::Captain),
                     "✔ Blocking steal with Captain!".cyan(),
                 ),
-                "block ambassador" => Verdict::accept_ack(
+                "block ambassador" => AskMatch::accept_say(
                     StealResolution::Blocked(Role::Ambassador),
                     "✔ Blocking steal with Ambassador!".cyan(),
                 ),
-                "allow" => Verdict::accept_ack(
+                "allow" => AskMatch::accept_say(
                     StealResolution::Stolen { coins: 2 },
                     "✔ Allowing the steal.".yellow(),
                 ),
-                _ => Verdict::reject(
+                _ => AskMatch::reject(
                     "Reply `block captain`, `block ambassador`, or `allow`.".yellow(),
                 ),
             },
@@ -229,9 +230,8 @@ pub async fn resolve_steal_attempt(
         .reply_timeout(Duration::from_secs(20))
         .ignore_commands()
         .warn_remaining(Duration::from_secs(5), "⏳ 5s left to block!".yellow())
-        .settled()
-        .await?
-        .into_reply();
+        .optional()
+        .await?;
 
     let resolution = response.unwrap_or(StealResolution::Stolen { coins: 2 });
     match resolution {

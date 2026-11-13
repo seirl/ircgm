@@ -23,8 +23,8 @@
 //!   (`#usa-xxxxxx` and `#ussr-xxxxxx`) in lockstep via `tokio::try_join!`.
 //! - **Multi-channel styled relay ([`Bot::inbox_rooms`] + [`ChatMessage::to_styled`]):** Streams
 //!   chat from both war rooms in wire order while preserving each player's mIRC colors/bold/italics.
-//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + `.settled()`
-//!   decisions in separate private rooms with [`Verdict::accept_ack`] so the faster premier gets
+//! - **Simultaneous secret channel prompts:** Runs parallel [`Room::ask_user`] + [`ircgm::Ask::optional`]
+//!   decisions in separate private rooms with [`AskMatch::accept_say`] so the faster premier gets
 //!   immediate in-bunker confirmation while waiting for their counterpart.
 
 use std::time::Duration;
@@ -129,39 +129,39 @@ pub async fn run_cold_war(
     // Phase 2: Simultaneous secret orders in each private war room:
     let parse_order = |m: &ChatMessage| {
         if m.is_cmd("!stand_down") {
-            Verdict::accept_ack(
+            AskMatch::accept_say(
                 Order::StandDown,
                 "✔ Stand-down order authenticated — awaiting counterpart...".green(),
             )
         } else if m.is_cmd("!launch") {
-            Verdict::accept_ack(
+            AskMatch::accept_say(
                 Order::Launch,
                 "✔ Launch key authenticated — awaiting counterpart...".red().bold(),
             )
         } else {
-            Verdict::reject("Issue `!stand_down` or `!launch`.".yellow())
+            AskMatch::reject("Issue `!stand_down` or `!launch`.".yellow())
         }
     };
 
-    let (usa_turn, ussr_turn) = tokio::try_join!(
+    let (usa_opt, ussr_opt) = tokio::try_join!(
         usa.ask_user(
             usa_premier,
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
         .reply_timeout(Duration::from_secs(15))
-        .settled(),
+        .optional(),
         ussr.ask_user(
             ussr_premier,
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
         .reply_timeout(Duration::from_secs(15))
-        .settled(),
+        .optional(),
     )?;
 
-    let usa_order = usa_turn.into_reply().unwrap_or(Order::StandDown);
-    let ussr_order = ussr_turn.into_reply().unwrap_or(Order::StandDown);
+    let usa_order = usa_opt.unwrap_or(Order::StandDown);
+    let ussr_order = ussr_opt.unwrap_or(Order::StandDown);
 
     let outcome = match (usa_order, ussr_order) {
         (Order::StandDown, Order::StandDown) => {

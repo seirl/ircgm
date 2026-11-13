@@ -65,7 +65,10 @@ async fn exclusive_serialization_and_15s_holder_location_warning() {
 
     server.dm("Alice", "yes!");
     server.settle().await;
-    assert_eq!(interrupt_task.await.unwrap().unwrap(), "yes!");
+    assert_eq!(
+        interrupt_task.await.unwrap().unwrap(),
+        Answer::Ok("yes!".into())
+    );
 }
 
 #[tokio::test]
@@ -123,7 +126,10 @@ async fn cancel_during_exclusive_dm_and_ignore_commands() {
 
     server.dm("Alice", "proceeding");
     server.settle().await;
-    assert_eq!(queued_ask.await.unwrap().unwrap(), "proceeding");
+    assert_eq!(
+        queued_ask.await.unwrap().unwrap(),
+        Answer::Ok("proceeding".into())
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -156,7 +162,10 @@ async fn stale_inbox_cleared_between_exclusive_dm_asks() {
 
     server.dm("Alice", "fresh_answer_to_q2");
     server.settle().await;
-    assert_eq!(ask2.await.unwrap(), "fresh_answer_to_q2");
+    assert_eq!(
+        ask2.await.unwrap(),
+        Answer::Ok("fresh_answer_to_q2".into())
+    );
 }
 
 #[tokio::test]
@@ -218,12 +227,12 @@ async fn exclusive_many_available_and_huddle_semantics() {
 
         let ask_fut = pack.ask("Who to bite?", |m| {
             let Some(target) = m.cmd_args("!kill") else {
-                return Verdict::ignore();
+                return AskMatch::ignore();
             };
             if villager.eq_nick(target) {
-                Verdict::accept((m.sender.clone(), target.to_owned()))
+                AskMatch::accept((m.sender.clone(), target.to_owned()))
             } else {
-                Verdict::reject("Invalid target!")
+                AskMatch::reject("Invalid target!")
             }
         });
 
@@ -242,7 +251,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
         };
 
         let (res, ()) = tokio::join!(ask_fut, interact);
-        let (killer, target) = res.unwrap();
+        let (killer, target) = res.unwrap().unwrap();
         assert_eq!(killer, w2);
         assert_eq!(target, "Villager");
 
@@ -269,11 +278,8 @@ async fn exclusive_many_available_and_huddle_semantics() {
 
     let mut empty_huddle = bot.huddle_available([&w3]).await.unwrap();
     assert!(empty_huddle.is_empty());
-    let empty_err = empty_huddle
-        .ask("Anyone?", |_| Some(()))
-        .await
-        .unwrap_err();
-    assert!(matches!(empty_err, Error::UserLeft { ref nick, .. } if nick == "Wolf3"));
+    let empty_ans = empty_huddle.ask("Anyone?", |_| Some(())).await.unwrap();
+    assert!(matches!(empty_ans, Answer::Left { ref nick, .. } if nick == "Wolf3"));
 }
 
 #[tokio::test(start_paused = true)]

@@ -4,10 +4,10 @@
 //! 1. Three players join in `#lobby` (or pass `(User, prompt)` assignments to [`collect_quips`]).
 //! 2. **Quip Phase (`45s`):** The bot simultaneously DMs each player a fill-in-the-blank prompt
 //!    ([`FuturesUnordered`] over `player.ask(...)`):
-//!    - Empty or `> 80`-char answers receive validation feedback via [`Verdict::reject`] without
+//!    - Empty or `> 80`-char answers receive validation feedback via [`AskMatch::reject`] without
 //!      resetting the `45s` timer.
 //!    - Players who haven't answered yet get a `10s` countdown warning (`warn_remaining`).
-//!    - If a player blocks DMs (`+g` `716` / `+R` `486`), [`Turn::Unreachable`] isolates that
+//!    - If a player blocks DMs (`+g` `716` / `+R` `486`), [`Answer::Unreachable`] isolates that
 //!      bounce and posts a helpful hint in `#lobby` without aborting everyone else!
 //! 3. **Audience Vote Phase (`20s`):** Submitted quips are posted anonymously in `#lobby`
 //!    (`#1`, `#2`, ...), and everyone votes with `!pick <number>` (deduplicated per [`UserId`],
@@ -17,11 +17,11 @@
 //!    answer on the wire (`ChatMessage::seq`) breaks the tie!
 //!
 //! ## Library Mechanics Showcased
-//! - **Concurrent per-player DM [`ircgm::Ask`]s (`FuturesUnordered`):** Inline [`Verdict::reject`]
-//!   validation (preserving remaining timeout), [`Verdict::accept_ack`] in-DM confirmation, and
+//! - **Concurrent per-player DM [`ircgm::Ask`]s (`FuturesUnordered`):** Inline [`AskMatch::reject`]
+//!   validation (preserving remaining timeout), [`AskMatch::accept_say`] in-DM confirmation, and
 //!   `warn_remaining` countdown warnings.
-//! - **PM-block bounce isolation (`+g` `716` / `+R` `486`):** [`ircgm::GameFutureExt::settled`] maps
-//!   server DM rejection numerics to [`Turn::Unreachable`].
+//! - **PM-block bounce isolation (`+g` `716` / `+R` `486`):** Default [`ircgm::Ask`] maps server DM
+//!   rejection numerics directly to [`Answer::Unreachable`].
 //! - **Identity-safe channel ballot collection:** [`Inbox::wait_map`] + [`UserId`] keys block
 //!   self-votes and double-votes even across mid-round `/nick` changes.
 //! - **Drop-out tolerant [`Bot::huddle_available`] + [`Huddle::ask`] tiebreaker:** Locks online
@@ -75,17 +75,17 @@ pub async fn collect_quips(
         .map(|(player, secret_prompt)| {
             let cfg = &cfg;
             async move {
-                let turn = player
+                let ans = player
                     .ask(
                         irc_format!("{} {secret_prompt} (45s, max 80 chars)", "Prompt:".bold().cyan()),
                         |m| {
                             let quip = m.text.trim();
                             if quip.is_empty() || quip.len() > 80 {
-                                Verdict::reject(
+                                AskMatch::reject(
                                     "Keep your answer between 1 and 80 characters!".yellow(),
                                 )
                             } else {
-                                Verdict::accept_ack(
+                                AskMatch::accept_say(
                                     quip.to_owned(),
                                     "✔ Quip locked in! Watch the channel for voting.".green(),
                                 )
@@ -97,18 +97,17 @@ pub async fn collect_quips(
                         Duration::from_secs(10),
                         "⏳ 10 seconds left to submit!".yellow(),
                     )
-                    .settled()
                     .await?;
-                Ok::<_, Error>((player.clone(), turn))
+                Ok::<_, Error>((player.clone(), ans))
             }
         })
         .collect();
 
     let mut submissions = Vec::with_capacity(total);
     while let Some(res) = tasks.next().await {
-        let (player, turn) = res?;
-        match turn {
-            Turn::Reply(quip) => {
+        let (player, ans) = res?;
+        match ans {
+            Answer::Ok(quip) => {
                 submissions.push((player.clone(), quip));
                 room.say(irc_format!(
                     "{} {} locked in! ({}/{total})",
@@ -117,13 +116,13 @@ pub async fn collect_quips(
                     submissions.len(),
                 ))?;
             }
-            Turn::TimedOut => {
+            Answer::TimedOut => {
                 room.say(irc_format!("{} ran out of time!", player.nick().bold().yellow()))?;
             }
-            Turn::Left { nick, .. } => {
+            Answer::Left { nick, .. } => {
                 room.say(irc_format!("{} disconnected.", nick.bold()))?;
             }
-            Turn::Unreachable { code, .. } => {
+            Answer::Unreachable { code, .. } => {
                 room.say(irc_format!(
                     "{} couldn't receive DMs ({code:?} — check `/umode -g` / NickServ)!",
                     player.nick().bold().red(),
@@ -153,7 +152,7 @@ pub async fn tiebreaker_buzz_in(
     huddle
         .ask("⚡ Tiebreaker! What is 17 * 6? (20s)", |m| {
             if m.text.trim() == "102" {
-                Verdict::accept_ack(
+                AskMatch::accept_say(
                     m.sender.clone(),
                     irc_format!(
                         "{} {} buzzed in first with 102!",
@@ -162,14 +161,13 @@ pub async fn tiebreaker_buzz_in(
                     ),
                 )
             } else {
-                Verdict::reject("Nope — try again! (17 * 6)".yellow())
+                AskMatch::reject("Nope — try again! (17 * 6)".yellow())
             }
         })
         .reply_timeout(Duration::from_secs(20))
         .no_timeout_message()
-        .settled()
+        .optional()
         .await
-        .map(Turn::into_reply)
 }
 
 /// Posts anonymous quips in `room`, collects `!pick <1..=N>` votes for `20s`, and breaks ties via DM buzz-in.

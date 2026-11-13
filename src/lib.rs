@@ -4,10 +4,10 @@
 //! - [`Bot`] manages the IRC connection pump, registration barrier, priority outbound flood scheduler,
 //!   and session-scoped [`Room`], [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
 //! - [`Ask`] and [`AskConfig`] provide ergonomic prompts with post-write-receipt reply clocks,
-//!   inline [`Verdict::reject`] validation, [`Verdict::accept_ack`] confirmations, countdown
-//!   warnings, and per-player timeout callouts.
+//!   inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations, countdown
+//!   warnings, per-player timeout callouts, and explicit [`Answer`] outcomes by default.
 //! - [`GameFutureExt`] composes any prompt or multi-step `async fn` with `.until()`, `.or_until()`,
-//!   `.with_timeout()`, `.optional()`, and `.settled()` ([`Turn`]).
+//!   `.with_timeout()`, `.none_on_timeout()`, and `.run_for()`.
 //!
 //! See `examples/` for standalone bot/API pattern showcases and the companion `minigames`
 //! workspace crate for 8 playable multi-player games (`blackjack`, `heist`, `cold_war`,
@@ -37,20 +37,19 @@
 //!                 player,
 //!                 irc_format!("{}: pick a number 1..=5!", player.nick().bold()),
 //!                 |m| match m.text.trim().parse::<u8>() {
-//!                     Ok(n @ 1..=5) => Verdict::accept(n),
-//!                     _ => Verdict::reject("Enter a number between 1 and 5!".yellow()),
+//!                     Ok(n @ 1..=5) => AskMatch::accept(n),
+//!                     _ => AskMatch::reject("Enter a number between 1 and 5!".yellow()),
 //!                 },
 //!             )
 //!             .reply_timeout(Duration::from_secs(15))
-//!             .settled()
 //!             .await?
 //!         {
-//!             Turn::Reply(3) => room.say("🎉 Spot on!".green().bold())?,
-//!             Turn::Reply(n) => room.say(format_args!("Nope ({n})—it was 3!"))?,
-//!             Turn::TimedOut => {
+//!             Answer::Ok(3) => room.say("🎉 Spot on!".green().bold())?,
+//!             Answer::Ok(n) => room.say(format_args!("Nope ({n})—it was 3!"))?,
+//!             Answer::TimedOut => {
 //!                 room.say(irc_format!("{} {}", player.nick().bold(), "ran out of time!".yellow()))?
 //!             }
-//!             Turn::Left { .. } | Turn::Unreachable { .. } => {}
+//!             Answer::Left { .. } | Answer::Unreachable { .. } => {}
 //!         }
 //!     }
 //!     Ok(())
@@ -86,22 +85,23 @@ pub mod fmt {
 }
 
 pub mod future {
+    pub use crate::ask::{AskOptional, AskRequired};
     pub use crate::supervise::{
-        MapOutput, Optional, OrUntil, RaceAll, RunFor, RunUntilDeadline, Settled, Until,
-        WithDeadline, WithTimeout,
+        MapOutput, NoneOnTimeout, OrUntil, RaceAll, RunFor, RunUntilDeadline, Until, WithDeadline,
+        WithTimeout,
     };
 }
 
 pub mod prelude {
     pub use crate::{
-        fmt::Colorize as _, irc_format, AskConfig, Bot, Breakout, ChatMessage, Error, Event,
-        ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result,
-        Room, Text, Turn, User, UserId, Verdict,
+        fmt::Colorize as _, irc_format, Answer, AskConfig, AskMatch, Bot, Breakout, ChatMessage,
+        Error, Event, ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind,
+        Outcome, Result, Room, Text, User, UserId,
     };
 }
 
 pub use crate::{
-    ask::{Ask, AskConfig, IntoVerdict, TimeoutCtx, Verdict},
+    ask::{Answer, Ask, AskConfig, AskMatch, IntoAskMatch, TimeoutCtx},
     bot::{Bot, BotConfig, ShutdownRequested},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
@@ -110,7 +110,7 @@ pub use crate::{
     inbox::{Inbox, InboxScope},
     message::{ChatMessage, Event, MessageKind, Target},
     room::{Member, Room},
-    supervise::{race_all, GameFutureExt, Outcome, Turn},
+    supervise::{race_all, GameFutureExt, Outcome},
     user::{ExclusiveDm, User, UserId},
 };
 
@@ -130,4 +130,6 @@ const _: () = {
     assert_send_sync::<ExclusiveDm>();
     assert_send_sync::<Huddle>();
     assert_send_sync::<Inbox>();
+    assert_send_sync::<Answer<()>>();
+    assert_send_sync::<AskMatch<()>>();
 };

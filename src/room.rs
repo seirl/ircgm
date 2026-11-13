@@ -5,7 +5,7 @@ use std::sync::Arc;
 use irc::proto::Command;
 use irc_colors::Text;
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoVerdict};
+use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::CaseMap;
 use crate::error::{Error, Result};
@@ -472,7 +472,7 @@ impl Room {
     pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoVerdict + 'a,
+        R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
         let caller = Location::caller();
@@ -496,7 +496,7 @@ impl Room {
     ) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoVerdict + 'a,
+        R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
         let caller = Location::caller();
@@ -513,7 +513,7 @@ impl Room {
     }
 
     /// Prompts the channel and accepts replies only from `users` (ignoring spectators and
-    /// failing with [`Error::UserLeft`] only if *every* listed user leaves/quits).
+    /// resolving with [`crate::Answer::Left`] only if *every* listed user leaves/quits).
     #[track_caller]
     pub fn ask_users<'a, I, U, F, R>(
         &'a self,
@@ -525,7 +525,7 @@ impl Room {
         I: IntoIterator<Item = U>,
         U: std::borrow::Borrow<User>,
         F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoVerdict + 'a,
+        R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
         let caller = Location::caller();

@@ -5,7 +5,7 @@
 //!    the outer `.until(...)` supervisor, immediately dropping the `ExclusiveDm` lock.
 //! 2. `resolve_simultaneous_triggers`: Two concurrent `user.ask(...)` futures run
 //!    inside `tokio::try_join!` — `ExclusiveDm` serializes them on the wire and
-//!    [`Verdict::accept_ack`] enqueues Prompt #1's confirmation *before* releasing
+//!    [`AskMatch::accept_say`] enqueues Prompt #1's confirmation *before* releasing
 //!    `ExclusiveDm` to Prompt #2.
 
 use std::time::Duration;
@@ -44,9 +44,9 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
             .ask(
                 "Bob played Steal on you! Play Block? (yes/no, 20s)",
                 |m| match m.text.trim() {
-                    "yes" => Verdict::accept_ack(true, "✔ Playing Block!".green()),
-                    "no" => Verdict::accept_ack(false, "✔ Allowing Steal.".yellow()),
-                    _ => Verdict::ignore(),
+                    "yes" => AskMatch::accept_say(true, "✔ Playing Block!".green()),
+                    "no" => AskMatch::accept_say(false, "✔ Allowing Steal.".yellow()),
+                    _ => AskMatch::ignore(),
                 }
             )
             .config(&prompt_cfg)
@@ -57,9 +57,9 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
                 "Discard a card (1, 2, or 3):",
                 |m| match m.text.trim().parse::<usize>() {
                     Ok(n @ 1..=3) => {
-                        Verdict::accept_ack(n, format_args!("✔ Discarded card #{n}.").green())
+                        AskMatch::accept_say(n, format_args!("✔ Discarded card #{n}.").green())
                     }
-                    _ => Verdict::reject("Please reply with 1, 2, or 3.".yellow()),
+                    _ => AskMatch::reject("Please reply with 1, 2, or 3.".yellow()),
                 }
             )
             .config(&prompt_cfg)

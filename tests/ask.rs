@@ -7,7 +7,7 @@ use ircgm::testing::{test_harness, test_harness_with};
 use ircgm::{BotConfig, DisconnectReason, Target};
 
 #[tokio::test(start_paused = true)]
-async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
+async fn ask_match_reject_warn_remaining_clear_warnings_and_closure_inference() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#lobby", &["Alice"]);
     server.settle().await;
@@ -25,8 +25,8 @@ async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
     let ask_task = tokio::spawn(async move {
         alice_c
             .ask("Pick 1..=3:", |m| match m.text.trim().parse::<u8>() {
-                Ok(n @ 1..=3) => Verdict::accept(n),
-                _ => Verdict::reject("Invalid! Pick 1, 2, or 3."),
+                Ok(n @ 1..=3) => AskMatch::accept(n),
+                _ => AskMatch::reject("Invalid! Pick 1, 2, or 3."),
             })
             .config(&cfg_c)
             .clear_warnings()
@@ -54,8 +54,8 @@ async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
     assert_eq!(server.take_messages_to("Alice"), vec!["5s left!"]);
 
     tokio::time::advance(Duration::from_secs(5)).await;
-    let err = ask_task.await.unwrap().unwrap_err();
-    assert!(matches!(err, Error::TimedOut));
+    let ans = ask_task.await.unwrap().unwrap();
+    assert_eq!(ans, Answer::TimedOut);
     assert_eq!(server.take_messages_to("Alice"), vec!["Time expired!"]);
 
     let alice_c2 = alice.clone();
@@ -76,11 +76,12 @@ async fn verdict_reject_warn_remaining_clear_warnings_and_closure_inference() {
     assert_eq!(server.take_messages_to("Alice"), vec!["10s inherited warn"]);
     server.dm("Alice", "yes");
     server.settle().await;
-    assert!(opt_task.await.unwrap().unwrap());
+    assert_eq!(opt_task.await.unwrap().unwrap(), Answer::Ok(true));
 }
 
 #[tokio::test(start_paused = true)]
-async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broadcasts_on_huddle() {
+async fn ask_match_accept_say_preserves_wire_order_across_queued_dm_asks_and_broadcasts_on_huddle()
+{
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#lobby", &["Alice", "Bob"]);
     server.settle().await;
@@ -89,15 +90,15 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
     let alice = bot.user("Alice").unwrap();
     let bob = bot.user("Bob").unwrap();
 
-    // 1. Two concurrent `alice.ask(...)` calls: `accept_ack` on Task 1 is enqueued while Task 1
+    // 1. Two concurrent `alice.ask(...)` calls: `accept_say` on Task 1 is enqueued while Task 1
     //    still holds `ExclusiveDm`, strictly preceding Task 2's prompt on the wire!
     let a1 = alice.clone();
     let t1 = tokio::spawn(async move {
         a1.ask("Prompt #1", |m| {
             if m.text.trim() == "first" {
-                Verdict::accept_ack("one", "✔ Ack #1")
+                AskMatch::accept_say("one", "✔ Ack #1")
             } else {
-                Verdict::ignore()
+                AskMatch::ignore()
             }
         })
         .await
@@ -108,9 +109,9 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
     let t2 = tokio::spawn(async move {
         a2.ask("Prompt #2", |m| {
             if m.text.trim() == "second" {
-                Verdict::accept_ack("two", "✔ Ack #2")
+                AskMatch::accept_say("two", "✔ Ack #2")
             } else {
-                Verdict::ignore()
+                AskMatch::ignore()
             }
         })
         .await
@@ -125,21 +126,21 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
         server.take_messages_to("Alice"),
         vec!["✔ Ack #1", "Prompt #2"]
     );
-    assert_eq!(t1.await.unwrap().unwrap(), "one");
+    assert_eq!(t1.await.unwrap().unwrap(), Answer::Ok("one"));
 
     server.dm("Alice", "second");
     server.settle().await;
     assert_eq!(server.take_messages_to("Alice"), vec!["✔ Ack #2"]);
-    assert_eq!(t2.await.unwrap().unwrap(), "two");
+    assert_eq!(t2.await.unwrap().unwrap(), Answer::Ok("two"));
 
-    // 2. `Room::ask` with `Verdict::accept_ack` acks in the channel:
+    // 2. `Room::ask` with `AskMatch::accept_say` acks in the channel:
     let r = room.clone();
     let r_task = tokio::spawn(async move {
         r.ask("Type !ready:", |m| {
             if m.is_cmd("!ready") {
-                Verdict::accept_ack(m.sender.nick(), format!("✔ {} is ready!", m.sender.nick()))
+                AskMatch::accept_say(m.sender.nick(), format!("✔ {} is ready!", m.sender.nick()))
             } else {
-                Verdict::ignore()
+                AskMatch::ignore()
             }
         })
         .await
@@ -148,10 +149,10 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
     let _ = server.take_messages_to("#lobby");
     server.chat("Bob", "#lobby", "!ready");
     server.settle().await;
-    assert_eq!(r_task.await.unwrap().unwrap(), "Bob");
+    assert_eq!(r_task.await.unwrap().unwrap(), Answer::Ok("Bob".into()));
     assert_eq!(server.take_messages_to("#lobby"), vec!["✔ Bob is ready!"]);
 
-    // 3. `Huddle::ask` with `Verdict::accept_ack` broadcasts the ack to all huddle members:
+    // 3. `Huddle::ask` with `AskMatch::accept_say` broadcasts the ack to all huddle members:
     let h_bot = bot.clone();
     let h_alice = alice.clone();
     let h_bob = bob.clone();
@@ -159,8 +160,8 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
         let mut huddle = h_bot.huddle([&h_alice, &h_bob]).await?;
         huddle
             .ask("Who takes watch?", |m| {
-                m.cmd_arg("!watch").map_or_else(Verdict::ignore, |who| {
-                    Verdict::accept_ack(
+                m.cmd_arg("!watch").map_or_else(AskMatch::ignore, |who| {
+                    AskMatch::accept_say(
                         who.to_owned(),
                         format!("✔ {} assigned {} to watch!", m.sender.nick(), who),
                     )
@@ -174,7 +175,7 @@ async fn verdict_accept_ack_preserves_wire_order_across_queued_dm_asks_and_broad
 
     server.dm("Alice", "!watch Bob");
     server.settle().await;
-    assert_eq!(h_task.await.unwrap().unwrap(), "Bob");
+    assert_eq!(h_task.await.unwrap().unwrap(), Answer::Ok("Bob".into()));
     assert_eq!(
         server.take_messages_to("Alice"),
         vec!["✔ Alice assigned Bob to watch!"]
@@ -232,8 +233,8 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     tokio::task::yield_now().await;
     let (r1, e1) = t1.await.unwrap();
     let (r2, e2) = t2.await.unwrap();
-    assert!(matches!(r1, Err(Error::TimedOut)));
-    assert!(matches!(r2, Err(Error::TimedOut)));
+    assert_eq!(r1.unwrap(), Answer::TimedOut);
+    assert_eq!(r2.unwrap(), Answer::TimedOut);
     assert_eq!(e1, Duration::from_secs(10));
     assert_eq!(e2, Duration::from_secs(10));
     assert!(
@@ -245,16 +246,16 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     server.dm("P4", "ok");
     server.settle().await;
     let (r4, e4) = t4.await.unwrap();
-    assert!(r4.is_ok());
+    assert_eq!(r4.unwrap(), Answer::Ok(()));
     assert_eq!(e4, Duration::from_secs(15));
     assert!(!t3.is_finished());
 
     tokio::time::advance(Duration::from_secs(3)).await;
     let (r3, e3) = t3.await.unwrap();
-    assert!(matches!(r3, Err(Error::TimedOut)));
+    assert_eq!(r3.unwrap(), Answer::TimedOut);
     assert_eq!(e3, Duration::from_secs(18));
 
-    // Single-timer override on `ExclusiveDm::ask`:
+    // Single-timer override on `ExclusiveDm::ask` + `.required()`:
     let (bot2, server2) = test_harness("GM");
     server2.complete_join("#r", &["Alice"]);
     server2.settle().await;
@@ -278,10 +279,12 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
         let a1 = dm
             .ask("120s prompt", |m| Some(m.text.clone()))
             .reply_timeout(Duration::from_secs(120))
+            .required()
             .await?;
         let a2 = dm
             .ask("unbounded prompt", |m| Some(m.text.clone()))
             .no_reply_timeout()
+            .required()
             .await?;
         Ok::<_, Error>((a1, a2))
     };
@@ -291,7 +294,7 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     assert_eq!(a2, "after_400s");
     drop(dm);
 
-    // Combinator table: `optional()`, `settled()`, and `with_timeout()`
+    // Combinator table: default `Answer`, `optional()`, `required()`, and `with_timeout().none_on_timeout()`
     let (bot3, mut server3) = test_harness("GM");
     server3.complete_join("#tab", &["Alice"]);
     server3.settle().await;
@@ -317,12 +320,8 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
         vec!["Q1", "Timeout fired!"]
     );
 
-    let r = room_msg
-        .ask("Q2", |_| Option::<()>::None)
-        .settled()
-        .await
-        .unwrap();
-    assert_eq!(r, Turn::TimedOut);
+    let r = room_msg.ask("Q2", |_| Option::<()>::None).await.unwrap();
+    assert_eq!(r, Answer::TimedOut);
     assert_eq!(
         server3.take_messages_to("#tab"),
         vec!["Q2", "Timeout fired!"]
@@ -340,23 +339,27 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     let r = room_msg
         .ask("Q4", |_| Option::<()>::None)
         .with_timeout(Duration::from_secs(3))
-        .optional()
+        .none_on_timeout()
         .await
         .unwrap();
     assert_eq!(r, None);
     assert_eq!(server3.take_messages_to("#tab"), vec!["Q4"]);
 
-    let r = room_silent
-        .ask("Q5", |_| Option::<()>::None)
-        .settled()
-        .await
-        .unwrap();
-    assert_eq!(r, Turn::TimedOut);
+    let r = room_silent.ask("Q5", |_| Option::<()>::None).await.unwrap();
+    assert_eq!(r, Answer::TimedOut);
     assert_eq!(server3.take_messages_to("#tab"), vec!["Q5"]);
+
+    let r_req = room_silent
+        .ask("Q6", |_| Option::<()>::None)
+        .required()
+        .await
+        .unwrap_err();
+    assert!(matches!(r_req, Error::TimedOut));
+    assert_eq!(server3.take_messages_to("#tab"), vec!["Q6"]);
 }
 
 #[tokio::test(start_paused = true)]
-async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
+async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#r", &["Alice", "Bob", "Cara"]);
     server.settle().await;
@@ -382,7 +385,6 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
             .ask_user(&a_turn, "Alice: hit or stand?", |m| {
                 (m.text.trim() == "hit").then_some(())
             })
-            .settled()
             .await
     });
     tokio::task::yield_now().await;
@@ -395,7 +397,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
 
     tokio::time::advance(Duration::from_secs(30)).await;
     let outcome = turn_task.await.unwrap().unwrap();
-    assert_eq!(outcome, Turn::TimedOut);
+    assert_eq!(outcome, Answer::TimedOut);
     assert_eq!(
         server.take_messages_to("#r"),
         vec!["Alice2 took too long (30s)!"]
@@ -406,7 +408,6 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
     let part_task = tokio::spawn(async move {
         r_part
             .ask_user(&a_part, "Again?", |m| Some(m.text.clone()))
-            .settled()
             .await
     });
     tokio::task::yield_now().await;
@@ -417,7 +418,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
     let part_out = part_task.await.unwrap().unwrap();
     assert_eq!(
         part_out,
-        Turn::Left {
+        Answer::Left {
             nick: "Alice2".into(),
             reason: Some("gotta go".into()),
         }
@@ -428,7 +429,6 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
     let kick_task = tokio::spawn(async move {
         r_kick
             .ask_user(&c_kick, "Cara?", |m| Some(m.text.clone()))
-            .settled()
             .await
     });
     tokio::task::yield_now().await;
@@ -439,7 +439,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
     let kick_out = kick_task.await.unwrap().unwrap();
     assert_eq!(
         kick_out,
-        Turn::Left {
+        Answer::Left {
             nick: "Cara".into(),
             reason: Some("removed".into()),
         }
@@ -447,7 +447,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_settled() {
 }
 
 #[tokio::test]
-async fn settled_unreachable_pm_block_and_fatal_disconnect_propagation() {
+async fn answer_unreachable_pm_block_optional_required_and_fatal_disconnect_propagation() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#game", &["P1", "P2", "P3"]);
     server.settle().await;
@@ -459,11 +459,8 @@ async fn settled_unreachable_pm_block_and_fatal_disconnect_propagation() {
     let players = vec![p1.clone(), p2.clone(), p3.clone()];
     let all_turns = tokio::spawn(async move {
         try_join_all(players.into_iter().map(|p| async move {
-            let t = p
-                .ask("Secret prompt!", |m| Some(m.text.clone()))
-                .settled()
-                .await?;
-            Ok::<_, Error>((p.nick(), t))
+            let ans = p.ask("Secret prompt!", |m| Some(m.text.clone())).await?;
+            Ok::<_, Error>((p.nick(), ans))
         }))
         .await
     });
@@ -480,23 +477,51 @@ async fn settled_unreachable_pm_block_and_fatal_disconnect_propagation() {
     server.settle().await;
 
     let results = all_turns.await.unwrap().unwrap();
-    assert_eq!(results[0], ("P1".into(), Turn::Reply("my quip".into())));
+    assert_eq!(results[0], ("P1".into(), Answer::Ok("my quip".into())));
     assert!(matches!(
         results[1].1,
-        Turn::Unreachable { ref target, code: 486, .. } if target == "P2"
+        Answer::Unreachable { ref nick, code: 486, .. } if nick == "P2"
     ));
     assert!(matches!(
         results[2].1,
-        Turn::Unreachable { ref target, code: 716, .. } if target == "P3"
+        Answer::Unreachable { ref nick, code: 716, .. } if nick == "P3"
+    ));
+
+    // `.optional()` maps `Unreachable` to `Ok(None)`, while `.required()` promotes it to `Err(UserUnreachable)`:
+    let p2_opt = p2.clone();
+    let opt_unreach = tokio::spawn(async move {
+        p2_opt
+            .ask("Optional?", |m| Some(m.text.clone()))
+            .optional()
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("P2");
+    server.send_line(":irc.srv 486 GM P2 :blocked\r\n");
+    server.settle().await;
+    assert_eq!(opt_unreach.await.unwrap().unwrap(), None);
+
+    let p3_req = p3.clone();
+    let req_unreach = tokio::spawn(async move {
+        p3_req
+            .ask("Required?", |m| Some(m.text.clone()))
+            .required()
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    let _ = server.take_messages_to("P3");
+    server.send_line(":irc.srv 716 GM P3 :blocked\r\n");
+    server.settle().await;
+    assert!(matches!(
+        req_unreach.await.unwrap(),
+        Err(Error::UserUnreachable { ref nick, code: 716, .. }) if nick == "P3"
     ));
 
     let p1_disc = p1.clone();
-    let disc_task = tokio::spawn(async move {
-        p1_disc
-            .ask("Still connected?", |m| Some(m.text.clone()))
-            .settled()
-            .await
-    });
+    let disc_task =
+        tokio::spawn(async move { p1_disc.ask("Still connected?", |m| Some(m.text.clone())).await });
     tokio::task::yield_now().await;
     server.disconnect();
 
@@ -516,11 +541,19 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
     let alice = bot.user("Alice").unwrap();
     let bob = bot.user("Bob").unwrap();
 
-    let absent_err = room
+    let absent_ans = room
         .ask_user(&bob, "Bob are you here?", |_| Some(()))
         .await
+        .unwrap();
+    assert!(matches!(absent_ans, Answer::Left { ref nick, .. } if nick == "Bob"));
+    assert!(server.try_recv_sent().is_none());
+
+    let absent_req_err = room
+        .ask_user(&bob, "Bob required?", |_| Some(()))
+        .required()
+        .await
         .unwrap_err();
-    assert!(matches!(absent_err, Error::UserLeft { ref nick, .. } if nick == "Bob"));
+    assert!(matches!(absent_req_err, Error::UserLeft { ref nick, .. } if nick == "Bob"));
     assert!(server.try_recv_sent().is_none());
 
     let mut raw_in = room.inbox();
@@ -543,7 +576,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
     ));
 
     let r_404 = room.clone();
-    let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).settled().await });
+    let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).await });
     assert_eq!(server.recv_message_to("#room").await, "Hello?");
     server.send_line(":irc.srv 404 GM #room :Cannot send to channel (+m)\r\n");
     server.settle().await;
@@ -565,7 +598,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
 
     for code in [486u16, 492, 531, 716] {
         let a = alice.clone();
-        let t = tokio::spawn(async move { a.ask("Ping?", |_| Some(())).settled().await });
+        let t = tokio::spawn(async move { a.ask("Ping?", |_| Some(())).await });
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         let _ = server.take_messages_to("Alice");
@@ -573,7 +606,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
         server.settle().await;
         let out = t.await.unwrap().unwrap();
         assert!(
-            matches!(out, Turn::Unreachable { ref target, code: c, .. } if target == "Alice" && c == code),
+            matches!(out, Answer::Unreachable { ref nick, code: c, .. } if nick == "Alice" && c == code),
             "expected Unreachable({code}), got {out:?}"
         );
     }
@@ -604,11 +637,7 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     // 1. `alice.ask` sends to `Alice`, `Alice` renames to `Alicia` in flight, server bounces `401 Alice`
     //    -> `Ask` automatically re-sends `"First prompt?"` to `"Alicia"` and accepts her reply!
     let a1 = alice.clone();
-    let ask1 = tokio::spawn(async move {
-        a1.ask("First prompt?", |m| Some(m.text.clone()))
-            .settled()
-            .await
-    });
+    let ask1 = tokio::spawn(async move { a1.ask("First prompt?", |m| Some(m.text.clone())).await });
     assert_eq!(server.recv_message_to("Alice").await, "First prompt?");
 
     server.rename_user("Alice", "Alicia");
@@ -618,7 +647,7 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     server.settle().await;
 
     let out1 = ask1.await.unwrap().unwrap();
-    assert_eq!(out1, Turn::Reply("renamed and replied!".into()));
+    assert_eq!(out1, Answer::Ok("renamed and replied!".into()));
     assert!(alice.is_online());
     assert_eq!(alice.nick(), "Alicia");
 
@@ -634,10 +663,10 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     server.send_line(":irc.srv 716 GM Alice :callerid\r\n");
     server.dm("Alicia", "got it!");
     server.settle().await;
-    assert_eq!(ask2.await.unwrap().unwrap(), "got it!");
+    assert_eq!(ask2.await.unwrap().unwrap(), Answer::Ok("got it!".into()));
 
     // 3. `Huddle::ask` where `Wolf1` renames in flight (`401 Wolf1` -> re-sends to `AlphaWolf`) while
-    //    `Wolf2` bounces `716`, then `AlphaWolf` also bounces `716` -> `UserUnreachable`:
+    //    `Wolf2` bounces `716`, then `AlphaWolf` also bounces `716` -> `Answer::Unreachable`:
     let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
     let huddle_fut = pack.ask("Target?", |m| Some(m.text.clone()));
     let drive_huddle = async {
@@ -653,6 +682,6 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     let (huddle_res, ()) = tokio::join!(huddle_fut, drive_huddle);
     assert!(matches!(
         huddle_res,
-        Err(Error::UserUnreachable { ref nick, code: 716, .. }) if nick == "AlphaWolf"
+        Ok(Answer::Unreachable { ref nick, code: 716, .. }) if nick == "AlphaWolf"
     ));
 }

@@ -17,9 +17,9 @@
 //!   to one [`User`] inside a busy public channel.
 //! - **Timed lobby seat collection ([`ircgm::GameFutureExt::run_for`]):** Runs a `20s` join loop
 //!   that exits early at 4 players with zero `Ok::<_, Error>(())` turbofish ceremony.
-//! - **Fault-isolated player turns ([`ircgm::GameFutureExt::settled`] / [`Turn`]):** Distinguishes
-//!   [`Turn::Reply`], [`Turn::TimedOut`] (auto-stand), and [`Turn::Left`] (`PART` / `KICK` / `QUIT`
-//!   mid-hand folds cleanly without aborting the table).
+//! - **Fault-isolated player turns ([`Answer`]):** Default [`ircgm::Ask`] awaiting resolves to
+//!   `Result<Answer<Move>>`, distinguishing [`Answer::Ok`], [`Answer::TimedOut`] (auto-stand), and
+//!   [`Answer::Left`] (`PART` / `KICK` / `QUIT` mid-hand folds cleanly without aborting the table).
 //! - **Live `/nick`-aware timeout messages ([`ircgm::TimeoutCtx`]):** Renders each player's *current*
 //!   nickname if they renamed mid-turn before their `30s` clock expired.
 
@@ -89,6 +89,7 @@ pub async fn run_round_with_shoe(
         "Seated players: anyone type `!deal` to cut the deck!",
         |m| m.is_cmd("!deal").then_some(()),
     )
+    .required()
     .await?;
 
     let mut dealer = vec![draw_card(&mut shoe), draw_card(&mut shoe)];
@@ -117,21 +118,20 @@ pub async fn run_round_with_shoe(
                     |m| {
                         let word = m.text.trim();
                         if word.eq_ignore_ascii_case("hit") {
-                            Verdict::accept(Move::Hit)
+                            AskMatch::accept(Move::Hit)
                         } else if word.eq_ignore_ascii_case("stand") {
-                            Verdict::accept_ack(
+                            AskMatch::accept_say(
                                 Move::Stand,
                                 irc_format!("{} stands on {total}.", player.nick().bold()),
                             )
                         } else {
-                            Verdict::ignore()
+                            AskMatch::ignore()
                         }
                     },
                 )
-                .settled()
                 .await?
             {
-                Turn::Reply(Move::Hit) => {
+                Answer::Ok(Move::Hit) => {
                     let card = draw_card(&mut shoe);
                     cards.push(card);
                     room.say(irc_format!(
@@ -140,15 +140,15 @@ pub async fn run_round_with_shoe(
                         hand_value(&cards),
                     ))?;
                 }
-                Turn::Reply(Move::Stand) | Turn::TimedOut => {
+                Answer::Ok(Move::Stand) | Answer::TimedOut => {
                     standing_hands.push((player.clone(), total));
                     break;
                 }
-                Turn::Left { nick, .. } => {
+                Answer::Left { nick, .. } => {
                     room.say(irc_format!("{} left the table—hand folded.", nick.bold()))?;
                     break;
                 }
-                Turn::Unreachable { .. } => break,
+                Answer::Unreachable { .. } => break,
             }
         }
     }

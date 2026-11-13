@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoVerdict};
+use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::Inbox;
@@ -268,7 +268,7 @@ impl Huddle {
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoVerdict + 'a,
+        R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
         let mut base_cfg = (*self.ask_config).clone();
@@ -291,7 +291,7 @@ impl Huddle {
     ) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoVerdict + 'a,
+        R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
         let mut base_cfg = (*self.ask_config).clone();

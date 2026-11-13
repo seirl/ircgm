@@ -23,72 +23,186 @@ use crate::user::{ExclusiveDm, User, UserId};
 mod private {
     pub trait Sealed {}
     impl<T> Sealed for Option<T> {}
-    impl<T> Sealed for super::Verdict<T> {}
+    impl<T> Sealed for super::AskMatch<T> {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum VerdictInner<T> {
+enum AskMatchInner<T> {
     Accept(T, Option<Text>),
     Reject(Text),
     Ignore,
 }
 
-/// Outcome returned by [`Ask`] matchers that want to send inline acknowledgment or
+/// Outcome returned by [`Ask`] matchers that want to send an inline confirmation or
 /// validation feedback without restarting the reply timer or leaving the `Ask` loop.
 ///
-/// Construct with [`Verdict::accept`], [`Verdict::accept_ack`], [`Verdict::reject`], or
-/// [`Verdict::ignore`].
+/// Construct with [`AskMatch::accept`], [`AskMatch::accept_say`], [`AskMatch::reject`], or
+/// [`AskMatch::ignore`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Verdict<T>(VerdictInner<T>);
+pub struct AskMatch<T>(AskMatchInner<T>);
 
-impl<T> Verdict<T> {
-    /// Accepts `val` silently and resolves the [`Ask`] with `Ok(val)`.
+impl<T> AskMatch<T> {
+    /// Accepts `val` silently and resolves the [`Ask`] with [`Answer::Ok`].
     pub fn accept(val: T) -> Self {
-        Self(VerdictInner::Accept(val, None))
+        Self(AskMatchInner::Accept(val, None))
     }
 
     /// Accepts `val`, immediately enqueues `msg` to the prompt's target (in-channel for
     /// [`Room`], in-DM while [`ExclusiveDm`] is still held for [`User`]/[`ExclusiveDm`], or
-    /// broadcast to all members for [`Huddle`]), and resolves the [`Ask`] with `Ok(val)`.
-    pub fn accept_ack(val: T, msg: impl Into<Text>) -> Self {
-        Self(VerdictInner::Accept(val, Some(msg.into())))
+    /// broadcast to all members for [`Huddle`]), and resolves the [`Ask`] with [`Answer::Ok`].
+    pub fn accept_say(val: T, msg: impl Into<Text>) -> Self {
+        Self(AskMatchInner::Accept(val, Some(msg.into())))
     }
 
     /// Sends validation feedback `msg` to the responder and keeps waiting without resetting the
     /// reply timer.
     pub fn reject(msg: impl Into<Text>) -> Self {
-        Self(VerdictInner::Reject(msg.into()))
+        Self(AskMatchInner::Reject(msg.into()))
     }
 
     /// Silently ignores this message and keeps waiting.
     pub const fn ignore() -> Self {
-        Self(VerdictInner::Ignore)
+        Self(AskMatchInner::Ignore)
     }
 }
 
-/// Sealed trait implemented for both `Option<T>` (`Some(v) -> Verdict::accept(v)`,
-/// `None -> Verdict::ignore()`) and [`Verdict<T>`].
-pub trait IntoVerdict: private::Sealed {
+/// Sealed trait implemented for both `Option<T>` (`Some(v) -> AskMatch::accept(v)`,
+/// `None -> AskMatch::ignore()`) and [`AskMatch<T>`].
+pub trait IntoAskMatch: private::Sealed {
     type Output;
-    fn into_verdict(self) -> Verdict<Self::Output>;
+    fn into_ask_match(self) -> AskMatch<Self::Output>;
 }
 
-impl<T> IntoVerdict for Option<T> {
+impl<T> IntoAskMatch for Option<T> {
     type Output = T;
 
-    fn into_verdict(self) -> Verdict<T> {
+    fn into_ask_match(self) -> AskMatch<T> {
         match self {
-            Some(v) => Verdict::accept(v),
-            None => Verdict::ignore(),
+            Some(v) => AskMatch::accept(v),
+            None => AskMatch::ignore(),
         }
     }
 }
 
-impl<T> IntoVerdict for Verdict<T> {
+impl<T> IntoAskMatch for AskMatch<T> {
     type Output = T;
 
-    fn into_verdict(self) -> Verdict<T> {
+    fn into_ask_match(self) -> AskMatch<T> {
         self
+    }
+}
+
+/// Outcome of an [`Ask`] prompt, separating normal player/prompt outcomes (`Ok`, `TimedOut`,
+/// `Left`, `Unreachable`) from fatal session or channel [`Error`]s.
+///
+/// Use [`Ask::optional`] (or [`Answer::ok`]) when any non-answer should map to `None`, or
+/// [`Ask::required`] (or [`Answer::into_result`]) when non-answers should fail with `Err`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer<T> {
+    Ok(T),
+    TimedOut,
+    Left {
+        nick: String,
+        reason: Option<String>,
+    },
+    Unreachable {
+        nick: String,
+        code: u16,
+        message: String,
+    },
+}
+
+impl<T> Answer<T> {
+    /// Converts `Err(Error::TimedOut | Error::UserLeft | Error::UserUnreachable)` into
+    /// `Ok(Answer::...)`, preserving fatal session/channel/input errors as `Err`.
+    pub fn from_result(res: Result<T>) -> Result<Self> {
+        match res {
+            Ok(val) => Ok(Answer::Ok(val)),
+            Err(Error::TimedOut) => Ok(Answer::TimedOut),
+            Err(Error::UserLeft { nick, reason }) => Ok(Answer::Left { nick, reason }),
+            Err(Error::UserUnreachable {
+                nick,
+                code,
+                message,
+            }) => Ok(Answer::Unreachable {
+                nick,
+                code,
+                message,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inverse of [`Answer::from_result`]: promotes `TimedOut`, `Left`, and `Unreachable` into
+    /// `Err(Error::...)`.
+    pub fn into_result(self) -> Result<T> {
+        match self {
+            Answer::Ok(val) => Ok(val),
+            Answer::TimedOut => Err(Error::TimedOut),
+            Answer::Left { nick, reason } => Err(Error::UserLeft { nick, reason }),
+            Answer::Unreachable {
+                nick,
+                code,
+                message,
+            } => Err(Error::UserUnreachable {
+                nick,
+                code,
+                message,
+            }),
+        }
+    }
+
+    /// Returns `Some(val)` on [`Answer::Ok`], or `None` on `TimedOut | Left | Unreachable`.
+    pub fn ok(self) -> Option<T> {
+        match self {
+            Answer::Ok(val) => Some(val),
+            Answer::TimedOut | Answer::Left { .. } | Answer::Unreachable { .. } => None,
+        }
+    }
+
+    /// Borrows `Some(&val)` on [`Answer::Ok`], or `None` otherwise.
+    pub fn as_ok(&self) -> Option<&T> {
+        match self {
+            Answer::Ok(val) => Some(val),
+            Answer::TimedOut | Answer::Left { .. } | Answer::Unreachable { .. } => None,
+        }
+    }
+
+    /// Extracts `val` from [`Answer::Ok`], panicking if the prompt did not receive an answer.
+    #[track_caller]
+    pub fn unwrap(self) -> T {
+        match self {
+            Answer::Ok(val) => val,
+            Answer::TimedOut => panic!("called `Answer::unwrap()` on `Answer::TimedOut`"),
+            Answer::Left { nick, reason } => {
+                panic!(
+                    "called `Answer::unwrap()` on `Answer::Left {{ nick: {nick:?}, reason: {reason:?} }}`"
+                )
+            }
+            Answer::Unreachable {
+                nick,
+                code,
+                message,
+            } => panic!(
+                "called `Answer::unwrap()` on `Answer::Unreachable {{ nick: {nick:?}, code: {code}, message: {message:?} }}`"
+            ),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Answer::Ok(_))
+    }
+
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, Answer::TimedOut)
+    }
+
+    pub fn is_left(&self) -> bool {
+        matches!(self, Answer::Left { .. })
+    }
+
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Answer::Unreachable { .. })
     }
 }
 
@@ -433,12 +547,17 @@ enum AskState<'a, F, O> {
 
 /// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`Room::ask_users`],
 /// [`User::ask`], [`ExclusiveDm::ask`], and [`Huddle::ask`].
+///
+/// By default, awaiting an `Ask` resolves to `Result<Answer<T>>` so timeouts, player departures,
+/// and DM bounces must be handled explicitly while broken sessions/channels propagate via `?`.
+/// Call [`Ask::optional`] to map any non-answer to `Ok(None)`, or [`Ask::required`] to promote
+/// non-answers into `Err(Error::...)`.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Ask<'a, F, R: IntoVerdict> {
+pub struct Ask<'a, F, R: IntoAskMatch> {
     state: AskState<'a, F, R::Output>,
 }
 
-impl<'a, F, R: IntoVerdict> Ask<'a, F, R> {
+impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
     pub(crate) fn new(
         source: AskSource<'a>,
         base_cfg: AskConfig,
@@ -526,6 +645,18 @@ impl<'a, F, R: IntoVerdict> Ask<'a, F, R> {
     pub fn no_timeout_message(self) -> Self {
         self.map_cfg(AskConfig::no_timeout_message)
     }
+
+    /// Collapses non-answers (`TimedOut`, `Left`, `Unreachable`) into `Ok(None)` and
+    /// `Answer::Ok(val)` into `Ok(Some(val))`, preserving session/channel errors as `Err`.
+    pub fn optional(self) -> AskOptional<'a, F, R> {
+        AskOptional { ask: self }
+    }
+
+    /// Promotes non-answers (`TimedOut`, `Left`, `Unreachable`) into `Err(Error::...)` so `?`
+    /// short-circuits sequential multi-step prompts.
+    pub fn required(self) -> AskRequired<'a, F, R> {
+        AskRequired { ask: self }
+    }
 }
 
 fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
@@ -610,7 +741,7 @@ async fn await_ask_loop<'a, F, R>(
 ) -> Result<R::Output>
 where
     F: FnMut(&ChatMessage) -> R + Send,
-    R: IntoVerdict,
+    R: IntoAskMatch,
 {
     receipt.wait().await;
     let write_completed_at = Instant::now();
@@ -628,8 +759,8 @@ where
             }
             err
         },
-        |msg| match matcher(msg).into_verdict().0 {
-            VerdictInner::Accept(val, ack) => {
+        |msg| match matcher(msg).into_ask_match().0 {
+            AskMatchInner::Accept(val, ack) => {
                 tracing::debug!(
                     sender = %msg.nick,
                     seq = msg.seq,
@@ -641,11 +772,11 @@ where
                 }
                 Some(val)
             }
-            VerdictInner::Reject(feedback) => {
+            AskMatchInner::Reject(feedback) => {
                 sender.send_reject(&msg.sender, feedback);
                 None
             }
-            VerdictInner::Ignore => {
+            AskMatchInner::Ignore => {
                 sender.handle_ignore(msg);
                 None
             }
@@ -707,7 +838,7 @@ async fn run_ask<'a, F, R>(
 ) -> Result<R::Output>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoVerdict + 'a,
+    R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
     if prompt.is_empty() {
@@ -831,19 +962,16 @@ where
     }
 }
 
-impl<'a, F, R> Future for Ask<'a, F, R>
+impl<'a, F, R> Ask<'a, F, R>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoVerdict + 'a,
+    R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    type Output = Result<R::Output>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if matches!(this.state, AskState::Unstarted(_)) {
+    fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<R::Output>> {
+        if matches!(self.state, AskState::Unstarted(_)) {
             let AskState::Unstarted(unstarted) =
-                std::mem::replace(&mut this.state, AskState::Done)
+                std::mem::replace(&mut self.state, AskState::Done)
             else {
                 unreachable!()
             };
@@ -855,20 +983,77 @@ where
             } = *unstarted;
             let span = make_span(&cfg, &source);
             let fut = run_ask(cfg, source, prompt, matcher).instrument(span);
-            this.state = AskState::Running(Box::pin(fut));
+            self.state = AskState::Running(Box::pin(fut));
         }
 
-        match &mut this.state {
+        match &mut self.state {
             AskState::Running(fut) => {
                 let poll_res = fut.as_mut().poll(cx);
                 if poll_res.is_ready() {
-                    this.state = AskState::Done;
+                    self.state = AskState::Done;
                 }
                 poll_res
             }
             AskState::Done => panic!("Ask polled after completion"),
             AskState::Unstarted(_) => unreachable!(),
         }
+    }
+}
+
+impl<'a, F, R> Future for Ask<'a, F, R>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    type Output = Result<Answer<R::Output>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut().poll_raw(cx) {
+            Poll::Ready(res) => Poll::Ready(Answer::from_result(res)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future returned by [`Ask::optional`], resolving to `Result<Option<T>>`.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct AskOptional<'a, F, R: IntoAskMatch> {
+    ask: Ask<'a, F, R>,
+}
+
+impl<'a, F, R> Future for AskOptional<'a, F, R>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    type Output = Result<Option<R::Output>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut().ask.poll_raw(cx) {
+            Poll::Ready(res) => Poll::Ready(Answer::from_result(res).map(Answer::ok)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future returned by [`Ask::required`], resolving to `Result<T>`.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct AskRequired<'a, F, R: IntoAskMatch> {
+    ask: Ask<'a, F, R>,
+}
+
+impl<'a, F, R> Future for AskRequired<'a, F, R>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    type Output = Result<R::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().ask.poll_raw(cx)
     }
 }
 

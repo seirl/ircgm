@@ -87,7 +87,7 @@ async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock
     let res = empty.ask("Anyone here?", |m| Some(m.text.clone())).await;
     assert!(matches!(res, Err(Error::InvalidInput(_))));
 
-    // 2. Huddle whose candidates were offline preserves real quitter nick in `UserLeft`:
+    // 2. Huddle whose candidates were offline preserves real quitter nick in `Answer::Left`:
     let gone = bot.user("ghostwolf").unwrap();
     server.quit_user("ghostwolf", Some("away"));
     server.settle().await;
@@ -95,7 +95,7 @@ async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock
     assert!(all_offline.is_empty());
     assert!(matches!(
         all_offline.ask("Anyone here?", |m| Some(m.text.clone())).await,
-        Err(Error::UserLeft { ref nick, ref reason }) if nick == "ghostwolf" && reason.as_deref() == Some("away")
+        Ok(crate::Answer::Left { ref nick, ref reason }) if nick == "ghostwolf" && reason.as_deref() == Some("away")
     ));
 
     // 3. `has_user`, `dm_mut`, and `ask_user` borrow the already-locked guard without self-deadlock:
@@ -116,7 +116,7 @@ async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock
         server.settle().await;
     };
     let (ans, ()) = tokio::join!(ask_member, drive);
-    assert_eq!(ans.unwrap(), "confirmed");
+    assert_eq!(ans.unwrap().unwrap(), "confirmed");
 
     assert!(matches!(
         pack.ask_user(&outsider, "Hello?", |m| Some(m.text.clone())).await,

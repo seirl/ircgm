@@ -156,7 +156,7 @@ async fn oneshot_non_backlog_and_inbox_dms_filtering() {
     let res = fresh_in
         .wait_cmd("!heist")
         .with_timeout(Duration::from_millis(20))
-        .optional()
+        .none_on_timeout()
         .await
         .unwrap();
     assert!(res.is_none());
@@ -232,7 +232,10 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     server.send_line(":Alice!u@h NOTICE #lobby :via_notice\r\n");
     server.settle().await;
 
-    assert_eq!(t2.await.unwrap().unwrap(), MessageKind::Notice);
+    assert_eq!(
+        t2.await.unwrap().unwrap(),
+        Answer::Ok(MessageKind::Notice)
+    );
     assert_eq!(t1.await.unwrap().unwrap(), None);
 }
 

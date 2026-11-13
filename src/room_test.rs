@@ -130,10 +130,11 @@ async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_playe
     server.part_user("alice", "#table", Some("out"));
     server.chat("bob", "#table", "!deal");
 
-    let dealer = ask_task.await.unwrap().unwrap();
+    let dealer = ask_task.await.unwrap().unwrap().unwrap();
     assert_eq!(dealer, "bob");
 
-    // Once `bob` also parts, `inbox_users` and `ask_users` fail with `Error::UserLeft`:
+    // Once `bob` also parts, `inbox_users` fails with `Error::UserLeft` and `ask_users` resolves
+    // to `Answer::Left`:
     let mut sub_inbox = room.inbox_users([&alice, &bob]);
     server.part_user("bob", "#table", Some("cashout"));
     match sub_inbox.next_chat().await {
@@ -147,7 +148,7 @@ async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_playe
     assert!(matches!(
         room.ask_users([&alice, &bob], "Anyone left?", |m| Some(m.text.clone()))
             .await,
-        Err(Error::UserLeft { .. })
+        Ok(crate::Answer::Left { .. })
     ));
 }
 

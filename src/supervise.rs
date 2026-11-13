@@ -13,52 +13,6 @@ pub enum Outcome<T, S> {
     Stopped(S),
 }
 
-/// Per-player outcome for multi-player turns, races, and votes where a single player timing out,
-/// leaving, or blocking DMs (`+g` / `+R`) should be handled locally without aborting the whole game.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Turn<T> {
-    Reply(T),
-    TimedOut,
-    Left {
-        nick: String,
-        reason: Option<String>,
-    },
-    Unreachable {
-        target: String,
-        code: u16,
-        message: String,
-    },
-}
-
-impl<T> Turn<T> {
-    /// Returns `Some(val)` on `Reply(val)`, or `None` on `TimedOut | Left { .. } | Unreachable { .. }`.
-    pub fn into_reply(self) -> Option<T> {
-        match self {
-            Turn::Reply(val) => Some(val),
-            Turn::TimedOut | Turn::Left { .. } | Turn::Unreachable { .. } => None,
-        }
-    }
-
-    pub fn as_reply(&self) -> Option<&T> {
-        match self {
-            Turn::Reply(val) => Some(val),
-            Turn::TimedOut | Turn::Left { .. } | Turn::Unreachable { .. } => None,
-        }
-    }
-
-    pub fn is_timed_out(&self) -> bool {
-        matches!(self, Turn::TimedOut)
-    }
-
-    pub fn is_left(&self) -> bool {
-        matches!(self, Turn::Left { .. })
-    }
-
-    pub fn is_unreachable(&self) -> bool {
-        matches!(self, Turn::Unreachable { .. })
-    }
-}
-
 /// Races a runtime-sized `0..=N` collection of futures yielding `F::Output` in registration order.
 ///
 /// Unlike `futures::future::select_all`, an empty iterator **never panics**—it stays
@@ -272,13 +226,13 @@ where
     }
 }
 
-/// Future returned by [`GameFutureExt::optional`].
+/// Future returned by [`GameFutureExt::none_on_timeout`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Optional<F> {
+pub struct NoneOnTimeout<F> {
     fut: Pin<Box<F>>,
 }
 
-impl<F, T> Future for Optional<F>
+impl<F, T> Future for NoneOnTimeout<F>
 where
     F: Future<Output = Result<T>>,
 {
@@ -288,40 +242,6 @@ where
         match self.fut.as_mut().poll(cx) {
             Poll::Ready(Ok(val)) => Poll::Ready(Ok(Some(val))),
             Poll::Ready(Err(Error::TimedOut)) => Poll::Ready(Ok(None)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Future returned by [`GameFutureExt::settled`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Settled<F> {
-    fut: Pin<Box<F>>,
-}
-
-impl<F, T> Future for Settled<F>
-where
-    F: Future<Output = Result<T>>,
-{
-    type Output = Result<Turn<T>>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(val)) => Poll::Ready(Ok(Turn::Reply(val))),
-            Poll::Ready(Err(Error::TimedOut)) => Poll::Ready(Ok(Turn::TimedOut)),
-            Poll::Ready(Err(Error::UserLeft { nick, reason })) => {
-                Poll::Ready(Ok(Turn::Left { nick, reason }))
-            }
-            Poll::Ready(Err(Error::UserUnreachable {
-                nick,
-                code,
-                message,
-            })) => Poll::Ready(Ok(Turn::Unreachable {
-                target: nick,
-                code,
-                message,
-            })),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -370,11 +290,11 @@ where
     }
 }
 
-/// Supervision and pure result-mapping combinators for game futures.
+/// Cancellation and timer combinators for game futures.
 ///
 /// Named `GameFutureExt` so importing it never collides with `futures::FutureExt`.
-/// All timeout and result-mapping combinators (`with_timeout`, `with_deadline`, `run_for`,
-/// `run_until_deadline`, `optional`, `settled`) are **pure wrappers** that never alter `Ask` messaging.
+/// All timer combinators (`with_timeout`, `with_deadline`, `none_on_timeout`, `run_for`,
+/// `run_until_deadline`) are **pure wrappers** that never alter `Ask` messaging.
 pub trait GameFutureExt: Future + Sized {
     /// Races `self` against `stop` using `biased` selection (`stop` wins ties); chain
     /// `.or_until(...)` on the returned [`Until`] to attach arbitrarily many stop triggers.
@@ -415,9 +335,20 @@ pub trait GameFutureExt: Future + Sized {
         }
     }
 
+    /// Converts `Err(Error::TimedOut)` into `Ok(None)` (and `Ok(val)` into `Ok(Some(val))`) while
+    /// preserving all other `Err(e)` variants for `?`.
+    fn none_on_timeout<T>(self) -> NoneOnTimeout<Self>
+    where
+        Self: Future<Output = Result<T>>,
+    {
+        NoneOnTimeout {
+            fut: Box::pin(self),
+        }
+    }
+
     /// Runs a `Result<()>` collection/phase loop for at most `duration`, returning `Ok(())` both
     /// on early `Ok(())` completion and when `duration` elapses (while propagating all `Err`s from
-    /// the inner future verbatim, including unhandled inner prompt `Err(Error::TimedOut)`).
+    /// the inner future verbatim, including unhandled inner `Err(Error::TimedOut)`).
     /// Fixing `Output = Result<()>` lets diverging `loop { ... }` blocks compile with zero
     /// `Infallible` or turbofish annotations.
     fn run_for(self, duration: Duration) -> RunFor<Self>
@@ -436,29 +367,6 @@ pub trait GameFutureExt: Future + Sized {
     {
         RunUntilDeadline {
             inner: Timed::new_deadline(self, deadline),
-        }
-    }
-
-    /// Pure result mapper converting `Err(Error::TimedOut)` to `Ok(None)` while preserving all
-    /// other `Err(e)` variants for `?`.
-    fn optional<T>(self) -> Optional<Self>
-    where
-        Self: Future<Output = Result<T>>,
-    {
-        Optional {
-            fut: Box::pin(self),
-        }
-    }
-
-    /// Pure result mapper converting `Err(Error::TimedOut)`, `Err(Error::UserLeft { .. })`, and
-    /// `Err(Error::UserUnreachable { .. })` into `Ok(Turn<T>)` while preserving room/session errors
-    /// (such as [`Error::ChannelSendFailed`] and [`Error::Disconnected`]) as `Err`.
-    fn settled<T>(self) -> Settled<Self>
-    where
-        Self: Future<Output = Result<T>>,
-    {
-        Settled {
-            fut: Box::pin(self),
         }
     }
 }
