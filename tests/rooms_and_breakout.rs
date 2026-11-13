@@ -436,3 +436,52 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
     let (res_avail_quit, ()) = tokio::join!(wait_avail_quit, drive_avail_quit);
     assert_eq!(res_avail_quit.unwrap(), vec![q2]);
 }
+
+#[tokio::test]
+async fn breakout_cancelled_mid_join_parts_without_spurious_part_on_join_failed() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#lobby", &["Alice"]);
+    server.settle().await;
+
+    let lobby = bot.room("#lobby").unwrap();
+
+    // 1. Cancelling `breakout_with` via `.until(...)` while `JOIN` is in flight before `366`
+    //    automatically enqueues `PART` so the bot never leaks an orphaned channel:
+    let cancel_trigger = lobby.inbox().on_cmd("!abort");
+    let setup_task = tokio::spawn({
+        let bot = bot.clone();
+        async move {
+            bot.breakout_with(BreakoutOptions::exact("#half-open"))
+                .until(cancel_trigger)
+                .await
+        }
+    });
+
+    assert_eq!(
+        server.recv_sent().await.unwrap(),
+        Command::JOIN("#half-open".into(), None, None)
+    );
+    server.chat("Alice", "#lobby", "!abort");
+    let out = setup_task.await.unwrap();
+    assert!(matches!(out, Outcome::Stopped(_)));
+    assert_eq!(
+        server.recv_sent().await.unwrap(),
+        Command::PART("#half-open".into(), None)
+    );
+
+    // 2. If the server explicitly rejects `JOIN` (`473 ERR_INVITEONLYCHAN`), the guard disarms
+    //    without emitting a spurious `PART`:
+    let rejected_task = tokio::spawn({
+        let bot = bot.clone();
+        async move { bot.breakout_with(BreakoutOptions::exact("#locked")).await }
+    });
+    assert_eq!(
+        server.recv_sent().await.unwrap(),
+        Command::JOIN("#locked".into(), None, None)
+    );
+    server.send_line(":irc.srv 473 GM #locked :Cannot join channel (+i)\r\n");
+    server.settle().await;
+    let err = rejected_task.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::JoinFailed { code: 473, .. }));
+    assert!(server.try_recv_sent().is_none());
+}

@@ -655,33 +655,66 @@ impl Bot {
     }
 
     pub async fn breakout_with(&self, opts: BreakoutOptions) -> Result<Breakout> {
+        struct BreakoutSetupGuard<'a> {
+            core: &'a Arc<BotCore>,
+            channel: Option<String>,
+        }
+
+        impl Drop for BreakoutSetupGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(ch) = self.channel.take() {
+                    if self.core.check_connected().is_ok() {
+                        let _ = self.core.outbound.enqueue_one(
+                            Priority::Background,
+                            Command::PART(ch, None),
+                            self.core.casemap(),
+                        );
+                    }
+                }
+            }
+        }
+
         let chan_name = opts.naming.generate_channel_name()?;
         validate_target(&chan_name, "breakout channel")?;
+        let core = &self.owner.core;
+        core.check_connected()?;
         let span = tracing::info_span!("ircgm::breakout", channel = %chan_name);
 
         async {
-            let mut room = self
+            let mut rollback = BreakoutSetupGuard {
+                core,
+                channel: Some(chan_name.clone()),
+            };
+
+            let mut room = match self
                 .join_inner(&chan_name, None, opts.setup_timeout)
-                .await?;
+                .await
+            {
+                Ok(room) => room,
+                Err(e) => {
+                    if matches!(e, Error::JoinFailed { .. } | Error::Disconnected(_)) {
+                        rollback.channel = None;
+                    }
+                    return Err(e);
+                }
+            };
+            rollback.channel = Some(room.name().to_owned());
 
             if opts.require_op && !room.bot_is_op() {
-                let _ = room.part(None);
                 return Err(Error::NotChannelOp {
                     channel: room.name().to_owned(),
                 });
             }
 
             if let Some(ref mode_flags) = opts.modes {
-                if let Err(e) = room.set_mode(mode_flags, &[]) {
-                    let _ = room.part(None);
-                    return Err(e);
-                }
+                room.set_mode(mode_flags, &[])?;
             }
 
             if let Some(ref cfg) = opts.ask_config {
                 room = room.with_ask_config(cfg);
             }
 
+            rollback.channel = None;
             Ok(Breakout::new(room, opts))
         }
         .instrument(span)
