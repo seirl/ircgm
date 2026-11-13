@@ -1,6 +1,5 @@
 use super::*;
 use crate::error::DisconnectReason;
-use std::panic::Location;
 
 #[tokio::test]
 async fn until_or_until_and_map_output() {
@@ -59,46 +58,6 @@ async fn virtual_clock_with_timeout_and_with_deadline() {
         too_slow.with_deadline(deadline).await.unwrap_err(),
         Error::TimedOut
     ));
-}
-
-#[tokio::test]
-async fn none_on_timeout_maps_timed_out_and_preserves_other_errors() {
-    let ok_val = async { Ok::<u32, Error>(7) }
-        .none_on_timeout()
-        .await
-        .unwrap();
-    assert_eq!(ok_val, Some(7));
-
-    let t_out = async { Err::<u32, Error>(Error::TimedOut) }
-        .none_on_timeout()
-        .await;
-    assert_eq!(t_out.unwrap(), None);
-
-    let u_left = async {
-        Err::<u32, Error>(Error::UserLeft {
-            nick: "Bob".into(),
-            reason: Some("Quit".into()),
-        })
-    }
-    .none_on_timeout()
-    .await;
-    assert!(matches!(u_left, Err(Error::UserLeft { .. })));
-
-    let res_disc = async { Err::<u32, Error>(Error::Disconnected(DisconnectReason::Eof)) }
-        .none_on_timeout()
-        .await;
-    assert!(matches!(
-        res_disc,
-        Err(Error::Disconnected(DisconnectReason::Eof))
-    ));
-
-    let err_lag = Error::Lagged {
-        scope: "user Alice".into(),
-        skipped: 5,
-        opened_at: Location::caller(),
-    };
-    let res_lag = async { Err::<u32, Error>(err_lag) }.none_on_timeout().await;
-    assert!(matches!(res_lag, Err(Error::Lagged { skipped: 5, .. })));
 }
 
 #[tokio::test(start_paused = true)]

@@ -156,10 +156,9 @@ async fn oneshot_non_backlog_and_inbox_dms_filtering() {
     let res = fresh_in
         .wait_cmd("!heist")
         .with_timeout(Duration::from_millis(20))
-        .none_on_timeout()
         .await
-        .unwrap();
-    assert!(res.is_none());
+        .unwrap_err();
+    assert!(matches!(res, Error::TimedOut));
 }
 
 #[tokio::test]

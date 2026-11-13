@@ -257,10 +257,9 @@ async fn dynamic_casemapping_rekey_rfc1459_netsplit_and_accounts() {
     let no_match = room_in
         .next_chat()
         .with_timeout(Duration::from_millis(10))
-        .none_on_timeout()
         .await
-        .unwrap();
-    assert!(no_match.is_none());
+        .unwrap_err();
+    assert!(matches!(no_match, Error::TimedOut));
 
     let mut all_events = bot.inbox_all();
     server.send_line(":Bob!~b@h JOIN #[lobby] bob_acct :Bob Real\r\n");

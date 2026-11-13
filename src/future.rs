@@ -188,7 +188,7 @@ impl<F: Future> Timed<F> {
     }
 }
 
-/// Future returned by [`GameFutureExt::with_timeout`].
+/// Future returned by [`GameFutureExt::with_timeout`] and [`GameFutureExt::with_deadline`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct WithTimeout<F> {
     inner: Timed<F>,
@@ -209,50 +209,7 @@ where
     }
 }
 
-/// Future returned by [`GameFutureExt::with_deadline`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct WithDeadline<F> {
-    inner: Timed<F>,
-}
-
-impl<F, T> Future for WithDeadline<F>
-where
-    F: Future<Output = Result<T>>,
-{
-    type Output = Result<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.poll_timed(cx) {
-            Poll::Ready(Ok(res)) => Poll::Ready(res),
-            Poll::Ready(Err(())) => Poll::Ready(Err(Error::TimedOut)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Future returned by [`GameFutureExt::none_on_timeout`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct NoneOnTimeout<F> {
-    fut: Pin<Box<F>>,
-}
-
-impl<F, T> Future for NoneOnTimeout<F>
-where
-    F: Future<Output = Result<T>>,
-{
-    type Output = Result<Option<T>>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(val)) => Poll::Ready(Ok(Some(val))),
-            Poll::Ready(Err(Error::TimedOut)) => Poll::Ready(Ok(None)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Future returned by [`GameFutureExt::run_for`].
+/// Future returned by [`GameFutureExt::run_for`] and [`GameFutureExt::run_until_deadline`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct RunFor<F> {
     inner: Timed<F>,
@@ -273,32 +230,11 @@ where
     }
 }
 
-/// Future returned by [`GameFutureExt::run_until_deadline`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct RunUntilDeadline<F> {
-    inner: Timed<F>,
-}
-
-impl<F> Future for RunUntilDeadline<F>
-where
-    F: Future<Output = Result<()>>,
-{
-    type Output = Result<()>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.poll_timed(cx) {
-            Poll::Ready(Ok(res)) => Poll::Ready(res),
-            Poll::Ready(Err(())) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 /// Cancellation and timer combinators for game futures.
 ///
 /// Named `GameFutureExt` so importing it never collides with `futures::FutureExt`.
-/// All timer combinators (`with_timeout`, `with_deadline`, `none_on_timeout`, `run_for`,
-/// `run_until_deadline`) are **pure wrappers** that never alter `Ask` messaging.
+/// All timer combinators (`with_timeout`, `with_deadline`, `run_for`, `run_until_deadline`)
+/// are **pure wrappers** that never alter `Ask` messaging.
 pub trait GameFutureExt: Future + Sized {
     /// Races `self` against `stop` using `biased` selection (`stop` wins ties); chain
     /// `.or_until(...)` on the returned [`Until`] to attach arbitrarily many stop triggers.
@@ -330,23 +266,12 @@ pub trait GameFutureExt: Future + Sized {
     }
 
     /// Outer absolute-deadline timeout: enforces a fixed phase end-time across loops.
-    fn with_deadline<T>(self, deadline: Instant) -> WithDeadline<Self>
+    fn with_deadline<T>(self, deadline: Instant) -> WithTimeout<Self>
     where
         Self: Future<Output = Result<T>>,
     {
-        WithDeadline {
+        WithTimeout {
             inner: Timed::new_deadline(self, deadline),
-        }
-    }
-
-    /// Converts `Err(Error::TimedOut)` into `Ok(None)` (and `Ok(val)` into `Ok(Some(val))`) while
-    /// preserving all other `Err(e)` variants for `?`.
-    fn none_on_timeout<T>(self) -> NoneOnTimeout<Self>
-    where
-        Self: Future<Output = Result<T>>,
-    {
-        NoneOnTimeout {
-            fut: Box::pin(self),
         }
     }
 
@@ -365,11 +290,11 @@ pub trait GameFutureExt: Future + Sized {
     }
 
     /// Absolute-deadline counterpart to [`GameFutureExt::run_for`].
-    fn run_until_deadline(self, deadline: Instant) -> RunUntilDeadline<Self>
+    fn run_until_deadline(self, deadline: Instant) -> RunFor<Self>
     where
         Self: Future<Output = Result<()>>,
     {
-        RunUntilDeadline {
+        RunFor {
             inner: Timed::new_deadline(self, deadline),
         }
     }

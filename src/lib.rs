@@ -7,7 +7,7 @@
 //!   inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations, countdown
 //!   warnings, per-player timeout callouts, and explicit [`Answer`] outcomes by default.
 //! - [`GameFutureExt`] composes any prompt or multi-step `async fn` with `.until()`, `.or_until()`,
-//!   `.with_timeout()`, `.none_on_timeout()`, and `.run_for()`.
+//!   `.with_timeout()`, `.with_deadline()`, `.run_for()`, and `.run_until_deadline()`.
 //!
 //! See `examples/` for standalone bot/API pattern showcases and the companion `minigames`
 //! workspace crate for 8 playable multi-player games (`blackjack`, `heist`, `cold_war`,

@@ -294,7 +294,7 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     assert_eq!(a2, "after_400s");
     drop(dm);
 
-    // Combinator table: default `Answer`, `Answer::ok()`, `Answer::required()`, and `with_timeout().none_on_timeout()`
+    // Combinator table: default `Answer`, `Answer::ok()`, `Answer::required()`, and outer `with_timeout()`
     let (bot3, mut server3) = test_harness("GM");
     server3.complete_join("#tab", &["Alice"]);
     server3.settle().await;
@@ -339,10 +339,9 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     let r = room_msg
         .ask("Q4", |_| Option::<()>::None)
         .with_timeout(Duration::from_secs(3))
-        .none_on_timeout()
         .await
-        .unwrap();
-    assert_eq!(r, None);
+        .unwrap_err();
+    assert!(matches!(r, Error::TimedOut));
     assert_eq!(server3.take_messages_to("#tab"), vec!["Q4"]);
 
     let r = room_silent.ask("Q5", |_| Option::<()>::None).await.unwrap();

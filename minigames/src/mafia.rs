@@ -285,10 +285,12 @@ pub async fn run_mafia_round(
             }
         });
 
-        let saved_victim = match race_all(protectors)
-            .with_timeout(Duration::from_secs(5))
-            .none_on_timeout()
-            .await?
+        let saved_victim = match Answer::from_result(
+            race_all(protectors)
+                .with_timeout(Duration::from_secs(5))
+                .await,
+        )?
+        .ok()
         {
             Some((_hero, protected)) => protected == victim,
             None => false,
