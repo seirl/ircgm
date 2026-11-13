@@ -95,7 +95,7 @@ pub mod prelude {
 
 pub use crate::{
     ask::{Answer, Ask, AskConfig, AskMatch, IntoAskMatch, TimeoutCtx},
-    bot::{Bot, BotConfig, ShutdownRequested},
+    bot::{Bot, BotConfig},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
     error::{DisconnectReason, Error, Result},

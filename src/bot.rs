@@ -1,15 +1,13 @@
 use std::borrow::Borrow;
 use std::future::Future;
 use std::panic::Location;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use irc::proto::{CapSubCommand, Command};
 use irc_colors::Text;
-use tokio::sync::{oneshot, watch, Notify};
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
@@ -103,8 +101,7 @@ pub(crate) struct BotCore {
     pub(crate) inboxes: InboxRegistry,
     pub(crate) outbound: Arc<OutboundSink>,
     pub(crate) is_test_transport: bool,
-    pub(crate) shutting_down: AtomicBool,
-    pub(crate) shutdown_waiters: Mutex<Vec<oneshot::Sender<()>>>,
+    pub(crate) shutdown_tx: watch::Sender<bool>,
     pub(crate) registered_tx: watch::Sender<bool>,
     pub(crate) registered_flag: AtomicBool,
     pub(crate) disconnect_reason: Mutex<Option<DisconnectReason>>,
@@ -132,6 +129,7 @@ impl BotCore {
         config: &BotConfig,
     ) -> Arc<Self> {
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let (shutdown_tx, _) = watch::channel(false);
         let (registered_tx, _) = watch::channel(false);
         Arc::new(Self {
             session_id,
@@ -140,8 +138,7 @@ impl BotCore {
             inboxes: InboxRegistry::default(),
             outbound,
             is_test_transport,
-            shutting_down: AtomicBool::new(false),
-            shutdown_waiters: Mutex::new(Vec::new()),
+            shutdown_tx,
             registered_tx,
             registered_flag: AtomicBool::new(false),
             disconnect_reason: Mutex::new(None),
@@ -253,33 +250,6 @@ impl Drop for BotOwner {
         self.core.state.write().unwrap().clear();
         self.core.inboxes.clear();
         self.core.users.clear();
-        self.core.shutdown_waiters.lock().unwrap().clear();
-    }
-}
-
-/// Future returned by [`Bot::shutdown_requested`], resolving to `()` as soon as
-/// [`Bot::request_shutdown`] or [`Bot::quit`] is called.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct ShutdownRequested {
-    rx: Option<oneshot::Receiver<()>>,
-}
-
-impl Future for ShutdownRequested {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(rx) = self.rx.as_mut() else {
-            return Poll::Ready(());
-        };
-        match Pin::new(rx).poll(cx) {
-            Poll::Ready(Ok(())) => {
-                self.rx = None;
-                Poll::Ready(())
-            }
-            // If `BotCore` itself dropped without `request_shutdown`, park pending:
-            Poll::Ready(Err(_)) => Poll::Pending,
-            Poll::Pending => Poll::Pending,
-        }
     }
 }
 
@@ -788,31 +758,23 @@ impl Bot {
     }
 
     pub fn request_shutdown(&self) {
-        let core = &self.owner.core;
-        core.shutting_down.store(true, Ordering::Release);
-        let waiters: Vec<oneshot::Sender<()>> =
-            std::mem::take(&mut *core.shutdown_waiters.lock().unwrap());
-        for tx in waiters {
-            let _ = tx.send(());
-        }
+        let _ = self.owner.core.shutdown_tx.send_replace(true);
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        self.owner.core.shutting_down.load(Ordering::Acquire)
+        *self.owner.core.shutdown_tx.borrow()
     }
 
-    pub fn shutdown_requested(&self) -> ShutdownRequested {
-        let core = &self.owner.core;
-        if core.shutting_down.load(Ordering::Acquire) {
-            return ShutdownRequested { rx: None };
+    /// Resolves to `()` as soon as [`Bot::request_shutdown`] or [`Bot::quit`] is called.
+    pub fn shutdown_requested(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut rx = self.owner.core.shutdown_tx.subscribe();
+        async move {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
         }
-        let mut waiters = core.shutdown_waiters.lock().unwrap();
-        if core.shutting_down.load(Ordering::Acquire) {
-            return ShutdownRequested { rx: None };
-        }
-        let (tx, rx) = oneshot::channel();
-        waiters.push(tx);
-        ShutdownRequested { rx: Some(rx) }
     }
 
     pub async fn quit(&self, reason: Option<&str>) -> Result<()> {

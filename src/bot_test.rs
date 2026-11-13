@@ -66,7 +66,14 @@ async fn shutdown_requested_resolves_before_and_after_request_shutdown() {
     let (bot, _server) = test_harness("gm");
     assert!(!bot.is_shutting_down());
 
+    // Dropping unused `shutdown_requested()` futures (e.g. across loop iterations) cleans up receivers:
+    for _ in 0..32 {
+        drop(bot.shutdown_requested());
+    }
+    assert_eq!(bot.owner.core.shutdown_tx.receiver_count(), 0);
+
     let waiter = bot.shutdown_requested();
+    assert_eq!(bot.owner.core.shutdown_tx.receiver_count(), 1);
     bot.request_shutdown();
     assert!(bot.is_shutting_down());
     waiter.await;

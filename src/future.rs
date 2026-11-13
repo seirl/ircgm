@@ -8,8 +8,6 @@ use tokio::time::{Instant, Sleep};
 
 use crate::error::{Error, Result};
 
-pub use crate::bot::ShutdownRequested;
-
 /// Outcome of racing a game future against one or more stop triggers via [`GameFutureExt::until`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome<T, S> {
