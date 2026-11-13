@@ -1,0 +1,22 @@
+[package]
+name = "ircgm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Direct-style async/await IRC game master and interactive bot library"
+
+[dependencies]
+chrono = "0.4"
+fastrand = "2"
+futures-core = "0.3"
+futures-util = "0.3"
+irc = "1"
+irc-colors = { version = "0.1", path = "../irc-colors" }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["test-util", "macros", "rt", "net", "io-util"] }
+tracing-subscriber = "0.3"
