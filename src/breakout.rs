@@ -296,7 +296,7 @@ impl Breakout {
         loop {
             let wire_res = tokio::select! {
                 biased;
-                res = poll_fn(|cx| inbox.poll_next_wire(cx, false)) => res,
+                res = poll_fn(|cx| inbox.poll_next_wire(cx)) => res,
                 _ = &mut sleep => {
                     return Err(Error::HandshakeTimeout {
                         operation: "breakout invite_and_wait",
@@ -451,7 +451,7 @@ impl Breakout {
         loop {
             let wire_res = tokio::select! {
                 biased;
-                res = poll_fn(|cx| inbox.poll_next_wire(cx, false)) => res,
+                res = poll_fn(|cx| inbox.poll_next_wire(cx)) => res,
                 _ = &mut sleep => break,
             };
 
@@ -560,7 +560,7 @@ impl Breakout {
         loop {
             let res = tokio::select! {
                 biased;
-                r = poll_fn(|cx| inbox.poll_next_wire(cx, false)) => r,
+                r = poll_fn(|cx| inbox.poll_next_wire(cx)) => r,
                 _ = &mut sleep => {
                     return Err(Error::HandshakeTimeout {
                         operation: "breakout close (PART)",

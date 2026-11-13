@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, UNIX_EPOCH};
 
 use irc::proto::Command;
@@ -418,4 +419,72 @@ async fn group2_notice_isolation_accept_notices_and_reply_mirroring() {
 
     assert_eq!(t2.await.unwrap().unwrap(), MessageKind::Notice);
     assert_eq!(t1.await.unwrap().unwrap(), None);
+}
+
+#[tokio::test]
+async fn group1_user_id_keys_and_consuming_inbox_combinators() {
+    let (bot, server) = test_harness("GM");
+    server.complete_join("#lobby", &["[Alice]", "Bob"]);
+    server.settle().await;
+
+    let room = bot.room("#lobby").unwrap();
+    let alice_1 = bot.user("[Alice]").unwrap();
+    let alice_folded = bot.user("{alice}").unwrap();
+    let bob = bot.user("Bob").unwrap();
+
+    // `UserId` is `Copy + Eq + Ord + Hash` with zero interior-mutability lints:
+    let alice_id: UserId = alice_1.id();
+    assert_eq!(alice_id, alice_folded.id());
+    assert_ne!(alice_id, bob.id());
+    assert!(alice_id.as_u64() > 0);
+    assert_eq!(alice_id.to_string(), alice_id.as_u64().to_string());
+
+    let mut scores: HashMap<UserId, usize> = HashMap::new();
+    scores.insert(alice_id, 10);
+    let mut seen: HashSet<UserId> = HashSet::new();
+    assert!(seen.insert(alice_id));
+    let mut ordered: BTreeSet<UserId> = BTreeSet::new();
+    ordered.insert(bob.id());
+    ordered.insert(alice_id);
+    assert_eq!(ordered.len(), 2);
+
+    // `/nick` preserves `UserId`; `QUIT` + rejoin allocates a fresh `UserId`:
+    server.send_line(":[Alice]!u@h NICK :AliceRenamed\r\n");
+    server.settle().await;
+    assert_eq!(bot.user("AliceRenamed").unwrap().id(), alice_id);
+    assert_eq!(scores[&alice_1.id()], 10);
+
+    server.quit_user("AliceRenamed", Some("reconnecting"));
+    server.send_line(":AliceRenamed!u@h JOIN #lobby\r\n");
+    server.settle().await;
+    let alice_rejoined = bot.user("AliceRenamed").unwrap();
+    assert_ne!(alice_rejoined.id(), alice_id);
+    assert!(seen.insert(alice_rejoined.id()));
+
+    // Consuming one-shot `Inbox::into_*` combinators compose directly in `.until` / `.or_until` without `let mut`:
+    let stop_fut = bot
+        .inbox_all()
+        .into_wait_for(|m| m.is_cmd("!stop"))
+        .ok_or_pending();
+    let abort_fut = bob.inbox().into_wait_cmd("!abort").ok_or_pending();
+
+    let work = async move {
+        let first = room.inbox().into_next_chat().await?;
+        let mapped = room
+            .inbox()
+            .into_wait_map(|m| m.cmd_args("!pick").map(str::to_owned))
+            .await?;
+        Ok::<_, Error>((first.text, mapped))
+    };
+
+    let race_task = tokio::spawn(async move { work.until(stop_fut).or_until(abort_fut).await });
+    tokio::task::yield_now().await;
+
+    server.dm("Bob", "!abort");
+    server.settle().await;
+
+    match race_task.await.unwrap() {
+        Outcome::Stopped(msg) => assert_eq!(msg.text, "!abort"),
+        other => panic!("expected Outcome::Stopped, got {other:?}"),
+    }
 }

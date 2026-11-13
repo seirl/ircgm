@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use irc_colors::Text;
@@ -8,7 +9,103 @@ use crate::error::{Error, Result};
 use crate::inbox::Inbox;
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::user::{ExclusiveDm, User};
+use crate::user::{ExclusiveDm, User, UserId};
+
+/// Disjoint outbound view of a [`Huddle`] so [`Ask`] can send prompts, countdown warnings,
+/// rejects, and banter relays while mutably polling `Huddle::inbox`.
+pub(crate) struct HuddleSender<'a> {
+    core: &'a Arc<BotCore>,
+    guards: &'a [ExclusiveDm],
+    relay_prefix: &'a Option<Text>,
+    relay_commands: bool,
+}
+
+impl HuddleSender<'_> {
+    pub(crate) fn has_relay(&self) -> bool {
+        self.relay_prefix.is_some()
+    }
+
+    pub(crate) fn broadcast_prompt_with_receipt(&self, prompt: Text) -> Result<WriteReceipt> {
+        self.core.check_connected()?;
+        let mut last_receipt: Option<WriteReceipt> = None;
+        let mut last_offline_err: Option<Error> = None;
+
+        for g in self.guards {
+            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone()) {
+                Ok(r) => last_receipt = Some(r),
+                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+
+        match last_receipt {
+            Some(r) => Ok(r),
+            None => Err(last_offline_err.unwrap_or(Error::UserLeft {
+                nick: String::new(),
+                reason: None,
+            })),
+        }
+    }
+
+    pub(crate) fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
+        self.core.check_connected()?;
+        for g in self.guards {
+            match g.send_chat_with_receipt(kind, text.clone()) {
+                Ok(_) | Err(Error::UserLeft { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn relay_to_others(&self, msg: &ChatMessage) -> Result<()> {
+        self.core.check_connected()?;
+        if !self.relay_commands && self.core.is_command_text(&msg.text) {
+            return Ok(());
+        }
+        let base = match self.relay_prefix {
+            Some(p) => p.clone(),
+            None => Text::new(),
+        };
+        let rendered = base + "<" + &msg.nick + "> " + msg.to_styled();
+        let sender_id = msg.sender.id();
+        for g in self.guards {
+            if g.user().id() == sender_id {
+                continue;
+            }
+            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, rendered.clone()) {
+                Ok(_) | Err(Error::UserLeft { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn find_matching_user_id(
+        &self,
+        target: &str,
+        target_user_id: Option<u64>,
+    ) -> Option<UserId> {
+        if let Some(raw_id) = target_user_id {
+            let uid = UserId(raw_id);
+            if self.guards.iter().any(|g| g.user().id() == uid) {
+                return Some(uid);
+            }
+        }
+        self.guards
+            .iter()
+            .map(ExclusiveDm::user)
+            .find(|u| u.eq_nick(target))
+            .map(User::id)
+    }
+
+    pub(crate) fn any_reachable_online(&self, bounced_users: &HashSet<UserId>) -> bool {
+        self.guards
+            .iter()
+            .map(ExclusiveDm::user)
+            .any(|u| u.is_online() && !bounced_users.contains(&u.id()))
+    }
+}
 
 /// RAII channel-free group DM guard (`bot.huddle(&users)` / `bot.huddle_available(&users)`).
 ///
@@ -20,6 +117,7 @@ pub struct Huddle {
     inbox: Inbox,
     ask_config: Arc<AskConfig>,
     relay_prefix: Option<Text>,
+    relay_commands: bool,
 }
 
 impl Huddle {
@@ -36,41 +134,31 @@ impl Huddle {
             inbox,
             ask_config,
             relay_prefix: None,
+            relay_commands: false,
         }
     }
 
-    pub(crate) fn core(&self) -> Option<&Arc<BotCore>> {
-        Some(&self.core)
+    pub(crate) fn check_connected(&self) -> Result<()> {
+        self.core.check_connected()
     }
 
-    pub(crate) fn has_relay(&self) -> bool {
-        self.relay_prefix.is_some()
-    }
-
-    pub(crate) fn contains_user_id(&self, uid: u64) -> bool {
-        self.guards.iter().any(|g| g.user().track_id() == uid)
-    }
-
-    pub(crate) fn broadcast_prompt_with_receipt(&self, prompt: Text) -> Result<WriteReceipt> {
-        self.core.check_connected()?;
-        let mut last_receipt: Option<WriteReceipt> = None;
-        let mut last_offline_err: Option<Error> = None;
-
-        for g in &self.guards {
-            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone()) {
-                Ok(r) => last_receipt = Some(r),
-                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
-                Err(e) => return Err(e),
-            }
+    fn sender_view(&self) -> HuddleSender<'_> {
+        HuddleSender {
+            core: &self.core,
+            guards: &self.guards,
+            relay_prefix: &self.relay_prefix,
+            relay_commands: self.relay_commands,
         }
+    }
 
-        match last_receipt {
-            Some(r) => Ok(r),
-            None => Err(last_offline_err.unwrap_or(Error::UserLeft {
-                nick: String::new(),
-                reason: None,
-            })),
-        }
+    pub(crate) fn split_for_ask(&mut self) -> (HuddleSender<'_>, &mut Inbox) {
+        let sender = HuddleSender {
+            core: &self.core,
+            guards: &self.guards,
+            relay_prefix: &self.relay_prefix,
+            relay_commands: self.relay_commands,
+        };
+        (sender, &mut self.inbox)
     }
 
     pub fn users(&self) -> Vec<User> {
@@ -130,49 +218,38 @@ impl Huddle {
         self.relay_prefix = prefix;
     }
 
+    /// Controls whether lines starting with `BotConfig::command_prefixes` (default `"!"`)
+    /// are relayed to fellow huddle members (default: `false`, so `!help` / `!status` or
+    /// mistyped commands aren't echoed to teammates even when `.ignore_commands()` is off).
+    pub fn with_relay_commands(mut self, enabled: bool) -> Self {
+        self.relay_commands = enabled;
+        self
+    }
+
+    pub fn set_relay_commands(&mut self, enabled: bool) {
+        self.relay_commands = enabled;
+    }
+
     /// Broadcasts to all currently-online huddle users (skipping any user who disconnected mid-huddle).
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        self.broadcast_kind(OutboundChatKind::Privmsg, text.into())
+        self.sender_view()
+            .broadcast_kind(OutboundChatKind::Privmsg, text.into())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        self.broadcast_kind(OutboundChatKind::Notice, text.into())
+        self.sender_view()
+            .broadcast_kind(OutboundChatKind::Notice, text.into())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        self.broadcast_kind(OutboundChatKind::Action, text.into())
+        self.sender_view()
+            .broadcast_kind(OutboundChatKind::Action, text.into())
     }
 
-    fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
-        self.core.check_connected()?;
-        for g in &self.guards {
-            match g.send_chat_with_receipt(kind, text.clone()) {
-                Ok(_) | Err(Error::UserLeft { .. }) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Relays `msg` to all other online huddle users (`<prefix><<msg.nick>> <msg.to_styled()>`).
+    /// Relays `msg` to all other online huddle users (`<prefix><<msg.nick>> <msg.to_styled()>`),
+    /// skipping command-prefixed messages unless [`Huddle::with_relay_commands`] is enabled.
     pub fn relay_to_others(&self, msg: &ChatMessage) -> Result<()> {
-        self.core.check_connected()?;
-        let base = match &self.relay_prefix {
-            Some(p) => p.clone(),
-            None => Text::new(),
-        };
-        let rendered = base + "<" + &msg.nick + "> " + msg.to_styled();
-        let sender_id = msg.sender.track_id();
-        for g in &self.guards {
-            if g.user().track_id() == sender_id {
-                continue;
-            }
-            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, rendered.clone()) {
-                Ok(_) | Err(Error::UserLeft { .. }) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.sender_view().relay_to_others(msg)
     }
 
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>

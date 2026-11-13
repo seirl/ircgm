@@ -482,19 +482,20 @@ async fn group3_exclusive_many_available_and_huddle_semantics() {
     // All offline -> `exclusive_available` returns `Ok(vec![])`:
     assert!(bot.exclusive_available([&w3]).await.unwrap().is_empty());
 
-    // 4. `Huddle` (`huddle_available`, `with_relay`, private `Verdict::Reject`, `.ignore_commands()`, `seq` order, RAII drop):
+    // 4. `Huddle` (`huddle_available`, `with_relay`, default command-relay suppression, private `Verdict::Reject`, `seq` order, RAII drop):
     {
+        // Note: NO `.with_ignore_commands()` needed — `pack.ask` matches `!kill <nick>` directly,
+        // while `Huddle`'s default `relay_commands = false` prevents `!status` / `!help` from being echoed to teammates!
         let mut pack = bot
             .huddle_available([&w1, &w2, &w3])
             .await
             .unwrap()
-            .with_relay("[Pack] ")
-            .with_ignore_commands();
+            .with_relay("[Pack] ");
         assert_eq!(pack.len(), 2);
         assert!(!pack.is_empty());
 
         let ask_fut = pack.ask("Who to bite?", |m| {
-            let Some(target) = m.text.trim().strip_prefix("kill ") else {
+            let Some(target) = m.cmd_args("!kill") else {
                 return Verdict::Ignore;
             };
             if villager.eq_nick(target) {
@@ -511,15 +512,15 @@ async fn group3_exclusive_many_available_and_huddle_semantics() {
             assert_eq!(server.take_messages_to("Wolf1"), vec!["Who to bite?"]);
             assert_eq!(server.take_messages_to("Wolf2"), vec!["Who to bite?"]);
 
-            // a) Unrelated `!status` command: skipped BEFORE matcher & NEVER relayed!
+            // a) Unrelated `!status` command: returns `Verdict::Ignore` in matcher, and is NOT relayed by default!
             server.dm("Wolf1", "!status");
             // b) Banter (`Verdict::Ignore`): relayed to Wolf2 ONLY (`[Pack] <Wolf1> let's get Villager`)!
             server.dm("Wolf1", "let's get Villager");
-            // c) Invalid `kill Nobody`: `Verdict::Reject` sent PRIVATELY to Wolf1 ONLY (Wolf2 gets nothing)!
-            server.dm("Wolf1", "kill Nobody");
-            // d) Same-batch `kill Villager` from Wolf2 BEFORE Wolf1 -> `seq` order picks Wolf2!
-            server.dm("Wolf2", "kill Villager");
-            server.dm("Wolf1", "kill Villager");
+            // c) Invalid `!kill Nobody`: `Verdict::Reject` sent PRIVATELY to Wolf1 ONLY (Wolf2 gets nothing)!
+            server.dm("Wolf1", "!kill Nobody");
+            // d) Same-batch `!kill Villager` from Wolf2 BEFORE Wolf1 -> `seq` order picks Wolf2!
+            server.dm("Wolf2", "!kill Villager");
+            server.dm("Wolf1", "!kill Villager");
             server.settle().await;
         };
 
@@ -534,6 +535,18 @@ async fn group3_exclusive_many_available_and_huddle_semantics() {
         assert_eq!(
             server.take_messages_to("Wolf2"),
             vec!["[Pack] <Wolf1> let's get Villager"]
+        );
+
+        // Opting in via `set_relay_commands(true)` relays commands when explicitly desired:
+        pack.inbox().clear();
+        pack.set_relay_commands(true);
+        server.dm("Wolf1", "!ping");
+        server.settle().await;
+        let cmd_msg = pack.inbox().next_chat().await.unwrap();
+        pack.relay_to_others(&cmd_msg).unwrap();
+        assert_eq!(
+            server.take_messages_to("Wolf2"),
+            vec!["[Pack] <Wolf1> !ping"]
         );
     } // `pack` drops here -> releases `dm_mutex` on Wolf1 & Wolf2!
 

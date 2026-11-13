@@ -1,18 +1,15 @@
 use std::collections::HashMap;
-use std::future::{poll_fn, Future};
+use std::future::poll_fn;
 use std::panic::Location;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use futures_core::Stream;
 use irc::proto::Message;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, Sleep};
 
-use crate::ask::TimeLimit;
 use crate::bot::BotCore;
 use crate::casemap::{CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
@@ -311,8 +308,6 @@ impl InboxRegistry {
             dropped,
             warned_75,
             lag_policy: LagPolicy::Strict,
-            read_limit: TimeLimit::None,
-            active_sleep: None,
             ignore_commands: false,
             accept_notices: false,
             latched_departure: None,
@@ -564,8 +559,6 @@ pub struct Inbox {
     dropped: Arc<AtomicU64>,
     warned_75: Arc<AtomicBool>,
     lag_policy: LagPolicy,
-    read_limit: TimeLimit,
-    active_sleep: Option<Pin<Box<Sleep>>>,
     ignore_commands: bool,
     accept_notices: bool,
     latched_departure: Option<Error>,
@@ -598,42 +591,10 @@ impl Inbox {
             dropped: Arc::new(AtomicU64::new(0)),
             warned_75: Arc::new(AtomicBool::new(false)),
             lag_policy: LagPolicy::Strict,
-            read_limit: TimeLimit::None,
-            active_sleep: None,
             ignore_commands: false,
             accept_notices: false,
             latched_departure: None,
         }
-    }
-
-    pub fn with_read_timeout(mut self, duration: Duration) -> Self {
-        self.set_read_timeout(duration);
-        self
-    }
-
-    pub fn with_read_deadline(mut self, deadline: Instant) -> Self {
-        self.set_read_deadline(deadline);
-        self
-    }
-
-    pub fn without_read_timeout(mut self) -> Self {
-        self.clear_read_timeout();
-        self
-    }
-
-    pub fn set_read_timeout(&mut self, duration: Duration) {
-        self.read_limit = TimeLimit::Duration(duration);
-        self.active_sleep = None;
-    }
-
-    pub fn set_read_deadline(&mut self, deadline: Instant) {
-        self.read_limit = TimeLimit::Deadline(deadline);
-        self.active_sleep = None;
-    }
-
-    pub fn clear_read_timeout(&mut self) {
-        self.read_limit = TimeLimit::None;
-        self.active_sleep = None;
     }
 
     pub fn ignore_commands(mut self) -> Self {
@@ -664,24 +625,81 @@ impl Inbox {
         while self.rx.try_recv().is_ok() {}
         self.dropped.store(0, Ordering::Release);
         self.warned_75.store(false, Ordering::Relaxed);
-        self.active_sleep = None;
     }
 
-    pub async fn wait_map<F, T>(&mut self, mut f: F) -> Result<T>
+    /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`] and [`crate::Ask`].
+    pub(crate) async fn wait_reply_map<B, F, T>(
+        &mut self,
+        ignore_commands: bool,
+        accept_notices: bool,
+        mut check_bounce: B,
+        mut f: F,
+    ) -> Result<T>
     where
+        B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
         poll_fn(|cx| loop {
-            match self.poll_next_chat_candidate(cx) {
-                Poll::Ready(Ok(msg)) => {
-                    if let Some(val) = f(&msg) {
-                        return Poll::Ready(Ok(val));
+            match self.poll_next_wire(cx) {
+                Poll::Ready(Ok(wire)) => match &wire.kind {
+                    WireKind::SendError {
+                        target,
+                        target_user_id,
+                        code,
+                        message,
+                    } => {
+                        if let Some(err) = check_bounce(target, *target_user_id, *code, message) {
+                            return Poll::Ready(Err(err));
+                        }
                     }
-                }
+                    WireKind::Chat(msg) => {
+                        if ignore_commands
+                            && self
+                                .core
+                                .as_ref()
+                                .is_some_and(|c| c.is_command_text(&msg.text))
+                        {
+                            continue;
+                        }
+                        if let Some(val) = f(msg) {
+                            return Poll::Ready(Ok(val));
+                        }
+                    }
+                    WireKind::Notice {
+                        human_chat: Some(msg),
+                        ..
+                    } if accept_notices => {
+                        if ignore_commands
+                            && self
+                                .core
+                                .as_ref()
+                                .is_some_and(|c| c.is_command_text(&msg.text))
+                        {
+                            continue;
+                        }
+                        if let Some(val) = f(msg) {
+                            return Poll::Ready(Ok(val));
+                        }
+                    }
+                    _ => {}
+                },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         })
+        .await
+    }
+
+    pub async fn wait_map<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnMut(&ChatMessage) -> Option<T>,
+    {
+        self.wait_reply_map(
+            self.ignore_commands,
+            self.accept_notices,
+            |_, _, _, _| None,
+            f,
+        )
         .await
     }
 
@@ -704,12 +722,44 @@ impl Inbox {
         self.wait_event_map(|ev| Some(ev.clone())).await
     }
 
+    /// Consuming one-shot variant of [`Inbox::wait_map`] that owns this [`Inbox`] inside the
+    /// returned future (ideal for `.until(...)` / `.or_until(...)` chains and helper functions).
+    pub async fn into_wait_map<F, T>(mut self, f: F) -> Result<T>
+    where
+        F: FnMut(&ChatMessage) -> Option<T>,
+    {
+        self.wait_map(f).await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::wait_for`].
+    pub async fn into_wait_for<P>(mut self, pred: P) -> Result<ChatMessage>
+    where
+        P: FnMut(&ChatMessage) -> bool,
+    {
+        self.wait_for(pred).await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::wait_cmd`].
+    pub async fn into_wait_cmd(mut self, cmd: &str) -> Result<ChatMessage> {
+        self.wait_cmd(cmd).await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::next_chat`].
+    pub async fn into_next_chat(mut self) -> Result<ChatMessage> {
+        self.next_chat().await
+    }
+
+    /// Consuming one-shot variant of [`Inbox::next_event`].
+    pub async fn into_next_event(mut self) -> Result<Event> {
+        self.next_event().await
+    }
+
     pub async fn wait_event_map<F, T>(&mut self, mut f: F) -> Result<T>
     where
         F: FnMut(&Event) -> Option<T>,
     {
         poll_fn(|cx| loop {
-            match self.poll_next_wire(cx, true) {
+            match self.poll_next_wire(cx) {
                 Poll::Ready(Ok(wire)) => {
                     if let Some(ev) = wire.to_public_event() {
                         if let Some(val) = f(&ev) {
@@ -725,7 +775,7 @@ impl Inbox {
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        poll_fn(|cx| match self.poll_next_wire(cx, true) {
+        poll_fn(|cx| match self.poll_next_wire(cx) {
             Poll::Ready(Ok(wire)) => Poll::Ready(Ok(Arc::clone(&wire.raw))),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -738,7 +788,7 @@ impl Inbox {
         F: FnMut(&Message) -> Option<T>,
     {
         poll_fn(|cx| loop {
-            match self.poll_next_wire(cx, true) {
+            match self.poll_next_wire(cx) {
                 Poll::Ready(Ok(wire)) => {
                     if let Some(val) = f(&wire.raw) {
                         return Poll::Ready(Ok(val));
@@ -753,7 +803,7 @@ impl Inbox {
 
     fn poll_next_chat_candidate(&mut self, cx: &mut Context<'_>) -> Poll<Result<ChatMessage>> {
         loop {
-            match self.poll_next_wire(cx, true) {
+            match self.poll_next_wire(cx) {
                 Poll::Ready(Ok(wire)) => {
                     let msg_opt = match &wire.kind {
                         WireKind::Chat(msg) => Some(msg),
@@ -781,18 +831,11 @@ impl Inbox {
     }
 
     /// Cancel-safe raw wire frame poller.
-    /// When `use_read_limit` is `false` (called from `Ask::poll`), `self.read_limit` is bypassed
-    /// so `Ask` owns the sole active timer.
-    pub(crate) fn poll_next_wire(
-        &mut self,
-        cx: &mut Context<'_>,
-        use_read_limit: bool,
-    ) -> Poll<Result<Arc<WireEvent>>> {
+    pub(crate) fn poll_next_wire(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<WireEvent>>> {
         let skipped = self.dropped.swap(0, Ordering::AcqRel);
         if skipped > 0 {
             match self.lag_policy {
                 LagPolicy::Strict => {
-                    self.active_sleep = None;
                     return Poll::Ready(Err(Error::Lagged {
                         scope: self.scope_label.clone(),
                         skipped,
@@ -811,22 +854,15 @@ impl Inbox {
         }
 
         if let Some(err) = self.latched_departure.take() {
-            self.active_sleep = None;
             return Poll::Ready(Err(err));
         }
 
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(wire)) => {
-                if matches!(self.read_limit, TimeLimit::Duration(_)) {
-                    self.active_sleep = None;
-                }
                 self.maybe_latch_in_stream_departure(&wire);
-                // `BotLeftRoom` has no public `Event`; for single-room/user-in-room, if latched,
-                // surface on the next iteration (or immediately if `BotLeftRoom` exhausted scope).
                 Poll::Ready(Ok(wire))
             }
             Poll::Ready(None) => {
-                self.active_sleep = None;
                 let reason = self
                     .core
                     .as_ref()
@@ -836,34 +872,8 @@ impl Inbox {
             }
             Poll::Pending => {
                 if let Some(err) = self.check_scope_exhausted() {
-                    self.active_sleep = None;
                     return Poll::Ready(Err(err));
                 }
-
-                if use_read_limit {
-                    match self.read_limit {
-                        TimeLimit::None => {}
-                        TimeLimit::Duration(dur) => {
-                            let sleep = self
-                                .active_sleep
-                                .get_or_insert_with(|| Box::pin(tokio::time::sleep(dur)));
-                            if sleep.as_mut().poll(cx).is_ready() {
-                                self.active_sleep = None;
-                                return Poll::Ready(Err(Error::TimedOut));
-                            }
-                        }
-                        TimeLimit::Deadline(dl) => {
-                            let sleep = self
-                                .active_sleep
-                                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(dl)));
-                            if sleep.as_mut().poll(cx).is_ready() {
-                                self.active_sleep = None;
-                                return Poll::Ready(Err(Error::TimedOut));
-                            }
-                        }
-                    }
-                }
-
                 Poll::Pending
             }
         }

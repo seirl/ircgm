@@ -28,21 +28,21 @@
 //!
 //! async fn lobby(bot: Bot, room: Room) -> Result<()> {
 //!     loop {
-//!         let trigger = match room.inbox().wait_cmd("!heist").until(bot.shutdown_requested()).await {
+//!         let trigger = match room.inbox().into_wait_cmd("!heist").until(bot.shutdown_requested()).await {
 //!             Outcome::Completed(res) => res?,
 //!             Outcome::Stopped(()) => break,
 //!         };
 //!         let leader = &trigger.sender;
 //!
-//!         let mut admin_inbox = bot.inbox_all();
-//!         let admin_stop = admin_inbox
-//!             .wait_for(|m| is_admin(m) && m.is_cmd("!stop") && (m.is_dm() || m.is_in(&room)))
+//!         let admin_stop = bot
+//!             .inbox_all()
+//!             .into_wait_for(|m| is_admin(m) && m.is_cmd("!stop") && (m.is_dm() || m.is_in(&room)))
 //!             .ok_or_pending()
 //!             .map_output(Stop::Admin);
 //!
-//!         let mut abort_inbox = leader.inbox();
-//!         let leader_abort = abort_inbox
-//!             .wait_cmd("!abort")
+//!         let leader_abort = leader
+//!             .inbox()
+//!             .into_wait_cmd("!abort")
 //!             .ok_or_pending()
 //!             .map_output(Stop::LeaderAbort);
 //!
@@ -189,14 +189,16 @@
 //!         let mut inbox = room.inbox();
 //!         room.say("First 3 to type " + "!join".bold().green() + " get to play!")?;
 //!
-//!         let mut set = HashSet::with_capacity(3);
-//!         while set.len() < 3 {
+//!         let mut seen = HashSet::with_capacity(3);
+//!         let mut players = Vec::with_capacity(3);
+//!         while players.len() < 3 {
 //!             let msg = inbox.wait_cmd("!join").await?;
-//!             if set.insert(msg.sender.clone()) {
-//!                 room.say(msg.sender.nick().bold() + format!(" joined! ({}/3)", set.len()))?;
+//!             if seen.insert(msg.sender.id()) {
+//!                 players.push(msg.sender.clone());
+//!                 room.say(msg.sender.nick().bold() + format!(" joined! ({}/3)", players.len()))?;
 //!             }
 //!         }
-//!         set.into_iter().collect()
+//!         players
 //!     };
 //!
 //!     let _locks = bot.exclusive_many(&players).await?;
@@ -284,10 +286,13 @@
 //!             dm.inbox().next_chat().await?.text,
 //!             dm.inbox().next_chat().await?.text,
 //!         ])
-//!     };
+//!     }
+//!     .with_timeout(Duration::from_secs(60));
 //!
-//!     let mut cancel_in = alice.inbox();
-//!     match flow.until(cancel_in.wait_cmd("!cancel").ok_or_pending()).await {
+//!     match flow
+//!         .until(alice.inbox().into_wait_cmd("!cancel").ok_or_pending())
+//!         .await
+//!     {
 //!         Outcome::Completed(res) => res.map(Some),
 //!         Outcome::Stopped(_) => {
 //!             alice.say("Loadout selection cancelled.".yellow())?;
@@ -651,7 +656,7 @@ pub mod prelude {
     pub use crate::{
         fmt::Colorize as _, AskConfig, Bot, BotConfig, Breakout, ChatMessage, Error, Event,
         ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind, Outcome, Result,
-        Room, Target, Text, Turn, User, Verdict,
+        Room, Target, Text, Turn, User, UserId, Verdict,
     };
 }
 
@@ -666,7 +671,7 @@ pub use crate::{
     message::{ChatMessage, Event, MessageKind, Target},
     room::{Member, Room},
     supervise::{race_all, GameFutureExt, Outcome, Turn},
-    user::{ExclusiveDm, User},
+    user::{ExclusiveDm, User, UserId},
 };
 
 const _: () = {
@@ -674,6 +679,7 @@ const _: () = {
     assert_send_sync::<Bot>();
     assert_send_sync::<Room>();
     assert_send_sync::<User>();
+    assert_send_sync::<UserId>();
     assert_send_sync::<Member>();
     assert_send_sync::<AskConfig>();
     assert_send_sync::<InboxScope>();

@@ -3,21 +3,22 @@ use std::fmt;
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use irc_colors::Text;
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
+use tracing::Instrument as _;
 
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
-use crate::huddle::Huddle;
+use crate::huddle::{Huddle, HuddleSender};
 use crate::inbox::Inbox;
-use crate::message::{ChatMessage, Target, WireKind};
+use crate::message::{ChatMessage, Target};
 use crate::outbound::{OutboundChatKind, WriteReceipt};
 use crate::room::Room;
-use crate::user::{ExclusiveDm, User};
+use crate::user::{ExclusiveDm, User, UserId};
 
 mod private {
     pub trait Sealed {}
@@ -199,11 +200,6 @@ impl AskConfig {
     }
 
     pub(crate) fn apply_to_inbox(&self, inbox: &mut Inbox) {
-        match self.time_limit {
-            TimeLimit::None => inbox.clear_read_timeout(),
-            TimeLimit::Duration(d) => inbox.set_read_timeout(d),
-            TimeLimit::Deadline(dl) => inbox.set_read_deadline(dl),
-        }
         inbox.set_ignore_commands(self.ignore_commands);
         inbox.set_accept_notices(self.accept_notices);
     }
@@ -231,166 +227,112 @@ pub(crate) enum AskSource<'a> {
     },
 }
 
-enum ActiveEndpoint<'a> {
+enum EndpointSender<'a> {
     RoomOpen {
         room: &'a Room,
-        inbox: Inbox,
     },
     RoomUser {
         room: &'a Room,
         user: &'a User,
-        inbox: Inbox,
     },
-    OwnedDm {
+    Dm {
+        core: &'a Arc<BotCore>,
         user: &'a User,
-        dm: ExclusiveDm,
     },
-    BorrowedDm {
-        dm: &'a mut ExclusiveDm,
-    },
-    BorrowedHuddle {
-        huddle: &'a mut Huddle,
-        bounced_users: HashSet<u64>,
+    Huddle {
+        sender: HuddleSender<'a>,
+        bounced_users: Mutex<HashSet<UserId>>,
     },
 }
 
-impl<'a> ActiveEndpoint<'a> {
-    fn core(&self) -> Option<&Arc<BotCore>> {
+impl<'a> EndpointSender<'a> {
+    fn timeout_target_and_user(&self) -> (Target, Option<&'a User>) {
         match self {
-            ActiveEndpoint::RoomOpen { room, .. } | ActiveEndpoint::RoomUser { room, .. } => {
-                Some(room.core())
+            EndpointSender::RoomOpen { room } => (Target::Channel(room.name().to_owned()), None),
+            EndpointSender::RoomUser { room, user } => {
+                (Target::Channel(room.name().to_owned()), Some(user))
             }
-            ActiveEndpoint::OwnedDm { dm, .. } => Some(dm.core()),
-            ActiveEndpoint::BorrowedDm { dm } => Some(dm.core()),
-            ActiveEndpoint::BorrowedHuddle { huddle, .. } => huddle.core(),
+            EndpointSender::Dm { user, .. } => (Target::Dm, Some(user)),
+            EndpointSender::Huddle { .. } => (Target::Dm, None),
         }
     }
 
-    fn inbox_mut(&mut self) -> &mut Inbox {
-        match self {
-            ActiveEndpoint::RoomOpen { inbox, .. } => inbox,
-            ActiveEndpoint::RoomUser { inbox, .. } => inbox,
-            ActiveEndpoint::OwnedDm { dm, .. } => dm.inbox(),
-            ActiveEndpoint::BorrowedDm { dm } => dm.inbox(),
-            ActiveEndpoint::BorrowedHuddle { huddle, .. } => huddle.inbox(),
-        }
-    }
-
-    fn timeout_target_and_user(&self) -> (Target, Option<User>) {
-        match self {
-            ActiveEndpoint::RoomOpen { room, .. } => {
-                (Target::Channel(room.name().to_owned()), None)
-            }
-            ActiveEndpoint::RoomUser { room, user, .. } => {
-                (Target::Channel(room.name().to_owned()), Some((*user).clone()))
-            }
-            ActiveEndpoint::OwnedDm { user, .. } => (Target::Dm, Some((*user).clone())),
-            ActiveEndpoint::BorrowedDm { dm } => (Target::Dm, Some(dm.user().clone())),
-            ActiveEndpoint::BorrowedHuddle { .. } => (Target::Dm, None),
+    fn send_dm(core: &Arc<BotCore>, user: &User, text: Text) {
+        if core.check_connected().is_ok() && user.quit_error().is_none() {
+            let nick = user.nick();
+            let _ = core.send_chat_with_receipt(OutboundChatKind::Privmsg, &nick, text);
         }
     }
 
     fn send_broadcast_or_target(&self, text: Text) {
         match self {
-            ActiveEndpoint::RoomOpen { room, .. } | ActiveEndpoint::RoomUser { room, .. } => {
+            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
                 let _ = room.say(text);
             }
-            ActiveEndpoint::OwnedDm { dm, .. } => {
-                let _ = dm.say(text);
+            EndpointSender::Dm { core, user } => {
+                Self::send_dm(core, user, text);
             }
-            ActiveEndpoint::BorrowedDm { dm } => {
-                let _ = dm.say(text);
-            }
-            ActiveEndpoint::BorrowedHuddle { huddle, .. } => {
-                let _ = huddle.say(text);
+            EndpointSender::Huddle { sender, .. } => {
+                let _ = sender.broadcast_kind(OutboundChatKind::Privmsg, text);
             }
         }
     }
 
-    fn send_reject(&self, sender: &User, feedback: Text) {
+    fn send_reject(&self, sender_user: &User, feedback: Text) {
         match self {
-            ActiveEndpoint::RoomOpen { room, .. } | ActiveEndpoint::RoomUser { room, .. } => {
+            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
                 let _ = room.say(feedback);
             }
-            ActiveEndpoint::OwnedDm { dm, .. } => {
-                let _ = dm.say(feedback);
+            EndpointSender::Dm { core, user } => {
+                Self::send_dm(core, user, feedback);
             }
-            ActiveEndpoint::BorrowedDm { dm } => {
-                let _ = dm.say(feedback);
-            }
-            ActiveEndpoint::BorrowedHuddle { .. } => {
-                let _ = sender.say(feedback);
+            EndpointSender::Huddle { .. } => {
+                let _ = sender_user.say(feedback);
             }
         }
     }
 
     fn handle_ignore(&self, msg: &ChatMessage) {
-        if let ActiveEndpoint::BorrowedHuddle { huddle, .. } = self {
-            if huddle.has_relay() {
-                let _ = huddle.relay_to_others(msg);
+        if let EndpointSender::Huddle { sender, .. } = self {
+            if sender.has_relay() {
+                let _ = sender.relay_to_others(msg);
             }
         }
     }
 
     fn check_send_error(
-        &mut self,
+        &self,
         target: &str,
         target_user_id: Option<u64>,
         code: u16,
         message: &str,
     ) -> Option<Error> {
         match self {
-            ActiveEndpoint::RoomOpen { room, .. } | ActiveEndpoint::RoomUser { room, .. } => {
-                if room.casemap().str_eq(target, room.name()) {
-                    return Some(Error::DeliveryFailed {
+            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => room
+                .casemap()
+                .str_eq(target, room.name())
+                .then(|| Error::DeliveryFailed {
+                    target: target.to_owned(),
+                    code,
+                    message: message.to_owned(),
+                }),
+            EndpointSender::Dm { user, .. } => {
+                (target_user_id == Some(user.track_id()) || user.eq_nick(target)).then(|| {
+                    Error::DeliveryFailed {
                         target: target.to_owned(),
                         code,
                         message: message.to_owned(),
-                    });
-                }
-                None
+                    }
+                })
             }
-            ActiveEndpoint::OwnedDm { user, .. } => {
-                if target_user_id == Some(user.track_id()) || user.eq_nick(target) {
-                    return Some(Error::DeliveryFailed {
-                        target: target.to_owned(),
-                        code,
-                        message: message.to_owned(),
-                    });
-                }
-                None
-            }
-            ActiveEndpoint::BorrowedDm { dm } => {
-                let u = dm.user();
-                if target_user_id == Some(u.track_id()) || u.eq_nick(target) {
-                    return Some(Error::DeliveryFailed {
-                        target: target.to_owned(),
-                        code,
-                        message: message.to_owned(),
-                    });
-                }
-                None
-            }
-            ActiveEndpoint::BorrowedHuddle {
-                huddle,
+            EndpointSender::Huddle {
+                sender,
                 bounced_users,
             } => {
-                let matched_uid = target_user_id.filter(|id| huddle.contains_user_id(*id)).or_else(
-                    || {
-                        huddle
-                            .users()
-                            .iter()
-                            .find(|u| u.eq_nick(target))
-                            .map(User::track_id)
-                    },
-                );
-                if let Some(uid) = matched_uid {
-                    bounced_users.insert(uid);
-                    let any_reachable_online = huddle
-                        .users()
-                        .iter()
-                        .any(|u| u.is_online() && !bounced_users.contains(&u.track_id()));
-                    if !any_reachable_online {
+                if let Some(uid) = sender.find_matching_user_id(target, target_user_id) {
+                    let mut bounced = bounced_users.lock().unwrap();
+                    bounced.insert(uid);
+                    if !sender.any_reachable_online(&bounced) {
                         return Some(Error::DeliveryFailed {
                             target: target.to_owned(),
                             code,
@@ -404,52 +346,27 @@ impl<'a> ActiveEndpoint<'a> {
     }
 }
 
-type BoxLockFut<'a> = Pin<Box<dyn Future<Output = Result<ExclusiveDm>> + Send + 'a>>;
+type BoxAskFuture<'a, O> = Pin<Box<dyn Future<Output = Result<O>> + Send + 'a>>;
 
-enum AskState<'a> {
+enum AskState<'a, F, O> {
     Unstarted {
+        cfg: AskConfig,
         source: AskSource<'a>,
         prompt: Text,
+        matcher: Box<F>,
     },
-    AcquiringDm {
-        user: &'a User,
-        lock_fut: BoxLockFut<'a>,
-        prompt: Text,
-        span: tracing::Span,
-    },
-    AwaitingReceipt {
-        endpoint: ActiveEndpoint<'a>,
-        receipt: WriteReceipt,
-        span: tracing::Span,
-    },
-    WaitingReply {
-        endpoint: ActiveEndpoint<'a>,
-        write_completed_at: Instant,
-        configured_timeout: Option<Duration>,
-        reply_sleep: Option<Pin<Box<Sleep>>>,
-        warnings: Vec<(Pin<Box<Sleep>>, Text)>,
-        span: tracing::Span,
-    },
+    Running(BoxAskFuture<'a, O>),
     Done,
 }
 
 /// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`User::ask`],
 /// [`ExclusiveDm::ask`], and [`Huddle::ask`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Ask<'a, F, R> {
-    cfg: AskConfig,
-    matcher: Box<F>,
-    state: AskState<'a>,
-    _marker: std::marker::PhantomData<fn() -> R>,
+pub struct Ask<'a, F, R: IntoVerdict> {
+    state: AskState<'a, F, R::Output>,
 }
 
-struct BuiltTimers {
-    configured_timeout: Option<Duration>,
-    reply_sleep: Option<Pin<Box<Sleep>>>,
-    warnings: Vec<(Pin<Box<Sleep>>, Text)>,
-}
-
-impl<'a, F, R> Ask<'a, F, R> {
+impl<'a, F, R: IntoVerdict> Ask<'a, F, R> {
     pub(crate) fn new(
         source: AskSource<'a>,
         base_cfg: AskConfig,
@@ -457,65 +374,76 @@ impl<'a, F, R> Ask<'a, F, R> {
         matcher: F,
     ) -> Self {
         Self {
-            cfg: base_cfg,
-            matcher: Box::new(matcher),
-            state: AskState::Unstarted { source, prompt },
-            _marker: std::marker::PhantomData,
+            state: AskState::Unstarted {
+                cfg: base_cfg,
+                source,
+                prompt,
+                matcher: Box::new(matcher),
+            },
+        }
+    }
+
+    fn cfg_mut(&mut self) -> &mut AskConfig {
+        match &mut self.state {
+            AskState::Unstarted { cfg, .. } => cfg,
+            AskState::Running(_) | AskState::Done => {
+                unreachable!("Ask builder methods consume self before polling")
+            }
         }
     }
 
     /// Applies a reusable [`AskConfig`] value to this prompt.
     pub fn config(mut self, cfg: &AskConfig) -> Self {
-        self.cfg = cfg.clone();
+        *self.cfg_mut() = cfg.clone();
         self
     }
 
     /// Overrides the post-write reply deadline for this prompt.
     pub fn reply_timeout(mut self, duration: Duration) -> Self {
-        self.cfg.time_limit = TimeLimit::Duration(duration);
+        self.cfg_mut().time_limit = TimeLimit::Duration(duration);
         self
     }
 
     /// Overrides the post-write deadline for this prompt using an absolute [`Instant`].
     pub fn reply_deadline(mut self, instant: Instant) -> Self {
-        self.cfg.time_limit = TimeLimit::Deadline(instant);
+        self.cfg_mut().time_limit = TimeLimit::Deadline(instant);
         self
     }
 
     /// Disables the reply deadline for this prompt.
     pub fn no_reply_timeout(mut self) -> Self {
-        self.cfg.time_limit = TimeLimit::None;
+        self.cfg_mut().time_limit = TimeLimit::None;
         self
     }
 
     /// Schedules a countdown warning `msg` when `remaining` time is left on this `Ask`'s
     /// post-write reply clock.
     pub fn warn_remaining(mut self, remaining: Duration, msg: impl Into<Text>) -> Self {
-        self.cfg.warnings.push((remaining, msg.into()));
+        self.cfg_mut().warnings.push((remaining, msg.into()));
         self
     }
 
     /// Clears any countdown warnings inherited from the handle's or `config`'s [`AskConfig`].
     pub fn clear_warnings(mut self) -> Self {
-        self.cfg.warnings.clear();
+        self.cfg_mut().warnings.clear();
         self
     }
 
     /// Opt-in command skipping for this prompt (`BotConfig::command_prefixes`, default `["!"]`).
     pub fn ignore_commands(mut self) -> Self {
-        self.cfg.ignore_commands = true;
+        self.cfg_mut().ignore_commands = true;
         self
     }
 
     /// Opt-in human `NOTICE` acceptance for this prompt (`MessageKind::Notice`).
     pub fn accept_notices(mut self) -> Self {
-        self.cfg.accept_notices = true;
+        self.cfg_mut().accept_notices = true;
         self
     }
 
     /// Overrides the message sent to the target if *this `Ask`'s own reply timer* expires.
     pub fn timeout_message(mut self, msg: impl Into<Text>) -> Self {
-        self.cfg.timeout_handler = Some(TimeoutHandler::Static(msg.into()));
+        self.cfg_mut().timeout_handler = Some(TimeoutHandler::Static(msg.into()));
         self
     }
 
@@ -524,78 +452,281 @@ impl<'a, F, R> Ask<'a, F, R> {
         G: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
         M: Into<Text>,
     {
-        self.cfg.timeout_handler =
+        self.cfg_mut().timeout_handler =
             Some(TimeoutHandler::Dynamic(Arc::new(move |ctx| f(ctx).into())));
         self
     }
 
     /// Suppresses any inherited timeout message on this prompt.
     pub fn no_timeout_message(mut self) -> Self {
-        self.cfg.timeout_handler = None;
+        self.cfg_mut().timeout_handler = None;
         self
     }
+}
 
-    fn build_timers(cfg: &AskConfig, write_completed_at: Instant) -> BuiltTimers {
-        match cfg.time_limit {
-            TimeLimit::None => BuiltTimers {
-                configured_timeout: None,
-                reply_sleep: None,
-                warnings: Vec::new(),
-            },
-            TimeLimit::Duration(dur) => {
-                let deadline = write_completed_at + dur;
-                let mut warns = Vec::new();
-                for (rem, msg) in &cfg.warnings {
-                    if dur > *rem {
-                        let warn_at = write_completed_at + (dur - *rem);
-                        warns.push((warn_at, msg.clone()));
-                    }
-                }
-                warns.sort_by_key(|(at, _)| *at);
-                let warn_sleeps = warns
-                    .into_iter()
-                    .map(|(at, m)| (Box::pin(tokio::time::sleep_until(at)), m))
-                    .collect();
-                BuiltTimers {
-                    configured_timeout: Some(dur),
-                    reply_sleep: Some(Box::pin(tokio::time::sleep_until(deadline))),
-                    warnings: warn_sleeps,
+fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
+    let timeout_ms = match cfg.time_limit {
+        TimeLimit::Duration(d) => Some(d.as_millis() as u64),
+        TimeLimit::Deadline(_) | TimeLimit::None => None,
+    };
+    match source {
+        AskSource::RoomOpen { room, .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = room.name(),
+            user = Option::<&str>::None,
+            timeout_ms = timeout_ms
+        ),
+        AskSource::RoomUser { room, user, .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = room.name(),
+            user = %user.nick(),
+            timeout_ms = timeout_ms
+        ),
+        AskSource::UserDm { user, .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = "DM",
+            user = %user.nick(),
+            timeout_ms = timeout_ms
+        ),
+        AskSource::BorrowedDm { dm } => tracing::debug_span!(
+            "ircgm::ask",
+            target = "DM",
+            user = %dm.user().nick(),
+            timeout_ms = timeout_ms
+        ),
+        AskSource::BorrowedHuddle { .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = "Huddle",
+            user = Option::<&str>::None,
+            timeout_ms = timeout_ms
+        ),
+    }
+}
+
+fn compute_schedule(
+    cfg: &AskConfig,
+    write_completed_at: Instant,
+) -> (Option<Duration>, Option<Instant>, Vec<(Instant, Text)>) {
+    match cfg.time_limit {
+        TimeLimit::None => (None, None, Vec::new()),
+        TimeLimit::Duration(dur) => {
+            let deadline = write_completed_at + dur;
+            let mut warns = Vec::new();
+            for (rem, msg) in &cfg.warnings {
+                if !rem.is_zero() && dur > *rem {
+                    warns.push((write_completed_at + (dur - *rem), msg.clone()));
                 }
             }
-            TimeLimit::Deadline(deadline) => {
-                let budget = deadline.saturating_duration_since(write_completed_at);
-                let mut warns = Vec::new();
-                for (rem, msg) in &cfg.warnings {
-                    if budget > *rem {
-                        let warn_at = deadline - *rem;
-                        warns.push((warn_at, msg.clone()));
-                    }
+            warns.sort_by_key(|(at, _)| *at);
+            (Some(dur), Some(deadline), warns)
+        }
+        TimeLimit::Deadline(deadline) => {
+            let budget = deadline.saturating_duration_since(write_completed_at);
+            let mut warns = Vec::new();
+            for (rem, msg) in &cfg.warnings {
+                if !rem.is_zero() && budget > *rem {
+                    warns.push((deadline - *rem, msg.clone()));
                 }
-                warns.sort_by_key(|(at, _)| *at);
-                let warn_sleeps = warns
-                    .into_iter()
-                    .map(|(at, m)| (Box::pin(tokio::time::sleep_until(at)), m))
-                    .collect();
-                BuiltTimers {
-                    configured_timeout: None,
-                    reply_sleep: Some(Box::pin(tokio::time::sleep_until(deadline))),
-                    warnings: warn_sleeps,
+            }
+            warns.sort_by_key(|(at, _)| *at);
+            (None, Some(deadline), warns)
+        }
+    }
+}
+
+async fn await_ask_loop<'a, F, R>(
+    cfg: &AskConfig,
+    matcher: &mut F,
+    sender: EndpointSender<'a>,
+    inbox: &mut Inbox,
+    receipt: WriteReceipt,
+) -> Result<R::Output>
+where
+    F: FnMut(&ChatMessage) -> R + Send,
+    R: IntoVerdict,
+{
+    receipt.wait().await;
+    let write_completed_at = Instant::now();
+    tracing::debug!("ask prompt written; waiting for reply");
+
+    let (configured_timeout, deadline, warnings) = compute_schedule(cfg, write_completed_at);
+
+    let reply_fut = inbox.wait_reply_map(
+        cfg.ignore_commands,
+        cfg.accept_notices,
+        |target, target_user_id, code, message| {
+            let err = sender.check_send_error(target, target_user_id, code, message);
+            if let Some(ref e) = err {
+                tracing::debug!(error = %e, "ask delivery bounced");
+            }
+            err
+        },
+        |msg| match matcher(msg).into_verdict() {
+            Verdict::Accept(val) => {
+                tracing::debug!(sender = %msg.nick, seq = msg.seq, "ask reply accepted");
+                Some(val)
+            }
+            Verdict::Reject(feedback) => {
+                sender.send_reject(&msg.sender, feedback);
+                None
+            }
+            Verdict::Ignore => {
+                sender.handle_ignore(msg);
+                None
+            }
+        },
+    );
+
+    let timer_fut = async {
+        match deadline {
+            None => std::future::pending::<()>().await,
+            Some(dl) => {
+                let send_warnings = async {
+                    for (warn_at, warn_msg) in warnings {
+                        tokio::time::sleep_until(warn_at).await;
+                        if Instant::now() < dl {
+                            sender.send_broadcast_or_target(warn_msg);
+                        }
+                    }
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(dl) => {}
+                    () = send_warnings => {}
                 }
             }
         }
-    }
+    };
 
-    fn make_span(cfg: &AskConfig, target: &str, user: Option<&str>) -> tracing::Span {
-        let timeout_ms = match cfg.time_limit {
-            TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-            TimeLimit::Deadline(_) | TimeLimit::None => None,
-        };
-        tracing::debug_span!(
-            "ircgm::ask",
-            target = target,
-            user = user,
-            timeout_ms = timeout_ms
-        )
+    tokio::select! {
+        biased;
+        res = reply_fut => {
+            if let Err(ref e) = res {
+                tracing::debug!(error = %e, "ask interrupted");
+            }
+            res
+        }
+        () = timer_fut => {
+            if let Some(handler) = &cfg.timeout_handler {
+                let (target, user_ref) = sender.timeout_target_and_user();
+                let ctx = TimeoutCtx {
+                    target: &target,
+                    user: user_ref,
+                    configured_timeout,
+                    elapsed: write_completed_at.elapsed(),
+                };
+                sender.send_broadcast_or_target(handler.render(&ctx));
+            }
+            tracing::debug!("ask reply timer expired");
+            Err(Error::TimedOut)
+        }
+    }
+}
+
+async fn run_ask<'a, F, R>(
+    cfg: AskConfig,
+    source: AskSource<'a>,
+    prompt: Text,
+    mut matcher: Box<F>,
+) -> Result<R::Output>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoVerdict + 'a,
+    R::Output: Send + 'a,
+{
+    match source {
+        AskSource::RoomOpen { room, caller } => {
+            room.ensure_bot_in_room_if_tracked()?;
+            let mut inbox = room.inbox_at(caller);
+            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::RoomOpen { room },
+                &mut inbox,
+                receipt,
+            )
+            .await
+        }
+        AskSource::RoomUser { room, user, caller } => {
+            if !user.belongs_to(room.core()) {
+                return Err(Error::InvalidInput(
+                    "User handle belongs to a different Bot session",
+                ));
+            }
+            room.ensure_user_askable(user)?;
+            let mut inbox = user.inbox_in_at(room, caller);
+            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::RoomUser { room, user },
+                &mut inbox,
+                receipt,
+            )
+            .await
+        }
+        AskSource::UserDm { user, caller } => {
+            let mut dm = match user.exclusive_at(caller).await {
+                Ok(dm) => dm,
+                Err(e) => {
+                    tracing::debug!(error = %e, "ask aborted before DM prompt write");
+                    return Err(e);
+                }
+            };
+            dm.inbox().clear();
+            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let (core, dm_user, inbox) = dm.split_for_ask();
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::Dm {
+                    core,
+                    user: dm_user,
+                },
+                inbox,
+                receipt,
+            )
+            .await
+        }
+        AskSource::BorrowedDm { dm } => {
+            dm.core().check_connected()?;
+            if let Some(err) = dm.user().quit_error() {
+                return Err(err);
+            }
+            dm.inbox().clear();
+            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let (core, dm_user, inbox) = dm.split_for_ask();
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::Dm {
+                    core,
+                    user: dm_user,
+                },
+                inbox,
+                receipt,
+            )
+            .await
+        }
+        AskSource::BorrowedHuddle { huddle } => {
+            huddle.check_connected()?;
+            huddle.inbox().clear();
+            let (sender, inbox) = huddle.split_for_ask();
+            let receipt = sender.broadcast_prompt_with_receipt(prompt)?;
+            await_ask_loop(
+                &cfg,
+                &mut *matcher,
+                EndpointSender::Huddle {
+                    sender,
+                    bounced_users: Mutex::new(HashSet::new()),
+                },
+                inbox,
+                receipt,
+            )
+            .await
+        }
     }
 }
 
@@ -607,331 +738,33 @@ where
 {
     type Output = Result<R::Output>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        loop {
-            let state = std::mem::replace(&mut this.state, AskState::Done);
-            match state {
-                AskState::Unstarted { source, prompt } => match source {
-                    AskSource::RoomOpen { room, caller } => {
-                        if let Err(e) = room.ensure_bot_in_room_if_tracked() {
-                            return Poll::Ready(Err(e));
-                        }
-                        let span = Self::make_span(&this.cfg, room.name(), None);
-                        let inbox = room.inbox_at(caller);
-                        let receipt = match room
-                            .send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)
-                        {
-                            Ok(r) => r,
-                            Err(e) => return Poll::Ready(Err(e)),
-                        };
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint: ActiveEndpoint::RoomOpen { room, inbox },
-                            receipt,
-                            span,
-                        };
-                    }
-                    AskSource::RoomUser { room, user, caller } => {
-                        if !user.belongs_to(room.core()) {
-                            return Poll::Ready(Err(Error::InvalidInput(
-                                "User handle belongs to a different Bot session",
-                            )));
-                        }
-                        if let Err(e) = room.ensure_user_askable(user) {
-                            return Poll::Ready(Err(e));
-                        }
-                        let user_nick = user.nick();
-                        let span = Self::make_span(&this.cfg, room.name(), Some(&user_nick));
-                        let inbox = user.inbox_in_at(room, caller);
-                        let receipt = match room
-                            .send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)
-                        {
-                            Ok(r) => r,
-                            Err(e) => return Poll::Ready(Err(e)),
-                        };
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint: ActiveEndpoint::RoomUser { room, user, inbox },
-                            receipt,
-                            span,
-                        };
-                    }
-                    AskSource::UserDm { user, caller } => {
-                        let nick = user.nick();
-                        let span = Self::make_span(&this.cfg, "DM", Some(&nick));
-                        let lock_fut = Box::pin(user.exclusive_at(caller));
-                        this.state = AskState::AcquiringDm {
-                            user,
-                            lock_fut,
-                            prompt,
-                            span,
-                        };
-                    }
-                    AskSource::BorrowedDm { dm } => {
-                        if let Err(e) = dm.core().check_connected() {
-                            return Poll::Ready(Err(e));
-                        }
-                        if let Some(err) = dm.user().quit_error() {
-                            return Poll::Ready(Err(err));
-                        }
-                        let nick = dm.user().nick();
-                        let span = Self::make_span(&this.cfg, "DM", Some(&nick));
-                        dm.inbox().clear();
-                        let receipt =
-                            match dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt) {
-                                Ok(r) => r,
-                                Err(e) => return Poll::Ready(Err(e)),
-                            };
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint: ActiveEndpoint::BorrowedDm { dm },
-                            receipt,
-                            span,
-                        };
-                    }
-                    AskSource::BorrowedHuddle { huddle } => {
-                        if let Some(core) = huddle.core() {
-                            if let Err(e) = core.check_connected() {
-                                return Poll::Ready(Err(e));
-                            }
-                        }
-                        let span = Self::make_span(&this.cfg, "Huddle", None);
-                        huddle.inbox().clear();
-                        let receipt = match huddle.broadcast_prompt_with_receipt(prompt) {
-                            Ok(r) => r,
-                            Err(e) => return Poll::Ready(Err(e)),
-                        };
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint: ActiveEndpoint::BorrowedHuddle {
-                                huddle,
-                                bounced_users: HashSet::new(),
-                            },
-                            receipt,
-                            span,
-                        };
-                    }
-                },
-
-                AskState::AcquiringDm {
-                    user,
-                    mut lock_fut,
-                    prompt,
-                    span,
-                } => match lock_fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(mut dm)) => {
-                        dm.inbox().clear();
-                        let receipt =
-                            match dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt) {
-                                Ok(r) => r,
-                                Err(e) => return Poll::Ready(Err(e)),
-                            };
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint: ActiveEndpoint::OwnedDm { user, dm },
-                            receipt,
-                            span,
-                        };
-                    }
-                    Poll::Ready(Err(e)) => {
-                        let _g = span.enter();
-                        tracing::debug!(error = %e, "ask aborted before DM prompt write");
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Pending => {
-                        this.state = AskState::AcquiringDm {
-                            user,
-                            lock_fut,
-                            prompt,
-                            span,
-                        };
-                        return Poll::Pending;
-                    }
-                },
-
-                AskState::AwaitingReceipt {
-                    endpoint,
-                    mut receipt,
-                    span,
-                } => match receipt.poll(cx) {
-                    Poll::Ready(()) => {
-                        let write_completed_at = Instant::now();
-                        let BuiltTimers {
-                            configured_timeout,
-                            reply_sleep,
-                            warnings,
-                        } = Self::build_timers(&this.cfg, write_completed_at);
-                        {
-                            let _g = span.enter();
-                            tracing::debug!("ask prompt written; waiting for reply");
-                        }
-                        this.state = AskState::WaitingReply {
-                            endpoint,
-                            write_completed_at,
-                            configured_timeout,
-                            reply_sleep,
-                            warnings,
-                            span,
-                        };
-                    }
-                    Poll::Pending => {
-                        this.state = AskState::AwaitingReceipt {
-                            endpoint,
-                            receipt,
-                            span,
-                        };
-                        return Poll::Pending;
-                    }
-                },
-
-                AskState::WaitingReply {
-                    mut endpoint,
-                    write_completed_at,
-                    configured_timeout,
-                    mut reply_sleep,
-                    warnings,
-                    span,
-                } => {
-                    // 1. Drain all ready incoming wire frames (bypassing inbox's idle `read_limit`!):
-                    loop {
-                        match endpoint.inbox_mut().poll_next_wire(cx, false) {
-                            Poll::Ready(Ok(ev)) => {
-                                match &ev.kind {
-                                    WireKind::SendError {
-                                        target,
-                                        target_user_id,
-                                        code,
-                                        message,
-                                    } => {
-                                        if let Some(err) = endpoint.check_send_error(
-                                            target,
-                                            *target_user_id,
-                                            *code,
-                                            message,
-                                        ) {
-                                            let _g = span.enter();
-                                            tracing::debug!(error = %err, "ask delivery bounced");
-                                            return Poll::Ready(Err(err));
-                                        }
-                                    }
-                                    WireKind::Chat(msg) => {
-                                        if let Some(res) = Self::evaluate_candidate(
-                                            &this.cfg,
-                                            &mut this.matcher,
-                                            &endpoint,
-                                            msg,
-                                            &span,
-                                        ) {
-                                            return Poll::Ready(res);
-                                        }
-                                    }
-                                    WireKind::Notice {
-                                        human_chat: Some(msg),
-                                        ..
-                                    } if this.cfg.accept_notices => {
-                                        if let Some(res) = Self::evaluate_candidate(
-                                            &this.cfg,
-                                            &mut this.matcher,
-                                            &endpoint,
-                                            msg,
-                                            &span,
-                                        ) {
-                                            return Poll::Ready(res);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Poll::Ready(Err(e)) => {
-                                let _g = span.enter();
-                                tracing::debug!(error = %e, "ask interrupted");
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => break,
-                        }
-                    }
-
-                    // 2. Check post-write reply deadline:
-                    if let Some(sleep) = reply_sleep.as_mut() {
-                        if sleep.as_mut().poll(cx).is_ready() {
-                            if let Some(handler) = &this.cfg.timeout_handler {
-                                let (target, user_owned) = endpoint.timeout_target_and_user();
-                                let ctx = TimeoutCtx {
-                                    target: &target,
-                                    user: user_owned.as_ref(),
-                                    configured_timeout,
-                                    elapsed: write_completed_at.elapsed(),
-                                };
-                                let msg = handler.render(&ctx);
-                                endpoint.send_broadcast_or_target(msg);
-                            }
-                            {
-                                let _g = span.enter();
-                                tracing::debug!("ask reply timer expired");
-                            }
-                            return Poll::Ready(Err(Error::TimedOut));
-                        }
-                    }
-
-                    // 3. Poll any pending `warn_remaining` timers:
-                    let mut remaining_warns = Vec::with_capacity(warnings.len());
-                    for (mut w_sleep, w_msg) in warnings {
-                        if w_sleep.as_mut().poll(cx).is_ready() {
-                            endpoint.send_broadcast_or_target(w_msg);
-                        } else {
-                            remaining_warns.push((w_sleep, w_msg));
-                        }
-                    }
-
-                    this.state = AskState::WaitingReply {
-                        endpoint,
-                        write_completed_at,
-                        configured_timeout,
-                        reply_sleep,
-                        warnings: remaining_warns,
-                        span,
-                    };
-                    return Poll::Pending;
-                }
-
-                AskState::Done => panic!("Ask polled after completion"),
-            }
-        }
-    }
-}
-
-impl<'a, F, R> Ask<'a, F, R>
-where
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoVerdict + 'a,
-    R::Output: Send + 'a,
-{
-    fn evaluate_candidate(
-        cfg: &AskConfig,
-        matcher: &mut F,
-        endpoint: &ActiveEndpoint<'a>,
-        msg: &ChatMessage,
-        span: &tracing::Span,
-    ) -> Option<Result<R::Output>> {
-        if cfg.ignore_commands {
-            if let Some(core) = endpoint.core() {
-                if core.is_command_text(&msg.text) {
-                    return None;
-                }
-            }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if matches!(this.state, AskState::Unstarted { .. }) {
+            let AskState::Unstarted {
+                cfg,
+                source,
+                prompt,
+                matcher,
+            } = std::mem::replace(&mut this.state, AskState::Done)
+            else {
+                unreachable!()
+            };
+            let span = make_span(&cfg, &source);
+            let fut = run_ask(cfg, source, prompt, matcher).instrument(span);
+            this.state = AskState::Running(Box::pin(fut));
         }
 
-        let verdict = matcher(msg).into_verdict();
-        match verdict {
-            Verdict::Accept(val) => {
-                let _g = span.enter();
-                tracing::debug!(sender = %msg.nick, seq = msg.seq, "ask reply accepted");
-                Some(Ok(val))
+        match &mut this.state {
+            AskState::Running(fut) => {
+                let poll_res = fut.as_mut().poll(cx);
+                if poll_res.is_ready() {
+                    this.state = AskState::Done;
+                }
+                poll_res
             }
-            Verdict::Reject(feedback) => {
-                endpoint.send_reject(&msg.sender, feedback);
-                None
-            }
-            Verdict::Ignore => {
-                endpoint.handle_ignore(msg);
-                None
-            }
+            AskState::Done => panic!("Ask polled after completion"),
+            AskState::Unstarted { .. } => unreachable!(),
         }
     }
 }

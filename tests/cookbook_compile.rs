@@ -23,7 +23,7 @@ pub async fn lobby(bot: Bot, room: Room) -> Result<()> {
     loop {
         let trigger = match room
             .inbox()
-            .wait_cmd("!heist")
+            .into_wait_cmd("!heist")
             .until(bot.shutdown_requested())
             .await
         {
@@ -32,15 +32,15 @@ pub async fn lobby(bot: Bot, room: Room) -> Result<()> {
         };
         let leader = &trigger.sender;
 
-        let mut admin_inbox = bot.inbox_all();
-        let admin_stop = admin_inbox
-            .wait_for(|m| is_admin(m) && m.is_cmd("!stop") && (m.is_dm() || m.is_in(&room)))
+        let admin_stop = bot
+            .inbox_all()
+            .into_wait_for(|m| is_admin(m) && m.is_cmd("!stop") && (m.is_dm() || m.is_in(&room)))
             .ok_or_pending()
             .map_output(Stop::Admin);
 
-        let mut abort_inbox = leader.inbox();
-        let leader_abort = abort_inbox
-            .wait_cmd("!abort")
+        let leader_abort = leader
+            .inbox()
+            .into_wait_cmd("!abort")
             .ok_or_pending()
             .map_output(Stop::LeaderAbort);
 
@@ -180,21 +180,22 @@ pub async fn blackjack_round(room: &Room, players: &[User]) -> Result<()> {
     Ok(())
 }
 
-// 5.3 Quiz (`User` hashes only its immutable session `u64` ID)
-#[allow(clippy::mutable_key_type)]
+// 5.3 Quiz (`UserId` is a lightweight `Copy` session key preserving join order in `players`)
 pub async fn quiz_game(bot: Bot, room: Room) -> Result<()> {
     let players: Vec<User> = {
         let mut inbox = room.inbox();
         room.say("First 3 to type " + "!join".bold().green() + " get to play!")?;
 
-        let mut set = HashSet::with_capacity(3);
-        while set.len() < 3 {
+        let mut seen = HashSet::with_capacity(3);
+        let mut players = Vec::with_capacity(3);
+        while players.len() < 3 {
             let msg = inbox.wait_cmd("!join").await?;
-            if set.insert(msg.sender.clone()) {
-                room.say(msg.sender.nick().bold() + format!(" joined! ({}/3)", set.len()))?;
+            if seen.insert(msg.sender.id()) {
+                players.push(msg.sender.clone());
+                room.say(msg.sender.nick().bold() + format!(" joined! ({}/3)", players.len()))?;
             }
         }
-        set.into_iter().collect()
+        players
     };
 
     let _locks = bot.exclusive_many(&players).await?;
@@ -289,10 +290,13 @@ pub async fn pick_loadout_or_cancel(alice: &User) -> Result<Option<[String; 3]>>
             dm.inbox().next_chat().await?.text,
             dm.inbox().next_chat().await?.text,
         ])
-    };
+    }
+    .with_timeout(Duration::from_secs(60));
 
-    let mut cancel_in = alice.inbox();
-    match flow.until(cancel_in.wait_cmd("!cancel").ok_or_pending()).await {
+    match flow
+        .until(alice.inbox().into_wait_cmd("!cancel").ok_or_pending())
+        .await
+    {
         Outcome::Completed(res) => res.map(Some),
         Outcome::Stopped(_) => {
             alice.say("Loadout selection cancelled.".yellow())?;

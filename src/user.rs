@@ -1,7 +1,6 @@
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -293,10 +292,31 @@ impl UserRegistry {
     }
 }
 
+/// Lightweight, `Copy`, immutable session identifier for a [`User`] ([`User::id`]).
+///
+/// Suitable as a key in `HashMap<UserId, V>`, `HashSet<UserId>`, `BTreeMap<UserId, V>`,
+/// or `BTreeSet<UserId>` without interior-mutability lints (`clippy::mutable_key_type`),
+/// handle cloning on lookups, or keeping offline [`User`] allocations alive in score/vote tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UserId(pub(crate) u64);
+
+impl UserId {
+    /// Returns the raw session-unique monotonic `u64` identifier.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for UserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Config-free, cycle-free, `NICK`/`QUIT`-aware session identity handle.
 ///
-/// Equality, ordering, and hashing use `UserTrack::id` ONLY, surviving `/nick` changes
-/// and RFC 1459 case-folding with 100% behavioral equivalence across equal `User` handles.
+/// Equality uses the session-unique [`UserId`] (`UserTrack::id`), surviving `/nick` changes
+/// and RFC 1459 case-folding. For `HashMap`/`HashSet`/`BTreeMap` keys, use [`User::id`].
 #[derive(Clone, Debug)]
 pub struct User {
     core: Weak<BotCore>,
@@ -311,24 +331,6 @@ impl PartialEq for User {
 
 impl Eq for User {}
 
-impl PartialOrd for User {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for User {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.track.id.cmp(&other.track.id)
-    }
-}
-
-impl Hash for User {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.track.id.hash(state);
-    }
-}
-
 impl User {
     pub(crate) fn from_parts(core: Weak<BotCore>, track: Arc<UserTrack>) -> Self {
         Self { core, track }
@@ -336,6 +338,11 @@ impl User {
 
     pub(crate) fn track_id(&self) -> u64 {
         self.track.id
+    }
+
+    /// Returns this user's lightweight `Copy` session identifier (`Hash + Eq + Ord`).
+    pub fn id(&self) -> UserId {
+        UserId(self.track.id)
     }
 
     pub(crate) fn track_arc(&self) -> Arc<UserTrack> {
@@ -593,6 +600,10 @@ impl Drop for ExclusiveDm {
 impl ExclusiveDm {
     pub(crate) fn core(&self) -> &Arc<BotCore> {
         &self.core
+    }
+
+    pub(crate) fn split_for_ask(&mut self) -> (&Arc<BotCore>, &User, &mut Inbox) {
+        (&self.core, &self.user, &mut self.inbox)
     }
 
     pub(crate) fn send_chat_with_receipt(
