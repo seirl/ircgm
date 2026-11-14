@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::future::poll_fn;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -588,6 +589,16 @@ pub struct Inbox {
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
+}
+
+impl fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inbox")
+            .field("scope", &self.scope_label)
+            .field("slot_id", &self.slot_id)
+            .field("opened_at", &self.opened_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for Inbox {

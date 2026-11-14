@@ -109,21 +109,21 @@ pub use crate::{
 };
 
 const _: () = {
-    const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<Bot>();
-    assert_send_sync::<Room>();
-    assert_send_sync::<User>();
-    assert_send_sync::<UserId>();
-    assert_send_sync::<Member>();
-    assert_send_sync::<AskConfig>();
-    assert_send_sync::<InboxScope>();
-    assert_send_sync::<MessageKind>();
-    assert_send_sync::<ChatMessage>();
-    assert_send_sync::<Event>();
-    assert_send_sync::<Breakout>();
-    assert_send_sync::<ExclusiveDm>();
-    assert_send_sync::<Huddle>();
-    assert_send_sync::<Inbox>();
-    assert_send_sync::<Answer<()>>();
-    assert_send_sync::<AskMatch<()>>();
+    const fn assert_send_sync_debug<T: Send + Sync + std::fmt::Debug>() {}
+    assert_send_sync_debug::<Bot>();
+    assert_send_sync_debug::<Room>();
+    assert_send_sync_debug::<User>();
+    assert_send_sync_debug::<UserId>();
+    assert_send_sync_debug::<Member>();
+    assert_send_sync_debug::<AskConfig>();
+    assert_send_sync_debug::<InboxScope>();
+    assert_send_sync_debug::<MessageKind>();
+    assert_send_sync_debug::<ChatMessage>();
+    assert_send_sync_debug::<Event>();
+    assert_send_sync_debug::<Breakout>();
+    assert_send_sync_debug::<ExclusiveDm>();
+    assert_send_sync_debug::<Huddle>();
+    assert_send_sync_debug::<Inbox>();
+    assert_send_sync_debug::<Answer<()>>();
+    assert_send_sync_debug::<AskMatch<()>>();
 };

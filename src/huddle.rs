@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
@@ -115,6 +116,14 @@ pub struct Huddle {
     ask_config: AskConfig,
     relay_prefix: Option<Text>,
     relay_commands: bool,
+}
+
+impl fmt::Debug for Huddle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Huddle")
+            .field("guards", &self.guards)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Huddle {

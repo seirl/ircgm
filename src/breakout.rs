@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::future::poll_fn;
 use std::ops::Deref;
 use std::panic::Location;
@@ -141,6 +142,15 @@ pub struct Breakout {
     room: Room,
     opts: BreakoutOptions,
     armed: bool,
+}
+
+impl fmt::Debug for Breakout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Breakout")
+            .field("room", &self.room)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Deref for Breakout {
