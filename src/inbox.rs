@@ -167,7 +167,13 @@ impl InboxSlot {
 }
 
 /// One exact role a slot plays: every slot in a bucket wants every event routed to it, so
-/// dispatch never re-filters.
+/// dispatch never re-filters (keeping `O(1)` lookup even with ~1,000 `UsersInRoom` slots in a
+/// single channel, and `O(1)` `swap_remove` on `Drop` via cached `InboxSlot::keys`).
+///
+/// Dispatch is intentionally pure fan-out with no shadowing: `ExclusiveDm` and `Huddle`
+/// serialize cooperative DM prompts via `UserTrack::dm_mutex`, while unserialized `user.inbox()`
+/// and `bot.inbox*()` continue receiving DMs so external `.until(...)` cancel/stop supervisors
+/// keep working while a prompt holds the DM lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BucketKey {
     /// `Filter::All`: every event.

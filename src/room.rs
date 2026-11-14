@@ -539,6 +539,11 @@ impl Room {
             .core
             .inboxes
             .subscribe(Arc::clone(&self.core), filter, caller);
+        // Conversation scopes (`Room`, `Breakout`, `ExclusiveDm`, `Huddle`) propagate their
+        // `AskConfig` stream flags (`ignore_commands`, `accept_notices`) onto `.inbox*()` so
+        // `room.with_ask_config` sets policy room-wide across both prompts and listeners (while
+        // `wait_cmd` / `on_cmd` explicitly override `ignore_commands = false`). `Bot` and `User`
+        // stay config-free so session routers and stop triggers start unfiltered.
         self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
     }

@@ -387,7 +387,10 @@ impl fmt::Display for UserId {
 /// Config-free, cycle-free, `NICK`/`QUIT`-aware session identity handle.
 ///
 /// Equality uses the session-unique [`UserId`] (`UserTrack::id`), surviving `/nick` changes
-/// and RFC 1459 case-folding. For `HashMap`/`HashSet`/`BTreeMap` keys, use [`User::id`].
+/// and RFC 1459 case-folding. `User` deliberately omits `Hash` and `Ord` in favor of
+/// [`User::id`]: `UserTrack` contains interior mutability (`RwLock`/`Mutex`/`AtomicU8`), which
+/// would trigger `clippy::mutable_key_type` on every caller's `HashMap<User, _>` / `HashSet<User>`,
+/// and keying long-lived tables by `UserId` avoids pinning departed `UserTrack` allocations.
 #[derive(Clone, Debug)]
 pub struct User {
     core: Weak<BotCore>,

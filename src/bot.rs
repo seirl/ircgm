@@ -196,6 +196,12 @@ impl BotCore {
         });
     }
 
+    /// Transitions to `Disconnected` at most once.
+    ///
+    /// Ordering invariant: `lifecycle_tx` MUST publish `Disconnected` before `outbound.abort()`
+    /// and `inboxes.clear()`. `Inbox` does not subscribe to `lifecycle_tx`; instead, dropping
+    /// every sender in `inboxes.clear()` wakes parked `Inbox` polls with `Ready(None)`, which
+    /// then read `disconnect_reason()`.
     pub(crate) fn mark_disconnected(&self, reason: DisconnectReason) {
         let transitioned = self.lifecycle_tx.send_if_modified(|state| match state {
             ConnLifecycle::Disconnected(_) => false,
@@ -289,6 +295,13 @@ impl BotCore {
     }
 }
 
+/// Owns the live background tasks for a [`Bot`] session separately from [`BotCore`].
+///
+/// Cycle-prevention invariant: `pump_task` holds a strong `Arc<BotCore>`, and `WorldState` holds
+/// `Arc<UserTrack>`s. Splitting [`Bot`] (`Arc<BotOwner>`) -> `Arc<BotCore>` while [`User`] holds
+/// only `Weak<BotCore>` ensures dropping the caller's last `Bot` handle immediately runs
+/// [`BotOwner::drop`] (aborting `pump_task` and clearing state) even when `User` or `Member`
+/// values remain stored in caller data structures.
 pub(crate) struct BotOwner {
     pub(crate) core: Arc<BotCore>,
     pub(crate) pump_task: JoinHandle<()>,

@@ -90,6 +90,13 @@ impl CaseMap {
 
 /// Shared lock-free [`CaseMap`] cell owned by `BotCore` and shared across `WorldState`,
 /// `UserRegistry`, `UserTrack`, `InboxRegistry`, and `OutboundSink`.
+///
+/// Concurrency invariant: structures that key `HashMap<FoldedStr, _>` (`WorldState`,
+/// `UserRegistry`, `InboxRegistry`) ALSO keep a plain `CaseMap` inside their own lock and fold
+/// lookup keys exclusively with that lock-internal copy. Because `005 CASEMAPPING=...` re-keys
+/// those three maps sequentially across separate locks, folding via `AtomicCaseMap::load()`
+/// during the torn window would hash lookups under the new casemap before a map's keys were
+/// re-hashed.
 #[derive(Clone, Debug)]
 pub(crate) struct AtomicCaseMap(Arc<AtomicU8>);
 
