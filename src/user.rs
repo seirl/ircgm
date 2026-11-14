@@ -19,7 +19,6 @@ use crate::message::ChatMessage;
 use crate::outbound::OutboundChatKind;
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
-pub(crate) const MAX_RENAME_RETRIES: u8 = 3;
 
 /// Live connection state of a tracked IRC user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,38 +93,13 @@ impl UserTrack {
     pub(crate) fn status(&self) -> UserStatus {
         self.status_tx.borrow().clone()
     }
-
-    /// Returns `Some(new_nick)` if a `401` bounced an outdated pre-rename nick while
-    /// `self` is still online under `new_nick` and retry budget remains.
-    pub(crate) fn next_rename_retry_nick(
-        &self,
-        bounced_target: &str,
-        retries: &mut u8,
-    ) -> Option<String> {
-        let cur_nick = self.nick();
-        if self.is_online()
-            && !cur_nick.is_empty()
-            && !self.casemap().str_eq(&cur_nick, bounced_target)
-            && *retries < MAX_RENAME_RETRIES
-        {
-            *retries += 1;
-            Some(cur_nick)
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Default)]
 struct RegistryState {
     casemap: CaseMap,
     tracks: HashMap<FoldedStr, Weak<UserTrack>>,
-    /// Vacated pre-rename nicks (`folded -> (raw_old_nick, Weak<UserTrack>)`) so in-flight
-    /// bounces (`401`, `486`, `716`, etc.) crossing with `NICK` still resolve `target_user_id`.
-    /// Evicted immediately if another user claims that nick.
-    former_tracks: HashMap<FoldedStr, (String, Weak<UserTrack>)>,
     last_live_count: usize,
-    last_former_count: usize,
 }
 
 impl RegistryState {
@@ -136,12 +110,6 @@ impl RegistryState {
         if self.tracks.len() > threshold {
             self.tracks.retain(|_, weak| weak.strong_count() > 0);
             self.last_live_count = self.tracks.len();
-        }
-        let former_threshold = 2 * self.last_former_count.max(32);
-        if self.former_tracks.len() > former_threshold {
-            self.former_tracks
-                .retain(|_, (_, weak)| weak.upgrade().is_some_and(|t| t.is_online()));
-            self.last_former_count = self.former_tracks.len();
         }
     }
 }
@@ -187,7 +155,6 @@ impl UserRegistry {
             return existing;
         }
 
-        state.former_tracks.remove(&folded);
         let id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
         let track = Arc::new(UserTrack::new(id, nick.to_owned(), self.casemap.clone()));
         state.tracks.insert(folded, Arc::downgrade(&track));
@@ -217,12 +184,6 @@ impl UserRegistry {
         };
 
         track.set_nick(new_nick.to_owned());
-        state.former_tracks.remove(&new_folded);
-        if old_folded != new_folded {
-            state
-                .former_tracks
-                .insert(old_folded, (old_nick.to_owned(), Arc::downgrade(&track)));
-        }
         state.tracks.insert(new_folded, Arc::downgrade(&track));
         track
     }
@@ -261,10 +222,6 @@ impl UserRegistry {
 
     /// Resolves a non-channel send-refusal / PM-block target (`401`, `486`, `716`, etc.) to
     /// `(target_user_id, quit_track_id)`.
-    ///
-    /// On `401 ERR_NOSUCHNICK`, only an *active* entry in `tracks` is marked `Quit`; if `target`
-    /// was vacated by a recent `NICK` (`former_tracks`), the online user keeps their new nick and
-    /// `Online` status while still receiving `target_user_id = Some(track.id)`.
     pub(crate) fn resolve_send_error(
         &self,
         target: &str,
@@ -273,50 +230,12 @@ impl UserRegistry {
         message: &str,
     ) -> (Option<u64>, Option<u64>) {
         if code == 401 {
-            let (active, former_id) = {
-                let mut state = self.state.lock().unwrap();
-                state.maybe_sweep();
-                let folded = state.casemap.fold(target);
-                if let Some(track) = state.tracks.remove(&folded).and_then(|w| w.upgrade()) {
-                    (Some(track), None)
-                } else {
-                    let fid = state
-                        .former_tracks
-                        .get(&folded)
-                        .and_then(|(_, w)| w.upgrade())
-                        .filter(|t| t.is_online())
-                        .map(|t| t.id);
-                    (None, fid)
-                }
-            };
-            if let Some(track) = active {
-                let live_nick = track.nick();
-                let _ = track.status_tx.send_replace(UserStatus::Quit {
-                    at_seq,
-                    nick: live_nick,
-                    reason: Some(message.to_owned()),
-                });
-                (Some(track.id), Some(track.id))
-            } else {
-                (former_id, None)
+            match self.mark_quit(target, at_seq, Some(message.to_owned())) {
+                Some(track) => (Some(track.id), Some(track.id)),
+                None => (None, None),
             }
         } else {
-            let mut state = self.state.lock().unwrap();
-            state.maybe_sweep();
-            let folded = state.casemap.fold(target);
-            let id = state
-                .tracks
-                .get(&folded)
-                .and_then(Weak::upgrade)
-                .or_else(|| {
-                    state
-                        .former_tracks
-                        .get(&folded)
-                        .and_then(|(_, w)| w.upgrade())
-                        .filter(|t| t.is_online())
-                })
-                .map(|t| t.id);
-            (id, None)
+            (self.get_existing(target).map(|t| t.id), None)
         }
     }
 
@@ -333,28 +252,14 @@ impl UserRegistry {
                 rebuilt.insert(folded, weak);
             }
         }
-        let old_former = std::mem::take(&mut state.former_tracks);
-        let mut rebuilt_former = HashMap::with_capacity(old_former.len());
-        for (_, (raw_old, weak)) in old_former {
-            if weak.upgrade().is_some_and(|t| t.is_online()) {
-                let folded = new_map.fold(&raw_old);
-                if !rebuilt.contains_key(&folded) {
-                    rebuilt_former.insert(folded, (raw_old, weak));
-                }
-            }
-        }
         state.last_live_count = rebuilt.len();
-        state.last_former_count = rebuilt_former.len();
         state.tracks = rebuilt;
-        state.former_tracks = rebuilt_former;
     }
 
     pub(crate) fn clear(&self) {
         let mut state = self.state.lock().unwrap();
         state.tracks.clear();
-        state.former_tracks.clear();
         state.last_live_count = 0;
-        state.last_former_count = 0;
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -490,8 +395,7 @@ impl User {
         self.send_chat(OutboundChatKind::Action, text.into())
     }
 
-    /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`] initialized with
-    /// `BotConfig::ask_config`.
+    /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`].
     #[track_caller]
     pub fn exclusive(&self) -> impl Future<Output = Result<ExclusiveDm>> + Send + '_ {
         let caller = Location::caller();
@@ -522,13 +426,7 @@ impl User {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let caller = Location::caller();
-        let cfg = self
-            .core
-            .upgrade()
-            .map(|c| (*c.ask_config).clone())
-            .unwrap_or_default();
-        Ask::from_user_dm(self, caller, cfg, prompt.into(), matcher)
+        Ask::from_user_dm(self, Location::caller(), prompt.into(), matcher)
     }
 
     /// Opens an unserialized DM [`Inbox`] tracking `NICK` changes and failing with

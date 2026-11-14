@@ -154,8 +154,7 @@ pub async fn recruit_players(
             },
         )
         .allow_change(true)
-        .reply_timeout(join_window)
-        .no_timeout_message()
+        .config(AskConfig::timeout(join_window))
         .stop_when(|a| a.values().filter(|&&joined| joined).count() >= max_players)
         .await?;
 

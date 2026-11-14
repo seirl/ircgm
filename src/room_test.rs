@@ -10,9 +10,7 @@ async fn room_invite_and_inbox_user_enforce_session_and_presence() {
 
     server.complete_join("#lobby", &["alice", "bob"]);
     server.settle().await;
-    let room = bot.room("#lobby").unwrap().with_ask_config(
-        &crate::AskConfig::new().ignore_commands().accept_notices(),
-    );
+    let room = bot.room("#lobby").unwrap();
 
     let alice = bot.user("alice").unwrap();
     let bob = bot.user("bob").unwrap();
@@ -27,9 +25,8 @@ async fn room_invite_and_inbox_user_enforce_session_and_presence() {
     // Foreign session User rejected:
     assert!(matches!(room.invite(&foreign), Err(Error::InvalidInput(_))));
 
-    // `Room::inbox_user` inherits `Room`'s `ask_config` (`ignore_commands` + `accept_notices`)
-    // and ignores other users in the same room:
-    let mut alice_in = room.inbox_user(&alice);
+    // `Room::inbox_user` scopes to `alice` in `#lobby` and supports `ignore_commands` + `accept_notices`:
+    let mut alice_in = room.inbox_user(&alice).ignore_commands().accept_notices();
     server.chat("bob", "#lobby", "bob noise");
     server.chat("alice", "#lobby", "!ignored_cmd");
     server.notice("alice", "#lobby", "alice notice");

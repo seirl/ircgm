@@ -223,7 +223,7 @@ async fn peer_identity_survives_rename_resets_on_quit_and_supports_protocol_help
         async move {
             lobby
                 .ask("Quick!", |_| Some(()))
-                .reply_timeout(std::time::Duration::from_secs(5))
+                .config(crate::AskConfig::timeout(std::time::Duration::from_secs(5)))
                 .await
         }
     });

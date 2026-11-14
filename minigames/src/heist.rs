@@ -75,14 +75,8 @@ async fn scaled_alarm(virtual_dur: Duration, rate_rx: &mut watch::Receiver<f64>)
 
 /// Hacker's 2-step private DM bypass puzzle.
 pub async fn hack_terminal(hacker: &User) -> Result<()> {
-    let mut dm = hacker
-        .exclusive()
-        .await?
-        .with_ask_config(
-            &AskConfig::new()
-                .reply_timeout(Duration::from_secs(30))
-                .ignore_commands(),
-        );
+    let mut dm = hacker.exclusive().await?;
+    let step_cfg = AskConfig::timeout(Duration::from_secs(30)).ignore_commands();
 
     dm.ask("💻 Step 1/2 — Convert `0x2A` to decimal:", |m| {
         match m.text.trim() {
@@ -90,6 +84,7 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
             _ => AskMatch::reject("Hint: 2 * 16 + 10.".yellow()),
         }
     })
+    .config(&step_cfg)
     .await?
     .required()?;
 
@@ -103,12 +98,15 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
             AskMatch::reject("Type `override` to sever door power.".yellow())
         }
     })
+    .config(&step_cfg)
     .await?
     .required()
 }
 
 /// Safecracker's 3-step vault channel lockpick sequence.
 pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
+    let pin_cfg = AskConfig::timeout(Duration::from_secs(20))
+        .timeout_message("🚨 Too slow on the tumblers!".yellow());
     for (idx, cmd) in ["!tension", "!rake", "!set"].into_iter().enumerate() {
         vault
             .ask_user(
@@ -120,7 +118,7 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
                 ),
                 |m| m.is_cmd(cmd).then_some(()),
             )
-            .reply_timeout(Duration::from_secs(20))
+            .config(&pin_cfg)
             .await?
             .required()?;
     }
@@ -151,14 +149,7 @@ pub async fn run_heist(
     safecracker: &User,
     safe_wire: Wire,
 ) -> Result<HeistOutcome> {
-    let vault = bot
-        .breakout(&crate::breakout_slug(lobby, "vault"))
-        .await?
-        .with_ask_config(
-            &AskConfig::new()
-                .reply_timeout(Duration::from_secs(20))
-                .timeout_message("🚨 Too slow on the tumblers!".yellow()),
-        );
+    let vault = bot.breakout(&crate::breakout_slug(lobby, "vault")).await?;
 
     lobby.say(irc_format!(
         "{} {} & {}: accept your invite to {}!",

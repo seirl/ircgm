@@ -283,17 +283,15 @@ async fn breakout_invite_and_wait_vs_invite_available_and_room_invite() {
 }
 
 #[tokio::test]
-async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() {
+async fn breakout_invite_tracks_nick_renames_quits_and_401_bounces() {
     let (bot, mut server) = test_harness("GM");
-    server.complete_join("#lobby", &["Alice", "Cara", "Dan", "Eve"]);
+    server.complete_join("#lobby", &["Alice", "Cara"]);
     server.settle().await;
 
     let alice = bot.user("Alice").unwrap();
     let untracked_bob = bot.user("UntrackedBob").unwrap();
     let cara = bot.user("Cara").unwrap();
     let ghost_user = bot.user("GhostUser").unwrap();
-    let dan = bot.user("Dan").unwrap();
-    let eve = bot.user("Eve").unwrap();
 
     let vault_task = tokio::spawn({
         let bot = bot.clone();
@@ -361,49 +359,7 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
         "expected UserLeft(GhostUser), got {res_401:?}"
     );
 
-    // 4. Cross-in-flight rename on `invite_and_wait`: `Dan` renames to `Danny` before server sees
-    //    `INVITE Dan #vault`, causing `401 Dan` -> bot automatically re-invites `Danny`!
-    let wait_cross = vault.invite_and_wait([&dan], Duration::from_secs(5));
-    let drive_cross = async {
-        assert_eq!(
-            server.recv_sent().await.unwrap(),
-            Command::INVITE("Dan".into(), "#vault".into())
-        );
-        server.rename_user("Dan", "Danny");
-        server.bounce(401, "Dan", "No such nick/channel");
-        assert_eq!(
-            server.recv_sent().await.unwrap(),
-            Command::INVITE("Danny".into(), "#vault".into())
-        );
-        server.join_user("Danny", "#vault");
-        server.settle().await;
-    };
-    let (res_cross, ()) = tokio::join!(wait_cross, drive_cross);
-    res_cross.unwrap();
-    assert!(dan.is_online());
-    assert!(vault.has_user(&dan));
-
-    // 5. Cross-in-flight rename on `invite_available`: `Eve` renames to `Evelyn`, `401 Eve` triggers
-    //    re-invite of `Evelyn`, and `Evelyn` joins cleanly:
-    let avail_cross = vault.invite_available([&eve], Duration::from_secs(5));
-    let drive_avail = async {
-        assert_eq!(
-            server.recv_sent().await.unwrap(),
-            Command::INVITE("Eve".into(), "#vault".into())
-        );
-        server.rename_user("Eve", "Evelyn");
-        server.bounce(401, "Eve", "No such nick/channel");
-        assert_eq!(
-            server.recv_sent().await.unwrap(),
-            Command::INVITE("Evelyn".into(), "#vault".into())
-        );
-        server.join_user("Evelyn", "#vault");
-        server.settle().await;
-    };
-    let (joined_avail, ()) = tokio::join!(avail_cross, drive_avail);
-    assert_eq!(joined_avail.unwrap(), vec![eve.clone()]);
-
-    // 6. Early joiner parting before second invitee joins fails `invite_and_wait` with `UserLeft`:
+    // 4. Early joiner parting before second invitee joins fails `invite_and_wait` with `UserLeft`:
     let p1 = bot.user("Early1").unwrap();
     let p2 = bot.user("Late2").unwrap();
     let wait_early_part = vault.invite_and_wait([&p1, &p2], Duration::from_secs(5));

@@ -63,10 +63,13 @@ pub async fn collect_quips(
     assignments: &[(User, &str)],
 ) -> Result<Vec<(User, String)>> {
     let total = assignments.len();
-    let cfg = AskConfig::new()
-        .reply_timeout(Duration::from_secs(45))
+    let cfg = AskConfig::timeout(Duration::from_secs(45))
         .timeout_message("⏳ Pencils down—time's up!".yellow())
-        .ignore_commands();
+        .ignore_commands()
+        .warn_remaining(
+            Duration::from_secs(10),
+            "⏳ 10 seconds left to submit!".yellow(),
+        );
 
     let mut tasks: FuturesUnordered<_> = assignments
         .iter()
@@ -91,10 +94,6 @@ pub async fn collect_quips(
                         },
                     )
                     .config(cfg)
-                    .warn_remaining(
-                        Duration::from_secs(10),
-                        "⏳ 10 seconds left to submit!".yellow(),
-                    )
                     .await?;
                 Ok::<_, Error>((player.clone(), ans))
             }
@@ -162,8 +161,7 @@ pub async fn tiebreaker_buzz_in(
                 AskMatch::reject("Nope — try again! (17 * 6)".yellow())
             }
         })
-        .reply_timeout(Duration::from_secs(20))
-        .no_timeout_message()
+        .config(AskConfig::timeout(Duration::from_secs(20)))
         .await?
         .ok())
 }
@@ -229,8 +227,7 @@ pub async fn vote_on_quips(
             }
         })
         .allow_change(true)
-        .reply_timeout(Duration::from_secs(20))
-        .no_timeout_message()
+        .config(AskConfig::timeout(Duration::from_secs(20)))
         .await?;
 
     let mut counts = vec![0usize; submissions.len()];

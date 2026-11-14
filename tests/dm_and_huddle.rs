@@ -24,7 +24,7 @@ async fn exclusive_serialization_and_15s_holder_location_warning() {
     let interrupt_task = tokio::spawn(async move {
         alice_bg
             .ask("Interrupt?", |m| Some(m.text.clone()))
-            .reply_timeout(Duration::from_secs(30))
+            .config(AskConfig::timeout(Duration::from_secs(30)))
             .await
     });
     tokio::task::yield_now().await;
@@ -93,7 +93,8 @@ async fn cancel_during_exclusive_dm_and_ignore_commands() {
     let flow_task = tokio::spawn(async move {
         let cancel_sig = alice_flow.inbox().on_cmd("!cancel");
         let body = async {
-            let mut dm = alice_flow.exclusive().await?.ignore_commands();
+            let mut dm = alice_flow.exclusive().await?;
+            dm.inbox().set_ignore_commands(true);
             let _ = ready_tx.send(());
             let first = dm.inbox().next_chat().await?.text;
             let second = dm.inbox().next_chat().await?.text;
@@ -143,7 +144,7 @@ async fn stale_inbox_cleared_between_exclusive_dm_asks() {
 
     let res1 = dm
         .ask("Question 1?", |m| Some(m.text.clone()))
-        .reply_timeout(Duration::from_secs(5))
+        .config(AskConfig::timeout(Duration::from_secs(5)))
         .await
         .unwrap()
         .ok();
@@ -285,55 +286,37 @@ async fn exclusive_many_available_and_huddle_semantics() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn exclusive_dm_inbox_enforces_ask_config_read_timeout() {
-    let (bot, server) = test_harness("GM");
+async fn unconfigured_dm_ask_uses_300s_default_reply_timeout_while_raw_inbox_reads_do_not() {
+    let (bot, mut server) = test_harness("GM");
     server.complete_join("#lobby", &["BouncerUser"]);
     server.settle().await;
 
     let bouncer = bot.user("BouncerUser").unwrap();
 
-    // 1. Default `AskConfig` enforces the 300s AFK bouncer safety timeout on direct `dm.inbox()` reads:
+    // 1. Unconfigured `Ask` uses `BotConfig::default_reply_timeout` (300s by default):
     {
-        let mut dm = bouncer.exclusive().await.unwrap();
         let start = tokio::time::Instant::now();
-        let res = dm.inbox().next_chat().await;
-        assert!(matches!(res, Err(Error::TimedOut)));
+        let ask_task = tokio::spawn({
+            let bouncer = bouncer.clone();
+            async move { bouncer.ask("Still there?", |m| Some(m.text.clone())).await }
+        });
+        assert_eq!(server.recv_message_to("BouncerUser").await, "Still there?");
+        let ans = ask_task.await.unwrap().unwrap();
+        assert_eq!(ans, Answer::TimedOut);
         assert_eq!(start.elapsed(), Duration::from_secs(300));
     }
 
-    // 2. `with_ask_config` overrides `dm.inbox()`'s read timeout (including `reply_timeout` and `no_reply_timeout`):
+    // 2. Raw `dm.inbox()` reads do not implicitly time out unless wrapped with `with_timeout`:
     {
-        let short_cfg = AskConfig::new().reply_timeout(Duration::from_secs(12));
-        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&short_cfg);
-        let start = tokio::time::Instant::now();
-        let res = dm.inbox().next_chat().await;
-        assert!(matches!(res, Err(Error::TimedOut)));
-        assert_eq!(start.elapsed(), Duration::from_secs(12));
-    }
-    {
-        let untimed_cfg = AskConfig::new().no_reply_timeout();
-        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&untimed_cfg);
+        let mut dm = bouncer.exclusive().await.unwrap();
         let wait_fut = async {
             tokio::time::sleep(Duration::from_secs(600)).await;
             server.dm("BouncerUser", "back from dinner");
         };
         let (msg, ()) = tokio::join!(dm.inbox().next_chat(), wait_fut);
         assert_eq!(msg.unwrap().text, "back from dinner");
-    }
 
-    // 3. Non-matching / ignored messages do NOT reset a `Duration` read limit inside `wait_*`:
-    {
-        let short_cfg = AskConfig::new().reply_timeout(Duration::from_secs(12));
-        let mut dm = bouncer.exclusive().await.unwrap().with_ask_config(&short_cfg);
-        let start = tokio::time::Instant::now();
-        let spam = async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            server.dm("BouncerUser", "unrelated chatter 1");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            server.dm("BouncerUser", "unrelated chatter 2");
-        };
-        let (res, ()) = tokio::join!(dm.inbox().wait_cmd("!confirm"), spam);
-        assert!(matches!(res, Err(Error::TimedOut)));
-        assert_eq!(start.elapsed(), Duration::from_secs(12));
+        let timed = dm.inbox().next_chat().with_timeout(Duration::from_secs(12)).await;
+        assert!(matches!(timed, Err(Error::TimedOut)));
     }
 }

@@ -244,7 +244,7 @@ async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_a
             raw: Arc::clone(&raw),
             kind: WireKind::Event(Event::Chat(ChatMessage {
                 raw: Arc::clone(&raw),
-                received_at: Instant::now(),
+                received_at: tokio::time::Instant::now(),
                 sender: sender.clone(),
                 nick: "[Alice]".into(),
                 ident: Some("~u".into()),

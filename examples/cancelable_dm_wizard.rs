@@ -1,7 +1,7 @@
 //! Demonstrates two advanced per-user `ExclusiveDm` patterns:
 //!
 //! 1. `pick_loadout_or_cancel`: A multi-step free-text DM wizard using
-//!    `.ignore_commands()` so `!cancel` skips the free-text reader and trips
+//!    `dm.inbox().set_ignore_commands(true)` so `!cancel` skips the free-text reader and trips
 //!    the outer `.until(...)` supervisor, immediately dropping the `ExclusiveDm` lock.
 //! 2. `resolve_simultaneous_triggers`: Two concurrent `user.ask(...)` futures run
 //!    inside `tokio::try_join!` — `ExclusiveDm` serializes them on the wire and
@@ -14,7 +14,8 @@ use ircgm::prelude::*;
 
 pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>> {
     let flow = async {
-        let mut dm = player.exclusive().await?.ignore_commands();
+        let mut dm = player.exclusive().await?;
+        dm.inbox().set_ignore_commands(true);
         dm.say("Name 3 items to bring into the vault (send 3 messages, or `!cancel`):")?;
         Ok::<_, Error>([
             dm.inbox().next_chat().await?.text,
@@ -34,10 +35,7 @@ pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>
 }
 
 pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Option<usize>)> {
-    let prompt_cfg = AskConfig::new()
-        .reply_timeout(Duration::from_secs(20))
-        .ignore_commands()
-        .no_timeout_message();
+    let prompt_cfg = AskConfig::timeout(Duration::from_secs(20)).ignore_commands();
 
     let (ans_block, ans_card) = tokio::try_join!(
         player
@@ -49,8 +47,11 @@ pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Optio
                     _ => AskMatch::ignore(),
                 }
             )
-            .config(&prompt_cfg)
-            .warn_remaining(Duration::from_secs(5), "⏳ 5 seconds left!".yellow()),
+            .config(
+                prompt_cfg
+                    .clone()
+                    .warn_remaining(Duration::from_secs(5), "⏳ 5 seconds left!".yellow()),
+            ),
         player
             .ask(
                 "Discard a card (1, 2, or 3):",

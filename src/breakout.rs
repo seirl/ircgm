@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::poll_fn;
 use std::ops::Deref;
@@ -10,7 +10,6 @@ use std::time::Duration;
 use irc::proto::Command;
 use irc_colors::Text;
 
-use crate::ask::AskConfig;
 use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
@@ -223,17 +222,6 @@ impl Breakout {
         self.room.clone()
     }
 
-    /// In-place [`AskConfig`] override (`mut self -> Self`), shadowing `Room::with_ask_config`
-    /// so chaining on a fresh `Breakout` never drops it.
-    pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
-        self.set_ask_config(cfg);
-        self
-    }
-
-    pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.room = self.room.with_ask_config(cfg);
-    }
-
     #[track_caller]
     pub fn inbox(&self) -> crate::inbox::Inbox {
         self.room.inbox()
@@ -318,7 +306,6 @@ impl Breakout {
 
         let mut joined_ids: HashSet<u64> = HashSet::new();
         let mut gone_ids: HashSet<u64> = HashSet::new();
-        let mut retries: HashMap<u64, u8> = HashMap::new();
         let mut invite_cmds: Vec<Command> = Vec::new();
 
         for u in &tracked_users {
@@ -333,7 +320,6 @@ impl Breakout {
                 let nick = u.nick();
                 if !nick.is_empty() {
                     invite_cmds.push(Command::INVITE(nick, self.room.name().to_owned()));
-                    retries.insert(u.track_id(), 0);
                 }
             }
         }
@@ -426,29 +412,14 @@ impl Breakout {
                             ..
                         }) => {
                             if let Some(uid) = wire.bounce_user_id() {
-                                if let Some(u) = tracked_users.iter().find(|u| u.track_id() == uid)
-                                {
-                                    if !joined_ids.contains(&uid) {
-                                        let cnt = retries.entry(uid).or_insert(0);
-                                        if let Some(new_nick) =
-                                            u.track_arc().next_rename_retry_nick(target, cnt)
-                                        {
-                                            core.outbound.enqueue_one(
-                                                Priority::Interactive,
-                                                Command::INVITE(
-                                                    new_nick,
-                                                    self.room.name().to_owned(),
-                                                ),
-                                            );
-                                        } else if strict {
-                                            return Err(Error::UserLeft {
-                                                nick: target.clone(),
-                                                reason: Some(message.clone()),
-                                            });
-                                        } else {
-                                            gone_ids.insert(uid);
-                                        }
+                                if seen_ids.contains(&uid) && !joined_ids.contains(&uid) {
+                                    if strict {
+                                        return Err(Error::UserLeft {
+                                            nick: target.clone(),
+                                            reason: Some(message.clone()),
+                                        });
                                     }
+                                    gone_ids.insert(uid);
                                 }
                             }
                         }

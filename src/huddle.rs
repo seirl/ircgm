@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
 
-use crate::ask::{Ask, AskConfig, AskMany, IntoAskMatch};
+use crate::ask::{Ask, AskMany, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
@@ -24,7 +24,6 @@ pub struct Huddle {
     leases: Vec<DmLease>,
     initial_offline: Option<(String, Option<String>)>,
     inbox: Inbox,
-    ask_config: AskConfig,
 }
 
 impl fmt::Debug for Huddle {
@@ -43,9 +42,7 @@ impl Huddle {
         leases: Vec<DmLease>,
         initial_offline: Option<(String, Option<String>)>,
         mut inbox: Inbox,
-        ask_config: AskConfig,
     ) -> Self {
-        ask_config.apply_to_locked_inbox(&mut inbox);
         let users: Vec<User> = leases.iter().map(|l| l.user().clone()).collect();
         let relay_core = Arc::clone(&core);
         let relay_name = name.clone();
@@ -71,7 +68,6 @@ impl Huddle {
             leases,
             initial_offline,
             inbox,
-            ask_config,
         }
     }
 
@@ -131,34 +127,6 @@ impl Huddle {
         self.leases.is_empty()
     }
 
-    /// The [`AskConfig`] this huddle's prompts and inbox reads use. Clone it to derive a tweaked
-    /// one for [`Huddle::set_ask_config`].
-    pub fn ask_config(&self) -> &AskConfig {
-        &self.ask_config
-    }
-
-    pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
-        self.set_ask_config(cfg);
-        self
-    }
-
-    pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.ask_config = cfg.clone();
-        cfg.apply_to_locked_inbox(&mut self.inbox);
-    }
-
-    pub fn ignore_commands(mut self) -> Self {
-        self.ask_config.ignore_commands = true;
-        self.inbox.ignore_commands = true;
-        self
-    }
-
-    pub fn accept_notices(mut self) -> Self {
-        self.ask_config.accept_notices = true;
-        self.inbox.accept_notices = true;
-        self
-    }
-
     /// Broadcasts to all currently-online huddle users (skipping any user who disconnected mid-huddle).
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
         self.broadcast_kind(OutboundChatKind::Privmsg, text.into())
@@ -179,8 +147,7 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let cfg = self.ask_config.clone();
-        Ask::from_group_with_config(self, cfg, prompt.into(), matcher)
+        Ask::from_group(self, prompt.into(), matcher)
     }
 
     /// Broadcasts `prompt` to all online huddle members and collects up to one answer per member
@@ -196,8 +163,7 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let cfg = self.ask_config.clone();
-        AskMany::from_group_with_config(self, cfg, prompt.into(), matcher)
+        crate::ask::ask_many(self, prompt, matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {

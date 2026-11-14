@@ -10,12 +10,9 @@ async fn exclusive_dm_records_and_clears_lock_holder_and_syncs_inbox_flags() {
 
     assert!(alice.track().lock_holder.lock().unwrap().is_none());
 
-    let mut dm = alice
-        .exclusive()
-        .await
-        .unwrap()
-        .ignore_commands()
-        .accept_notices();
+    let mut dm = alice.exclusive().await.unwrap();
+    dm.inbox().set_ignore_commands(true);
+    dm.inbox().set_accept_notices(true);
     assert!(alice.track().lock_holder.lock().unwrap().is_some());
     assert_eq!(dm.user(), &alice);
     assert!(format!("{dm:?}").contains("ExclusiveDm"));

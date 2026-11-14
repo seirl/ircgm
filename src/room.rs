@@ -6,7 +6,7 @@ use std::sync::Arc;
 use irc::proto::Command;
 use irc_colors::Text;
 
-use crate::ask::{Ask, AskConfig, AskMany, IntoAskMatch};
+use crate::ask::{Ask, AskMany, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::CaseMap;
 use crate::chat::{Chat, GroupChat, InboxRef};
@@ -32,25 +32,16 @@ pub struct Member {
     pub prefixes: Vec<char>,
 }
 
-/// Lightweight handle to an IRC channel (`#lobby`), carrying a local [`AskConfig`].
+/// Lightweight handle to an IRC channel (`#lobby`).
 #[derive(Clone, Debug)]
 pub struct Room {
     core: Arc<BotCore>,
     channel_name: String,
-    ask_config: Arc<AskConfig>,
 }
 
 impl Room {
-    pub(crate) fn new(
-        core: Arc<BotCore>,
-        channel_name: String,
-        ask_config: Arc<AskConfig>,
-    ) -> Self {
-        Self {
-            core,
-            channel_name,
-            ask_config,
-        }
+    pub(crate) fn new(core: Arc<BotCore>, channel_name: String) -> Self {
+        Self { core, channel_name }
     }
 
     pub(crate) fn core(&self) -> &Arc<BotCore> {
@@ -89,21 +80,6 @@ impl Room {
 
     pub fn casemap(&self) -> CaseMap {
         self.core.casemap()
-    }
-
-    /// The [`AskConfig`] this room's prompts and inboxes start from. Clone it to derive a
-    /// tweaked view: `room.with_ask_config(&room.ask_config().clone().reply_timeout(dur))`.
-    pub fn ask_config(&self) -> &AskConfig {
-        &self.ask_config
-    }
-
-    /// Derives a lightweight `Room` view carrying `cfg` as its local [`AskConfig`].
-    pub fn with_ask_config(&self, cfg: &AskConfig) -> Self {
-        Self {
-            core: Arc::clone(&self.core),
-            channel_name: self.channel_name.clone(),
-            ask_config: Arc::new(cfg.clone()),
-        }
     }
 
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
@@ -379,7 +355,7 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        Ask::from_group_with_config(self, (*self.ask_config).clone(), prompt.into(), matcher)
+        Ask::from_group(self, prompt.into(), matcher)
     }
 
     /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`crate::TimeoutCtx::user`]
@@ -412,7 +388,7 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        AskMany::from_group_with_config(self, (*self.ask_config).clone(), prompt.into(), matcher)
+        crate::ask::ask_many(self, prompt, matcher)
     }
 
     #[track_caller]
@@ -466,12 +442,9 @@ impl Room {
         if !all_belong {
             return Inbox::invalid_session(filter, caller);
         }
-        let mut inbox = self
-            .core
+        self.core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller);
-        self.ask_config.apply_flags_to_inbox(&mut inbox);
-        inbox
+            .subscribe(Arc::clone(&self.core), filter, caller)
     }
 
     pub(crate) fn inbox_at(&self, caller: &'static Location<'static>) -> Inbox {
@@ -479,17 +452,9 @@ impl Room {
             rooms: vec![self.channel_name.clone()],
             dm_users: Vec::new(),
         };
-        let mut inbox = self
-            .core
+        self.core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller);
-        // Conversation scopes (`Room`, `Breakout`, `ExclusiveDm`, `Huddle`) propagate their
-        // `AskConfig` stream flags (`ignore_commands`, `accept_notices`) onto `.inbox*()` so
-        // `room.with_ask_config` sets policy room-wide across both prompts and listeners (while
-        // `wait_cmd` / `on_cmd` explicitly override `ignore_commands = false`). `Bot` and `User`
-        // stay config-free so session routers and stop triggers start unfiltered.
-        self.ask_config.apply_flags_to_inbox(&mut inbox);
-        inbox
+            .subscribe(Arc::clone(&self.core), filter, caller)
     }
 }
 

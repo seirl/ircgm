@@ -9,9 +9,7 @@ use std::task::{Context, Poll};
 
 use irc::proto::Message;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 
-use crate::ask::TimeLimit;
 use crate::bot::BotCore;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
@@ -395,7 +393,6 @@ impl InboxRegistry {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
-            read_limit: TimeLimit::None,
             latched_departure: None,
             last_user_departure: None,
             departed_users,
@@ -646,7 +643,6 @@ pub struct Inbox {
     lag_policy: LagPolicy,
     pub(crate) ignore_commands: bool,
     pub(crate) accept_notices: bool,
-    pub(crate) read_limit: TimeLimit,
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
@@ -688,7 +684,6 @@ impl Inbox {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
-            read_limit: TimeLimit::None,
             latched_departure: None,
             last_user_departure: None,
             departed_users: HashSet::new(),
@@ -779,42 +774,27 @@ impl Inbox {
         }
     }
 
-    async fn next_wire_until(&mut self, deadline: Option<Instant>) -> Result<Arc<WireEvent>> {
-        let next = poll_fn(|cx| self.poll_next_wire(cx));
-        match deadline {
-            None => next.await,
-            Some(dl) => tokio::time::timeout_at(dl, next)
-                .await
-                .map_err(|_| Error::TimedOut)?,
-        }
+    async fn next_wire(&mut self) -> Result<Arc<WireEvent>> {
+        poll_fn(|cx| self.poll_next_wire(cx)).await
     }
 
     /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`], [`Inbox::wait_cmd`], and
     /// [`Inbox::next_chat`].
-    async fn wait_reply_map_inner<B, F, T>(
+    async fn wait_reply_map_inner<F, T>(
         &mut self,
-        read_limit: TimeLimit,
         ignore_commands: bool,
         accept_notices: bool,
-        mut on_other: B,
         mut f: F,
     ) -> Result<T>
     where
-        B: FnMut(&WireEvent) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        let deadline = read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_until(deadline).await?;
+            let wire = self.next_wire().await?;
             let candidate = match &wire.kind {
                 WireKind::Event(Event::Chat(msg)) => Some(msg),
                 WireKind::Event(Event::Notice { .. }) if accept_notices => wire.human_notice(),
-                _ => {
-                    if let Some(err) = on_other(&wire) {
-                        return Err(err);
-                    }
-                    None
-                }
+                _ => None,
             };
             let Some(msg) = candidate else {
                 continue;
@@ -837,14 +817,8 @@ impl Inbox {
     where
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        self.wait_reply_map_inner(
-            self.read_limit,
-            self.ignore_commands,
-            self.accept_notices,
-            |_| None,
-            f,
-        )
-        .await
+        self.wait_reply_map_inner(self.ignore_commands, self.accept_notices, f)
+            .await
     }
 
     pub async fn wait_for<P>(&mut self, mut pred: P) -> Result<ChatMessage>
@@ -857,25 +831,17 @@ impl Inbox {
     /// Waits for a word-boundary command `cmd` (ASCII case-insensitive), ignoring
     /// `self.ignore_commands` so explicit command waits never deadlock on command-skipping inboxes.
     pub async fn wait_cmd(&mut self, cmd: &str) -> Result<ChatMessage> {
-        self.wait_reply_map_inner(
-            self.read_limit,
-            false,
-            self.accept_notices,
-            |_| None,
-            |m| m.is_cmd(cmd).then(|| m.clone()),
-        )
+        self.wait_reply_map_inner(false, self.accept_notices, |m| {
+            m.is_cmd(cmd).then(|| m.clone())
+        })
         .await
     }
 
     /// Waits for `cmd` followed by non-empty arguments, returning `(msg, trimmed_arg_string)`.
     pub async fn wait_cmd_arg(&mut self, cmd: &str) -> Result<(ChatMessage, String)> {
-        self.wait_reply_map_inner(
-            self.read_limit,
-            false,
-            self.accept_notices,
-            |_| None,
-            |m| m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned())),
-        )
+        self.wait_reply_map_inner(false, self.accept_notices, |m| {
+            m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned()))
+        })
         .await
     }
 
@@ -937,13 +903,7 @@ impl Inbox {
     {
         self.lag_policy = LagPolicy::Lossy;
         match self
-            .wait_reply_map_inner(
-                TimeLimit::None,
-                self.ignore_commands,
-                self.accept_notices,
-                |_| None,
-                f,
-            )
+            .wait_reply_map_inner(self.ignore_commands, self.accept_notices, f)
             .await
         {
             Ok(val) => val,
@@ -966,9 +926,8 @@ impl Inbox {
     where
         F: FnMut(&Event) -> Option<T>,
     {
-        let deadline = self.read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_until(deadline).await?;
+            let wire = self.next_wire().await?;
             if let Some(ev) = wire.to_public_event() {
                 if let Some(val) = f(&ev) {
                     return Ok(val);
@@ -978,8 +937,7 @@ impl Inbox {
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        let deadline = self.read_limit.deadline_from(Instant::now());
-        let wire = self.next_wire_until(deadline).await?;
+        let wire = self.next_wire().await?;
         Ok(Arc::clone(&wire.raw))
     }
 
@@ -992,9 +950,8 @@ impl Inbox {
     where
         F: FnMut(&Message) -> Option<T>,
     {
-        let deadline = self.read_limit.deadline_from(Instant::now());
         loop {
-            let wire = self.next_wire_until(deadline).await?;
+            let wire = self.next_wire().await?;
             if let Some(val) = f(&wire.raw) {
                 return Ok(val);
             }

@@ -15,7 +15,7 @@ async fn confirm(mut chat: impl Chat, question: &str) -> Result<Option<bool>> {
             AskMatch::ignore()
         }
     })
-    .reply_timeout(Duration::from_secs(10))
+    .config(AskConfig::timeout(Duration::from_secs(10)))
     .await?
     .ok())
 }
@@ -27,7 +27,7 @@ async fn ready_roll_call(mut group: impl GroupChat, players: &[User]) -> Result<
         m.is_cmd("!ready").then_some(())
     })
     .from_users(players)
-    .reply_timeout(Duration::from_secs(10))
+    .config(AskConfig::timeout(Duration::from_secs(10)))
     .await?;
     Ok(answers.into_iter().map(|(u, ())| u).collect())
 }

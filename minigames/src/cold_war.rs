@@ -149,13 +149,13 @@ pub async fn run_cold_war(
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
-        .reply_timeout(Duration::from_secs(15)),
+        .config(AskConfig::timeout(Duration::from_secs(15))),
         ussr.ask_user(
             ussr_premier,
             "🔒 Hotline severed! Issue final order (`!stand_down` or `!launch`, 15s):",
             parse_order,
         )
-        .reply_timeout(Duration::from_secs(15)),
+        .config(AskConfig::timeout(Duration::from_secs(15))),
     )?;
 
     let usa_order = usa_ans.ok().unwrap_or(Order::StandDown);

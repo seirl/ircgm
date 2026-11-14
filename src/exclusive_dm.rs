@@ -7,7 +7,7 @@ use std::time::Duration;
 use irc_colors::Text;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::ask::{Ask, AskConfig, IntoAskMatch};
+use crate::ask::{Ask, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::chat::{Chat, InboxRef};
 use crate::error::{Error, Result};
@@ -46,11 +46,10 @@ impl DmLease {
 }
 
 /// RAII guard holding exclusive access to a [`User`]'s interactive DM prompt slot
-/// plus a pre-subscribed [`Inbox`] and local [`AskConfig`].
+/// plus a pre-subscribed [`Inbox`].
 pub struct ExclusiveDm {
     lease: DmLease,
     inbox: Inbox,
-    ask_config: AskConfig,
 }
 
 impl fmt::Debug for ExclusiveDm {
@@ -62,14 +61,13 @@ impl fmt::Debug for ExclusiveDm {
 }
 
 impl ExclusiveDm {
-    /// Wraps `lease` with a fresh DM [`Inbox`] for its user, configured from
-    /// `BotConfig::ask_config`.
+    /// Wraps `lease` with a fresh DM [`Inbox`] for its user.
     pub(crate) fn from_lease(
         core: Arc<BotCore>,
         lease: DmLease,
         caller: &'static Location<'static>,
     ) -> Self {
-        let mut inbox = core.inboxes.subscribe(
+        let inbox = core.inboxes.subscribe(
             Arc::clone(&core),
             Filter::Scoped {
                 rooms: Vec::new(),
@@ -77,45 +75,11 @@ impl ExclusiveDm {
             },
             caller,
         );
-        let ask_config = (*core.ask_config).clone();
-        ask_config.apply_to_locked_inbox(&mut inbox);
-        Self {
-            lease,
-            inbox,
-            ask_config,
-        }
+        Self { lease, inbox }
     }
 
     pub fn user(&self) -> &User {
         self.lease.user()
-    }
-
-    /// The [`AskConfig`] this DM's prompts and inbox reads use. Clone it to derive a tweaked
-    /// one for [`ExclusiveDm::set_ask_config`].
-    pub fn ask_config(&self) -> &AskConfig {
-        &self.ask_config
-    }
-
-    pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
-        self.set_ask_config(cfg);
-        self
-    }
-
-    pub fn set_ask_config(&mut self, cfg: &AskConfig) {
-        self.ask_config = cfg.clone();
-        cfg.apply_to_locked_inbox(&mut self.inbox);
-    }
-
-    pub fn ignore_commands(mut self) -> Self {
-        self.ask_config.ignore_commands = true;
-        self.inbox.ignore_commands = true;
-        self
-    }
-
-    pub fn accept_notices(mut self) -> Self {
-        self.ask_config.accept_notices = true;
-        self.inbox.accept_notices = true;
-        self
     }
 
     /// Same as [`User::say`]: holding the lock changes who may prompt the user, not how
@@ -139,8 +103,7 @@ impl ExclusiveDm {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let cfg = self.ask_config.clone();
-        Ask::from_chat_with_config(self, cfg, prompt.into(), matcher)
+        crate::ask::ask(self, prompt, matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {

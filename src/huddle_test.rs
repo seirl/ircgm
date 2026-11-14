@@ -132,7 +132,7 @@ async fn huddle_ask_from_user_and_ask_many_consensus_with_banter_relay() {
             }
         })
         .allow_change(true)
-        .reply_timeout(std::time::Duration::from_secs(30))
+        .config(crate::AskConfig::timeout(std::time::Duration::from_secs(30)))
         .stop_when(|a| {
             // Unanimous once at least 2 wolves have voted and every active vote matches:
             a.len() >= 2 && {

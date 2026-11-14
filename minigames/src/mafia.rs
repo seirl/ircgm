@@ -16,7 +16,7 @@
 //!    - Any unguarded victim is eliminated (`-v` devoiced) and non-blockingly invited to a dead-chat
 //!      `#graveyard-xxxxxx` [`Breakout`] via [`Breakout::invite_available`].
 //!    - All surviving players cast a simultaneous secret DM ballot ([`User::ask`] +
-//!      [`ircgm::Ask::reply_deadline`] + [`AskMatch::accept_say`] / [`AskMatch::reject`]). Exiling a
+//!      [`AskConfig::deadline`] + [`AskMatch::accept_say`] / [`AskMatch::reject`]). Exiling a
 //!      Werewolf wins for **Town**; otherwise **Werewolves Win**!
 //!
 //! ## Library Mechanics Showcased
@@ -28,7 +28,7 @@
 //! - **Concurrent `0..=N` DM prompts:** Joins every online bodyguard's `!protect` prompt, so dawn
 //!   comes as soon as each has answered or timed out (immediately when `0` guards are online).
 //! - **Shared-deadline DM ballots:** Combines concurrent [`User::ask`] prompts with
-//!   [`ircgm::Ask::reply_deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
+//!   [`AskConfig::deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -97,14 +97,7 @@ pub async fn werewolf_pack_kill(
     wolves: &[User],
     townsfolk: &[User],
 ) -> Result<Option<User>> {
-    let mut pack = bot
-        .huddle_available("Wolves".red().bold(), wolves)
-        .await?
-        .with_ask_config(
-            &AskConfig::new()
-                .reply_timeout(Duration::from_secs(30))
-                .timeout_message("⏳ Dawn breaks—the pack missed its chance!".yellow()),
-        );
+    let mut pack = bot.huddle_available("Wolves".red().bold(), wolves).await?;
 
     if pack.is_empty() {
         return Ok(None);
@@ -130,6 +123,10 @@ pub async fn werewolf_pack_kill(
                     None => AskMatch::reject("Pick a living non-Werewolf townsfolk!".yellow()),
                 }
             },
+        )
+        .config(
+            AskConfig::timeout(Duration::from_secs(30))
+                .timeout_message("⏳ Dawn breaks—the pack missed its chance!".yellow()),
         )
         .await?
         .ok())
@@ -175,8 +172,7 @@ pub async fn collect_secret_votes(
                         ),
                     }
                 })
-                .reply_deadline(deadline)
-                .no_timeout_message()
+                .config(AskConfig::deadline(deadline))
                 .await?
                 .ok();
             Ok::<_, Error>((voter.clone(), pick))
@@ -242,8 +238,7 @@ pub async fn run_mafia_round(
                             }
                         },
                     )
-                    .reply_timeout(Duration::from_secs(5))
-                    .no_timeout_message()
+                    .config(AskConfig::timeout(Duration::from_secs(5)))
                     .await?
                     .ok();
                 Ok::<_, Error>(pick)

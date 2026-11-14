@@ -79,25 +79,28 @@ fn into_ask_match_and_answer_conversions() {
 #[test]
 fn compute_schedule_filters_and_sorts_countdown_warnings() {
     let now = Instant::now();
+    let def_to = Duration::from_secs(300);
+
+    // Default `AskConfig::new()` uses `default_timeout`:
+    let (def_dl, def_warns) = compute_schedule(&AskConfig::new(), now, def_to);
+    assert_eq!(def_dl, Some(now + def_to));
+    assert!(def_warns.is_empty());
 
     // TimeLimit::None produces no deadline and no warnings even if configured:
-    let none_cfg = AskConfig::new()
-        .no_reply_timeout()
-        .warn_remaining(Duration::from_secs(10), "10s!");
-    let (dl, warns) = compute_schedule(&none_cfg, now);
+    let none_cfg = AskConfig::untimed().warn_remaining(Duration::from_secs(10), "10s!");
+    let (dl, warns) = compute_schedule(&none_cfg, now, def_to);
     assert!(dl.is_none());
     assert!(warns.is_empty());
 
     // TimeLimit::Duration filters out rem == 0 and rem >= dur, and sorts chronologically:
-    let dur_cfg = AskConfig::new()
-        .reply_timeout(Duration::from_secs(30))
+    let dur_cfg = AskConfig::timeout(Duration::from_secs(30))
         .warn_remaining(Duration::from_secs(5), "5s left")
         .warn_remaining(Duration::ZERO, "zero ignored")
         .warn_remaining(Duration::from_secs(30), "equal to timeout ignored")
         .warn_remaining(Duration::from_secs(45), "greater than timeout ignored")
         .warn_remaining(Duration::from_secs(20), "20s left");
 
-    let (dl, warns) = compute_schedule(&dur_cfg, now);
+    let (dl, warns) = compute_schedule(&dur_cfg, now, def_to);
     assert_eq!(dl, Some(now + Duration::from_secs(30)));
     assert_eq!(warns.len(), 2);
     // 20s remaining fires at now + 10s; 5s remaining fires at now + 25s:
@@ -108,11 +111,10 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
 
     // TimeLimit::Deadline computes budget relative to sent_at:
     let target_dl = now + Duration::from_secs(15);
-    let dl_cfg = AskConfig::new()
-        .reply_deadline(target_dl)
+    let dl_cfg = AskConfig::deadline(target_dl)
         .warn_remaining(Duration::from_secs(20), "exceeds budget")
         .warn_remaining(Duration::from_secs(5), "5s left");
-    let (dl, warns) = compute_schedule(&dl_cfg, now);
+    let (dl, warns) = compute_schedule(&dl_cfg, now, def_to);
     assert_eq!(dl, Some(target_dl));
     assert_eq!(warns.len(), 1);
     assert_eq!(warns[0].0, now + Duration::from_secs(10));
@@ -221,7 +223,8 @@ async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
     };
 
     // DM prompt answered by `NOTICE`s: the reject and the ack are `NOTICE`s too.
-    let ask = alice.ask("Ready?", pick).accept_notices();
+    let notice_cfg = AskConfig::new().accept_notices();
+    let ask = alice.ask("Ready?", pick).config(&notice_cfg);
     let drive = async {
         assert_eq!(
             server.recv_sent().await,
@@ -247,7 +250,7 @@ async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
         (true, Command::NOTICE("#lobby".into(), "Locked in".into())),
         (false, Command::PRIVMSG("#lobby".into(), "Locked in".into())),
     ] {
-        let ask = lobby.ask("Ready?", pick).accept_notices();
+        let ask = lobby.ask("Ready?", pick).config(&notice_cfg);
         let drive = async {
             assert_eq!(
                 server.recv_sent().await,
@@ -266,99 +269,26 @@ async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
     }
 }
 
-#[tokio::test]
-async fn ask_config_getters_let_handles_derive_tweaked_configs() {
-    let (bot, _server) = test_harness("gm");
-    let limit = |cfg: &AskConfig| match cfg.time_limit {
-        TimeLimit::Duration(d) => Some(d),
-        TimeLimit::Deadline(_) | TimeLimit::None => None,
+#[tokio::test(start_paused = true)]
+async fn bot_config_default_reply_timeout_applies_to_unconfigured_prompts() {
+    let cfg = crate::BotConfig {
+        default_reply_timeout: Duration::from_secs(7),
+        ..crate::BotConfig::default()
     };
-    assert_eq!(limit(bot.ask_config()), Some(Duration::from_secs(300)));
-
-    // Clone-and-tweak: a derived room view keeps the source's timeout and flags, adds one more,
-    // and leaves the source untouched.
-    let lobby = bot.room("#lobby").unwrap().with_ask_config(
-        &bot.ask_config()
-            .clone()
-            .reply_timeout(Duration::from_secs(9))
-            .ignore_commands(),
-    );
-    let tuned = lobby.with_ask_config(&lobby.ask_config().clone().accept_notices());
-    assert_eq!(limit(tuned.ask_config()), Some(Duration::from_secs(9)));
-    assert!(tuned.ask_config().ignore_commands);
-    assert!(tuned.ask_config().accept_notices);
-    assert!(!lobby.ask_config().accept_notices);
-
-    // Same on a DM and a huddle, whose shortcut builders show up in the reported config:
-    let alice = bot.user("alice").unwrap();
-    let mut dm = alice.exclusive().await.unwrap().accept_notices();
-    let shorter = dm.ask_config().clone().reply_timeout(Duration::from_secs(5));
-    dm.set_ask_config(&shorter);
-    assert_eq!(limit(dm.ask_config()), Some(Duration::from_secs(5)));
-    assert!(dm.ask_config().accept_notices);
-    drop(dm);
-
-    let mut pack = bot.huddle("Pack", [&alice]).await.unwrap().ignore_commands();
-    let shorter = pack.ask_config().clone().reply_timeout(Duration::from_secs(5));
-    pack.set_ask_config(&shorter);
-    assert_eq!(limit(pack.ask_config()), Some(Duration::from_secs(5)));
-    assert!(pack.ask_config().ignore_commands);
-}
-
-#[tokio::test]
-async fn inherited_flags_can_be_undone_per_prompt_and_per_inbox() {
-    let (bot, mut server) = test_harness("gm");
+    let (bot, mut server) = crate::testing::test_harness_with("gm", cfg);
     server.complete_join("#lobby", &["alice"]);
     server.settle().await;
-    let alice = bot.user("alice").unwrap();
-    let room = bot
-        .room("#lobby")
-        .unwrap()
-        .with_ask_config(&AskConfig::new().ignore_commands());
+    let room = bot.room("#lobby").unwrap();
 
-    // A prompt can match commands although its room ignores them:
-    let ask = room.ask("Go?", |m| Some(m.text.clone())).allow_commands();
-    let drive = async {
-        assert_eq!(server.recv_message_to("#lobby").await, "Go?");
-        server.chat("alice", "#lobby", "!go");
-        server.settle().await;
-    };
-    let (ans, ()) = tokio::join!(ask, drive);
-    assert_eq!(ans.unwrap().unwrap(), "!go");
-
-    // Room inboxes inherit the room's flags; both an in-place setter and a room view derived
-    // with `allow_commands()` switch skipping back off:
-    let mut inherited = room.inbox();
-    let mut derived = room
-        .with_ask_config(&room.ask_config().clone().allow_commands())
-        .inbox();
-    let mut skipping = room.inbox();
-    inherited.set_ignore_commands(false);
-    server.chat("alice", "#lobby", "!cmd");
-    server.chat("alice", "#lobby", "plain");
-    server.settle().await;
-    assert_eq!(inherited.next_chat().await.unwrap().text, "!cmd");
-    assert_eq!(derived.next_chat().await.unwrap().text, "!cmd");
-    assert_eq!(skipping.next_chat().await.unwrap().text, "plain");
-
-    // A DM that accepts notices can stop again, both on its borrowed inbox and per prompt:
-    let mut dm = alice.exclusive().await.unwrap().accept_notices();
-    dm.inbox().set_accept_notices(false);
-    server.notice("alice", "gm", "n1");
-    server.dm("alice", "p1");
-    server.settle().await;
-    assert_eq!(dm.inbox().next_chat().await.unwrap().text, "p1");
-
-    dm.inbox().set_accept_notices(true);
-    let ask = dm.ask("Pick?", |m| Some(m.text.clone())).ignore_notices();
-    let drive = async {
-        assert_eq!(server.recv_message_to("alice").await, "Pick?");
-        server.notice("alice", "gm", "n2");
-        server.dm("alice", "p2");
-        server.settle().await;
-    };
-    let (ans, ()) = tokio::join!(ask, drive);
-    assert_eq!(ans.unwrap().unwrap(), "p2");
+    let ask_task = tokio::spawn({
+        let room = room.clone();
+        async move { room.ask("Ping?", |m| Some(m.text.clone())).await }
+    });
+    assert_eq!(server.recv_message_to("#lobby").await, "Ping?");
+    server.advance(Duration::from_secs(6)).await;
+    assert!(!ask_task.is_finished());
+    server.advance(Duration::from_secs(1)).await;
+    assert_eq!(ask_task.await.unwrap().unwrap(), Answer::TimedOut);
 }
 
 #[tokio::test(start_paused = true)]
@@ -386,9 +316,11 @@ async fn ask_many_from_users_locks_in_deduplicates_warns_and_finishes_early_on_d
                 }
             })
             .from_users(&voters)
-            .reply_timeout(Duration::from_secs(20))
-            .warn_remaining(Duration::from_secs(5), "5s left!")
-            .timeout_message("Someone was too slow!")
+            .config(
+                AskConfig::timeout(Duration::from_secs(20))
+                    .warn_remaining(Duration::from_secs(5), "5s left!")
+                    .timeout_message("Someone was too slow!"),
+            )
             .await
         }
     });
@@ -454,7 +386,7 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
     let no_timer_err = room
         .ask_many("Vote:", |_| AskMatch::accept(()))
         .from_users([&alice])
-        .no_reply_timeout()
+        .config(AskConfig::untimed())
         .allow_change(true)
         .await
         .unwrap_err();
@@ -477,11 +409,14 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
             })
             .from_users(&voters)
             .allow_change(true)
-            .reply_timeout(Duration::from_secs(10))
-            .timeout_message_fn(|ctx| match ctx.user {
-                Some(u) => Text::from(format!("{} didn't vote!", u.nick())),
-                None => Text::from("Multiple non-voters!"),
-            })
+            .config(
+                AskConfig::timeout(Duration::from_secs(10)).timeout_message_fn(|ctx| {
+                    match ctx.user {
+                        Some(u) => Text::from(format!("{} didn't vote!", u.nick())),
+                        None => Text::from("Multiple non-voters!"),
+                    }
+                }),
+            )
             .await
         }
     });
@@ -530,7 +465,7 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
                 }
             })
             .allow_change(true)
-            .no_reply_timeout()
+            .config(AskConfig::untimed())
             .stop_when(|a| a.values().filter(|&&yes| yes).count() >= 2)
             .await
         }

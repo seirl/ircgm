@@ -212,7 +212,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     let t1 = tokio::spawn(async move {
         r_def
             .ask("Default ask", |m| (m.text == "via_notice").then_some(()))
-            .reply_timeout(Duration::from_millis(30))
+            .config(AskConfig::timeout(Duration::from_millis(30)))
             .await
     });
     let r_acc = room.clone();
@@ -221,7 +221,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
             .ask("Notice ask", |m| {
                 (m.text == "via_notice").then_some(m.kind)
             })
-            .accept_notices()
+            .config(AskConfig::new().accept_notices())
             .await
     });
     tokio::task::yield_now().await;

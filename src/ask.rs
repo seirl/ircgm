@@ -12,7 +12,6 @@ use irc_colors::Text;
 use tokio::time::Instant;
 use tracing::Instrument as _;
 
-use crate::bot::BotCore;
 use crate::casemap::CaseMap;
 use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
@@ -205,8 +204,7 @@ impl<T> Answer<T> {
     }
 }
 
-/// Context passed to [`AskConfig::timeout_message_fn`] and [`Ask::timeout_message_fn`]
-/// when a prompt's reply timer expires.
+/// Context passed to [`AskConfig::timeout_message_fn`] when a prompt's reply timer expires.
 pub struct TimeoutCtx<'a> {
     /// Where the prompt was sent: `Target::Channel("#blackjack")` or `Target::Dm`.
     pub target: &'a Target,
@@ -215,16 +213,20 @@ pub struct TimeoutCtx<'a> {
     pub user: Option<&'a User>,
 }
 
+const FALLBACK_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum TimeLimit {
+enum TimeLimit {
+    Default,
     None,
     Duration(Duration),
     Deadline(Instant),
 }
 
 impl TimeLimit {
-    pub(crate) fn deadline_from(self, base: Instant) -> Option<Instant> {
+    fn deadline_from(self, base: Instant, default_timeout: Duration) -> Option<Instant> {
         match self {
+            Self::Default => Some(crate::future::deadline_after_from(base, default_timeout)),
             Self::None => None,
             Self::Duration(dur) => Some(crate::future::deadline_after_from(base, dur)),
             Self::Deadline(dl) => Some(dl),
@@ -256,10 +258,10 @@ impl fmt::Debug for TimeoutHandler {
     }
 }
 
-/// Reusable prompt configuration sharing a 1-to-1 builder vocabulary with [`Ask`] and [`AskMany`].
+/// Prompt configuration passed to [`Ask::config`] and [`AskMany::config`].
 #[derive(Clone, Debug)]
 pub struct AskConfig {
-    pub(crate) time_limit: TimeLimit,
+    time_limit: TimeLimit,
     pub(crate) warnings: Vec<(Duration, Text)>,
     pub(crate) timeout_handler: Option<TimeoutHandler>,
     pub(crate) ignore_commands: bool,
@@ -269,7 +271,7 @@ pub struct AskConfig {
 impl Default for AskConfig {
     fn default() -> Self {
         Self {
-            time_limit: TimeLimit::Duration(Duration::from_secs(300)),
+            time_limit: TimeLimit::Default,
             warnings: Vec::new(),
             timeout_handler: None,
             ignore_commands: false,
@@ -281,6 +283,21 @@ impl Default for AskConfig {
 impl AskConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shorthand for `AskConfig::new().reply_timeout(duration)`.
+    pub fn timeout(duration: Duration) -> Self {
+        Self::new().reply_timeout(duration)
+    }
+
+    /// Shorthand for `AskConfig::new().reply_deadline(instant)`.
+    pub fn deadline(instant: Instant) -> Self {
+        Self::new().reply_deadline(instant)
+    }
+
+    /// Shorthand for `AskConfig::new().no_reply_timeout()`.
+    pub fn untimed() -> Self {
+        Self::new().no_reply_timeout()
     }
 
     pub fn reply_timeout(mut self, duration: Duration) -> Self {
@@ -318,18 +335,6 @@ impl AskConfig {
         self
     }
 
-    /// Undoes [`AskConfig::ignore_commands`]: command-prefixed lines are matched again.
-    pub fn allow_commands(mut self) -> Self {
-        self.ignore_commands = false;
-        self
-    }
-
-    /// Undoes [`AskConfig::accept_notices`]: human `NOTICE`s are skipped again.
-    pub fn ignore_notices(mut self) -> Self {
-        self.accept_notices = false;
-        self
-    }
-
     pub fn timeout_message(mut self, msg: impl Into<Text>) -> Self {
         self.timeout_handler = Some(TimeoutHandler::Static(msg.into()));
         self
@@ -348,16 +353,6 @@ impl AskConfig {
         self.timeout_handler = None;
         self
     }
-
-    pub(crate) fn apply_flags_to_inbox(&self, inbox: &mut Inbox) {
-        inbox.ignore_commands = self.ignore_commands;
-        inbox.accept_notices = self.accept_notices;
-    }
-
-    pub(crate) fn apply_to_locked_inbox(&self, inbox: &mut Inbox) {
-        self.apply_flags_to_inbox(inbox);
-        inbox.read_limit = self.time_limit;
-    }
 }
 
 /// Sends `prompt` to any [`Chat`] (such as `&room`, `&breakout`, `&mut huddle`, `&mut dm`, or
@@ -370,7 +365,7 @@ where
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    Ask::from_chat_with_config(chat, AskConfig::default(), prompt.into(), matcher)
+    Ask::from_chat(chat, prompt.into(), matcher)
 }
 
 /// Sends `prompt` to any [`GroupChat`] (such as `&room`, `&breakout`, `&mut huddle`, or
@@ -383,7 +378,7 @@ where
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    AskMany::from_group_with_config(group, AskConfig::default(), prompt.into(), matcher)
+    AskMany::from_group(group, prompt.into(), matcher)
 }
 
 trait ChatDyn: Send + Sync {
@@ -539,38 +534,26 @@ pub struct Ask<'a, F, R: IntoAskMatch> {
 
 impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
     #[track_caller]
-    pub(crate) fn from_chat_with_config<C: Chat + 'a>(
-        chat: C,
-        cfg: AskConfig,
-        prompt: Text,
-        matcher: F,
-    ) -> Self {
+    pub(crate) fn from_chat<C: Chat + 'a>(chat: C, prompt: Text, matcher: F) -> Self {
         Self::new(
             AskSource::Endpoint {
                 endpoint: Box::new(ChatEndpoint(chat)),
                 restricted_users: None,
                 caller: Location::caller(),
             },
-            cfg,
             prompt,
             matcher,
         )
     }
 
     #[track_caller]
-    pub(crate) fn from_group_with_config<G: GroupChat + 'a>(
-        group: G,
-        cfg: AskConfig,
-        prompt: Text,
-        matcher: F,
-    ) -> Self {
+    pub(crate) fn from_group<G: GroupChat + 'a>(group: G, prompt: Text, matcher: F) -> Self {
         Self::new(
             AskSource::Endpoint {
                 endpoint: Box::new(GroupEndpoint(group)),
                 restricted_users: None,
                 caller: Location::caller(),
             },
-            cfg,
             prompt,
             matcher,
         )
@@ -579,30 +562,21 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
     pub(crate) fn from_user_dm(
         user: &'a User,
         caller: &'static Location<'static>,
-        cfg: AskConfig,
         prompt: Text,
         matcher: F,
     ) -> Self {
-        Self::new(AskSource::UserDm { user, caller }, cfg, prompt, matcher)
+        Self::new(AskSource::UserDm { user, caller }, prompt, matcher)
     }
 
-    fn new(source: AskSource<'a>, cfg: AskConfig, prompt: Text, matcher: F) -> Self {
+    fn new(source: AskSource<'a>, prompt: Text, matcher: F) -> Self {
         Self {
             state: LazyState::new(AskUnstarted {
-                cfg,
+                cfg: AskConfig::default(),
                 source,
                 prompt,
                 matcher,
             }),
         }
-    }
-
-    fn map_cfg(mut self, f: impl FnOnce(AskConfig) -> AskConfig) -> Self {
-        self.state.map_unstarted(|u| {
-            let taken = std::mem::take(&mut u.cfg);
-            u.cfg = f(taken);
-        });
-        self
     }
 
     /// Restricts a group prompt so only `user` may answer (and sets [`TimeoutCtx::user`] to
@@ -635,60 +609,11 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
         self
     }
 
-    pub fn config(self, cfg: &AskConfig) -> Self {
-        self.map_cfg(|_| cfg.clone())
-    }
-
-    pub fn reply_timeout(self, duration: Duration) -> Self {
-        self.map_cfg(|c| c.reply_timeout(duration))
-    }
-
-    pub fn reply_deadline(self, instant: Instant) -> Self {
-        self.map_cfg(|c| c.reply_deadline(instant))
-    }
-
-    pub fn no_reply_timeout(self) -> Self {
-        self.map_cfg(AskConfig::no_reply_timeout)
-    }
-
-    pub fn warn_remaining(self, remaining: Duration, msg: impl Into<Text>) -> Self {
-        self.map_cfg(|c| c.warn_remaining(remaining, msg))
-    }
-
-    pub fn clear_warnings(self) -> Self {
-        self.map_cfg(AskConfig::clear_warnings)
-    }
-
-    pub fn ignore_commands(self) -> Self {
-        self.map_cfg(AskConfig::ignore_commands)
-    }
-
-    pub fn accept_notices(self) -> Self {
-        self.map_cfg(AskConfig::accept_notices)
-    }
-
-    pub fn allow_commands(self) -> Self {
-        self.map_cfg(AskConfig::allow_commands)
-    }
-
-    pub fn ignore_notices(self) -> Self {
-        self.map_cfg(AskConfig::ignore_notices)
-    }
-
-    pub fn timeout_message(self, msg: impl Into<Text>) -> Self {
-        self.map_cfg(|c| c.timeout_message(msg))
-    }
-
-    pub fn timeout_message_fn<G, M>(self, f: G) -> Self
-    where
-        G: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
-        M: Into<Text>,
-    {
-        self.map_cfg(|c| c.timeout_message_fn(f))
-    }
-
-    pub fn no_timeout_message(self) -> Self {
-        self.map_cfg(AskConfig::no_timeout_message)
+    /// Applies an [`AskConfig`] (by value or `&AskConfig`) to this prompt.
+    pub fn config(mut self, cfg: impl Borrow<AskConfig>) -> Self {
+        let cloned = cfg.borrow().clone();
+        self.state.map_unstarted(|u| u.cfg = cloned);
+        self
     }
 }
 
@@ -964,18 +889,13 @@ pub struct AskMany<'a, F, R: IntoAskMatch> {
 
 impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
     #[track_caller]
-    pub(crate) fn from_group_with_config<G: GroupChat + 'a>(
-        group: G,
-        cfg: AskConfig,
-        prompt: Text,
-        matcher: F,
-    ) -> Self {
+    pub(crate) fn from_group<G: GroupChat + 'a>(group: G, prompt: Text, matcher: F) -> Self {
         Self {
             state: LazyState::new(AskManyUnstarted {
                 endpoint: Box::new(GroupEndpoint(group)),
                 caller: Location::caller(),
                 restricted_users: None,
-                cfg,
+                cfg: AskConfig::default(),
                 prompt,
                 matcher,
                 allow_change: false,
@@ -983,14 +903,6 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
                 invalid_max_zero: false,
             }),
         }
-    }
-
-    fn map_cfg(mut self, f: impl FnOnce(AskConfig) -> AskConfig) -> Self {
-        self.state.map_unstarted(|u| {
-            let taken = std::mem::take(&mut u.cfg);
-            u.cfg = f(taken);
-        });
-        self
     }
 
     /// Restricts eligible responders to `users` (deduplicated in input order).
@@ -1043,60 +955,11 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
         self
     }
 
-    pub fn config(self, cfg: &AskConfig) -> Self {
-        self.map_cfg(|_| cfg.clone())
-    }
-
-    pub fn reply_timeout(self, duration: Duration) -> Self {
-        self.map_cfg(|c| c.reply_timeout(duration))
-    }
-
-    pub fn reply_deadline(self, instant: Instant) -> Self {
-        self.map_cfg(|c| c.reply_deadline(instant))
-    }
-
-    pub fn no_reply_timeout(self) -> Self {
-        self.map_cfg(AskConfig::no_reply_timeout)
-    }
-
-    pub fn warn_remaining(self, remaining: Duration, msg: impl Into<Text>) -> Self {
-        self.map_cfg(|c| c.warn_remaining(remaining, msg))
-    }
-
-    pub fn clear_warnings(self) -> Self {
-        self.map_cfg(AskConfig::clear_warnings)
-    }
-
-    pub fn ignore_commands(self) -> Self {
-        self.map_cfg(AskConfig::ignore_commands)
-    }
-
-    pub fn accept_notices(self) -> Self {
-        self.map_cfg(AskConfig::accept_notices)
-    }
-
-    pub fn allow_commands(self) -> Self {
-        self.map_cfg(AskConfig::allow_commands)
-    }
-
-    pub fn ignore_notices(self) -> Self {
-        self.map_cfg(AskConfig::ignore_notices)
-    }
-
-    pub fn timeout_message(self, msg: impl Into<Text>) -> Self {
-        self.map_cfg(|c| c.timeout_message(msg))
-    }
-
-    pub fn timeout_message_fn<G, M>(self, f: G) -> Self
-    where
-        G: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
-        M: Into<Text>,
-    {
-        self.map_cfg(|c| c.timeout_message_fn(f))
-    }
-
-    pub fn no_timeout_message(self) -> Self {
-        self.map_cfg(AskConfig::no_timeout_message)
+    /// Applies an [`AskConfig`] (by value or `&AskConfig`) to this prompt.
+    pub fn config(mut self, cfg: impl Borrow<AskConfig>) -> Self {
+        let cloned = cfg.borrow().clone();
+        self.state.map_unstarted(|u| u.cfg = cloned);
+        self
     }
 }
 
@@ -1112,7 +975,7 @@ where
         self.get_mut().state.poll_with(cx, |u| {
             let timeout_ms = match u.cfg.time_limit {
                 TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-                TimeLimit::Deadline(_) | TimeLimit::None => None,
+                TimeLimit::Default | TimeLimit::Deadline(_) | TimeLimit::None => None,
             };
             let target = u.endpoint.chat().target();
             let span = tracing::debug_span!(
@@ -1136,7 +999,7 @@ fn target_span_label(target: &Target) -> &str {
 fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
     let timeout_ms = match cfg.time_limit {
         TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-        TimeLimit::Deadline(_) | TimeLimit::None => None,
+        TimeLimit::Default | TimeLimit::Deadline(_) | TimeLimit::None => None,
     };
     match source {
         AskSource::Endpoint {
@@ -1173,8 +1036,9 @@ fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
 fn compute_schedule(
     cfg: &AskConfig,
     sent_at: Instant,
+    default_timeout: Duration,
 ) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
-    let Some(deadline) = cfg.time_limit.deadline_from(sent_at) else {
+    let Some(deadline) = cfg.time_limit.deadline_from(sent_at, default_timeout) else {
         return (None, VecDeque::new());
     };
     let budget = deadline.saturating_duration_since(sent_at);
@@ -1186,28 +1050,6 @@ fn compute_schedule(
         .collect();
     warns.sort_by_key(|(at, _)| *at);
     (Some(deadline), VecDeque::from(warns))
-}
-
-#[derive(Default)]
-struct DeliveryState {
-    rename_retries: HashMap<UserId, u8>,
-}
-
-fn resend_to_renamed(
-    core: &Arc<BotCore>,
-    user: &User,
-    bounced_nick: &str,
-    prompt: &Text,
-    state: &mut DeliveryState,
-) -> bool {
-    let retries = state.rename_retries.entry(user.id()).or_insert(0);
-    match user.track().next_rename_retry_nick(bounced_nick, retries) {
-        Some(new_nick) => {
-            let _ = core.send_chat(OutboundChatKind::Privmsg, &new_nick, prompt.clone());
-            true
-        }
-        None => false,
-    }
 }
 
 struct PromptRunOutcome<T> {
@@ -1341,7 +1183,6 @@ where
         let owned = match initial_ref {
             InboxRef::Owned(mut ib) => {
                 ib.set_opened_at(caller);
-                cfg.apply_flags_to_inbox(&mut ib);
                 Some(ib)
             }
             InboxRef::Borrowed(_) => None,
@@ -1434,7 +1275,10 @@ where
     }
 
     let sent_at = Instant::now();
-    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at);
+    let default_timeout = inbox_core
+        .as_ref()
+        .map_or(FALLBACK_REPLY_TIMEOUT, |c| c.default_reply_timeout);
+    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at, default_timeout);
     let endpoint_target = endpoint.chat().target();
     let casemap = inbox_core
         .as_ref()
@@ -1459,7 +1303,6 @@ where
         Deadline,
     }
 
-    let mut delivery = DeliveryState::default();
     let mut timed_out = false;
 
     loop {
@@ -1579,19 +1422,6 @@ where
                         let pool = base_participants.as_deref().or(voters.as_deref());
                         if let (Some(pool), Some(tid)) = (pool, wire.bounce_user_id()) {
                             if let Some(member) = pool.iter().find(|u| u.track_id() == tid) {
-                                if matches!(endpoint_target, Target::Dm) && *code == 401 {
-                                    if let Some(ref core) = inbox_core {
-                                        if resend_to_renamed(
-                                            core,
-                                            member,
-                                            target,
-                                            &prompt,
-                                            &mut delivery,
-                                        ) {
-                                            continue;
-                                        }
-                                    }
-                                }
                                 if let Some(&idx) = answers.index_by_id.get(&member.id()) {
                                     departed.insert(member.id());
                                     answers.record_unreachable_if_pending(

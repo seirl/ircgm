@@ -10,7 +10,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
-use crate::ask::AskConfig;
 use crate::breakout::{Breakout, BreakoutOptions};
 use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::error::{DisconnectReason, Error, Result};
@@ -46,8 +45,8 @@ pub struct BotConfig {
     pub command_prefixes: Vec<String>,
     /// Default timeout for protocol handshakes like `JOIN`/`NAMES`, `Breakout`, and `quit` drain (default: `15s`).
     pub handshake_timeout: Duration,
-    /// Startup bot-wide [`AskConfig`] defaults inherited by `Room`, `Breakout`, `User::ask`, and `ExclusiveDm`.
-    pub ask_config: AskConfig,
+    /// Default reply timeout applied to [`crate::Ask`] / [`crate::AskMany`] prompts when not overridden via [`crate::AskConfig`] (default: `300s`).
+    pub default_reply_timeout: Duration,
     /// Upper ceiling on payload bytes per outbound `PRIVMSG`/`NOTICE` passed to `Text::wrap` (default: `450`).
     pub max_payload_bytes: usize,
     /// Outbound scheduler burst allowance (default: `15` lines per `8s` on live connections).
@@ -76,16 +75,11 @@ impl BotConfig {
             ],
             command_prefixes: vec!["!".into()],
             handshake_timeout: Duration::from_secs(15),
-            ask_config: AskConfig::default(),
+            default_reply_timeout: Duration::from_secs(300),
             max_payload_bytes: 450,
             outbound_burst: 15,
             outbound_window: Duration::from_secs(8),
         }
-    }
-
-    pub fn with_ask_config(mut self, cfg: AskConfig) -> Self {
-        self.ask_config = cfg;
-        self
     }
 
     pub fn with_command_prefixes<I, S>(mut self, prefixes: I) -> Self
@@ -116,7 +110,7 @@ pub(crate) struct BotCore {
     pub(crate) inbox_capacity: usize,
     pub(crate) command_prefixes: Vec<String>,
     pub(crate) handshake_timeout: Duration,
-    pub(crate) ask_config: Arc<AskConfig>,
+    pub(crate) default_reply_timeout: Duration,
     pub(crate) max_payload_bytes: usize,
 }
 
@@ -148,7 +142,7 @@ impl BotCore {
             inbox_capacity: config.inbox_capacity.max(1),
             command_prefixes: config.command_prefixes.clone(),
             handshake_timeout: config.handshake_timeout,
-            ask_config: Arc::new(config.ask_config.clone()),
+            default_reply_timeout: config.default_reply_timeout,
             max_payload_bytes: config.max_payload_bytes.max(1),
         })
     }
@@ -497,19 +491,11 @@ impl Bot {
         self.owner.core.casemap()
     }
 
-    /// The session-wide [`AskConfig`] (`BotConfig::ask_config`) that new rooms, DMs, and
-    /// huddles start from. Clone it to derive a tweaked config for one handle.
-    pub fn ask_config(&self) -> &AskConfig {
-        &self.owner.core.ask_config
-    }
-
     pub fn room(&self, channel: &str) -> Result<Room> {
         validate_target(channel, "channel name")?;
-        let core = &self.owner.core;
         Ok(Room::new(
-            Arc::clone(core),
+            Arc::clone(&self.owner.core),
             channel.to_owned(),
-            Arc::clone(&core.ask_config),
         ))
     }
 
@@ -520,8 +506,14 @@ impl Bot {
         Ok(User::from_parts(Arc::downgrade(core), track))
     }
 
-    /// Strict all-or-nothing multi-user DM lock in canonical `UserTrack::id` order, returning
-    /// guards in the caller's iteration order.
+    /// Acquires multiple independent 1-on-1 [`ExclusiveDm`] locks in canonical [`crate::UserId`]
+    /// order (returning guards in the caller's iteration order).
+    ///
+    /// Use this instead of acquiring individual [`User::exclusive`] guards across concurrent tasks
+    /// when locking multiple players for *private* 1-on-1 exchanges (where [`Bot::huddle`] is
+    /// unsuitable because `Huddle` relays messages and broadcasts replies): canonical lock ordering
+    /// guarantees concurrent callers locking overlapping user sets in different orders can never
+    /// ABBA-deadlock.
     #[track_caller]
     pub fn exclusive_many<I, U>(
         &self,
@@ -539,8 +531,9 @@ impl Bot {
         }
     }
 
-    /// Partial/team-resilient multi-user DM lock: skips any `User` who is offline or quits
-    /// during lock acquisition, returning online guards in caller relative order.
+    /// Drop-out tolerant counterpart to [`Bot::exclusive_many`]: acquires independent 1-on-1
+    /// [`ExclusiveDm`] locks in canonical [`crate::UserId`] order (preventing ABBA deadlocks across
+    /// concurrent tasks) while skipping any user who is offline or quits during lock acquisition.
     #[track_caller]
     pub fn exclusive_available<I, U>(
         &self,
@@ -628,14 +621,7 @@ impl Bot {
             },
             caller,
         );
-        Huddle::new(
-            Arc::clone(core),
-            name,
-            leases,
-            initial_offline,
-            inbox,
-            (*core.ask_config).clone(),
-        )
+        Huddle::new(Arc::clone(core), name, leases, initial_offline, inbox)
     }
 
     pub async fn join(&self, channel: &str) -> Result<Room> {
@@ -669,11 +655,7 @@ impl Bot {
             match mode {
                 JoinMode::Shared => {
                     if let Some(existing) = ws.channel(channel).filter(|c| c.members().is_some()) {
-                        return Ok(Room::new(
-                            Arc::clone(core),
-                            existing.name.clone(),
-                            Arc::clone(&core.ask_config),
-                        ));
+                        return Ok(Room::new(Arc::clone(core), existing.name.clone()));
                     }
                 }
                 JoinMode::Exclusive => {
@@ -715,11 +697,7 @@ impl Bot {
         };
 
         match outcome {
-            Some(JoinOutcome::Joined { name }) => Ok(Room::new(
-                Arc::clone(core),
-                name,
-                Arc::clone(&core.ask_config),
-            )),
+            Some(JoinOutcome::Joined { name }) => Ok(Room::new(Arc::clone(core), name)),
             Some(JoinOutcome::Failed {
                 channel,
                 code,

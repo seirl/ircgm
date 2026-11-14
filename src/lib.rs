@@ -41,7 +41,7 @@
 //!                     _ => AskMatch::reject("Enter a number between 1 and 5!".yellow()),
 //!                 },
 //!             )
-//!             .reply_timeout(Duration::from_secs(15))
+//!             .config(AskConfig::timeout(Duration::from_secs(15)))
 //!             .await?
 //!         {
 //!             Answer::Ok(3) => room.say("🎉 Spot on!".green().bold())?,

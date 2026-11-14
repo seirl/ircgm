@@ -71,51 +71,23 @@ fn account_transitions() {
 }
 
 #[test]
-fn former_tracks_correlate_inflight_bounces_until_evicted_by_new_claimant() {
+fn resolve_send_error_distinguishes_401_departure_from_other_bounces() {
     let reg = UserRegistry::new(AtomicCaseMap::new(CaseMap::Rfc1459));
     let alice = reg.get_or_create("[Alice]");
 
-    // Chained rename `[Alice]` -> `Alicia` -> `Ally` preserves both former nicks:
-    reg.rename("[Alice]", "Alicia");
-    reg.rename("Alicia", "Ally");
-
-    // 401 on former nick resolves `alice.id` WITHOUT marking `Ally` offline:
+    // Non-401 bounce resolves `alice.id` without marking offline:
     assert_eq!(
-        reg.resolve_send_error("{alice}", 401, 10, "No such nick"),
-        (Some(alice.id), None)
-    );
-    assert_eq!(
-        reg.resolve_send_error("alicia", 716, 11, "callerid"),
+        reg.resolve_send_error("{alice}", 716, 10, "callerid"),
         (Some(alice.id), None)
     );
     assert!(alice.is_online());
-    assert_eq!(alice.nick(), "Ally");
 
-    // Dynamic `CASEMAPPING=ascii` re-folds `[Alice]`'s former entry from `{alice}` to `[alice]`:
-    reg.rekey_casemap(CaseMap::Ascii);
+    // 401 marks `alice` offline and returns `quit_track_id`:
     assert_eq!(
-        reg.resolve_send_error("[alice]", 401, 12, "No such nick"),
-        (Some(alice.id), None)
+        reg.resolve_send_error("{alice}", 401, 11, "No such nick"),
+        (Some(alice.id), Some(alice.id))
     );
-    assert_eq!(
-        reg.resolve_send_error("{alice}", 401, 13, "No such nick"),
-        (None, None)
-    );
-
-    // Another user claiming `[alice]` evicts the former entry immediately:
-    let mallory = reg.get_or_create("[alice]");
-    assert_ne!(mallory.id, alice.id);
-    assert_eq!(
-        reg.resolve_send_error("[alice]", 716, 14, "callerid"),
-        (Some(mallory.id), None)
-    );
-    // 401 on active `mallory` marks `mallory` offline and returns `quit_track_id`:
-    assert_eq!(
-        reg.resolve_send_error("[alice]", 401, 15, "No such nick"),
-        (Some(mallory.id), Some(mallory.id))
-    );
-    assert!(!mallory.is_online());
-    assert!(alice.is_online());
+    assert!(!alice.is_online());
 }
 
 #[test]
