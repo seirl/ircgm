@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::testing::test_harness;
 
@@ -271,4 +273,70 @@ async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_a
         mid_window_inbox.next_chat().await.unwrap().text,
         "after rekey"
     );
+}
+
+#[tokio::test]
+async fn clear_keeps_detached_inboxes_failing_with_their_original_error() {
+    let (bot1, _srv1) = test_harness("gm1");
+    let (bot2, _srv2) = test_harness("gm2");
+
+    // Cross-session handles yield an `InvalidSession` inbox; `clear()` must not turn it into a
+    // silently pending (or `BotDropped`) inbox:
+    let foreign = bot1.user("alice").unwrap();
+    let mut invalid = bot2.inbox_dms_from([&foreign]);
+    invalid.clear();
+    assert!(matches!(invalid.next_chat().await, Err(Error::InvalidInput(_))));
+    invalid.clear();
+    assert!(matches!(invalid.next_chat().await, Err(Error::InvalidInput(_))));
+
+    // A `User` outliving its `Bot` yields a `Disconnected(BotDropped)` inbox, also after `clear()`:
+    let orphan = bot1.user("bob").unwrap();
+    drop(bot1);
+    let mut dropped = orphan.inbox();
+    dropped.clear();
+    assert!(matches!(
+        dropped.next_chat().await,
+        Err(Error::Disconnected(DisconnectReason::BotDropped))
+    ));
+}
+
+#[tokio::test]
+async fn exact_role_buckets_route_only_matching_inboxes_and_prune_on_drop() {
+    let (bot, server) = test_harness("gm");
+    let rooms: Vec<Room> = (0..1000)
+        .map(|i| bot.room(&format!("#r{i}")).unwrap())
+        .collect();
+    let mut room_inboxes: Vec<Inbox> = rooms.iter().map(Room::inbox).collect();
+    let alice = bot.user("alice").unwrap();
+    let mut alice_in_r7 = rooms[7].inbox_user(&alice);
+    let registry = &rooms[0].core().inboxes;
+    {
+        let inner = registry.inner.lock().unwrap();
+        assert_eq!(inner.slots.len(), 1001);
+        assert_eq!(inner.channels.len(), 1000);
+        assert_eq!(inner.users.len(), 1);
+    }
+
+    // One channel message reaches exactly that room's inbox and the matching user-in-room inbox:
+    server.chat("alice", "#r7", "hi");
+    server.settle().await;
+    assert_eq!(room_inboxes[7].next_chat().await.unwrap().text, "hi");
+    assert_eq!(alice_in_r7.next_chat().await.unwrap().text, "hi");
+    for idx in [0, 6, 8, 999] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), room_inboxes[idx].next_chat())
+                .await
+                .is_err(),
+            "#r{idx} must not receive #r7 traffic"
+        );
+    }
+
+    // Dropping every inbox prunes all buckets (no stale per-channel or per-user entries):
+    drop(alice_in_r7);
+    room_inboxes.clear();
+    let inner = registry.inner.lock().unwrap();
+    assert!(inner.slots.is_empty());
+    assert!(inner.channels.is_empty());
+    assert!(inner.users.is_empty());
+    assert!(inner.all.is_empty() && inner.all_dms.is_empty());
 }

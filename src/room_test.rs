@@ -219,3 +219,29 @@ async fn moderation_on_unjoined_room_is_rejected_locally() {
         Some(Command::PRIVMSG("#nowhere".into(), "hello?".into()))
     );
 }
+
+#[tokio::test]
+async fn bounce_401_wakes_parked_inbox_user_with_user_left() {
+    let (bot, server) = test_harness("gm");
+    server.complete_join("#lobby", &["alice", "bob"]);
+    server.settle().await;
+    let room = bot.room("#lobby").unwrap();
+    let alice = bot.user("alice").unwrap();
+
+    // Park a `Room::inbox_user` read before alice silently vanishes (no QUIT ever arrives):
+    let mut watch_alice = room.inbox_user(&alice);
+    let parked = tokio::spawn(async move { watch_alice.next_chat().await });
+    tokio::task::yield_now().await;
+    assert!(!parked.is_finished());
+
+    // A `401` for alice (e.g. bouncing an unrelated DM) must wake the parked read immediately:
+    server.send_line(":srv 401 gm alice :No such nick/channel\r\n");
+    let res = tokio::time::timeout(std::time::Duration::from_secs(1), parked)
+        .await
+        .expect("401 bounce must wake a parked UsersInRoom inbox")
+        .unwrap();
+    assert!(
+        matches!(res, Err(Error::UserLeft { ref nick, .. }) if nick == "alice"),
+        "{res:?}"
+    );
+}
