@@ -90,7 +90,7 @@ pub mod prelude {
     pub use crate::{
         fmt::Colorize as _, irc_format, Answer, AskConfig, AskMatch, Bot, Breakout, ChatMessage,
         Error, Event, ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope, MessageKind,
-        Outcome, Result, Room, Text, User, UserId,
+        ModerationGuard, Outcome, Result, Room, Text, User, UserId,
     };
 }
 
@@ -105,7 +105,7 @@ pub use crate::{
     huddle::Huddle,
     inbox::{Inbox, InboxScope},
     message::{ChatMessage, Event, MessageKind, Target},
-    room::{Member, Room},
+    room::{Member, ModerationGuard, Room},
     user::{User, UserId},
 };
 
@@ -113,6 +113,7 @@ const _: () = {
     const fn assert_send_sync_debug<T: Send + Sync + std::fmt::Debug>() {}
     assert_send_sync_debug::<Bot>();
     assert_send_sync_debug::<Room>();
+    assert_send_sync_debug::<ModerationGuard>();
     assert_send_sync_debug::<User>();
     assert_send_sync_debug::<UserId>();
     assert_send_sync_debug::<Member>();

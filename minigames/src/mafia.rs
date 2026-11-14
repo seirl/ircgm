@@ -44,48 +44,6 @@ pub enum MafiaWinner {
     Werewolves,
 }
 
-/// RAII guard restoring `-m`, devoicing players, and restoring the prior channel topic when
-/// `run_mafia_round` finishes or is cancelled externally mid-game.
-struct MafiaRoomGuard<'a> {
-    room: &'a Room,
-    players: Vec<User>,
-    prev_topic: Option<String>,
-    active: bool,
-}
-
-impl<'a> MafiaRoomGuard<'a> {
-    fn enter_night(room: &'a Room, alive: &[User], dead: &[User], night: u32) -> Result<Self> {
-        let prev_topic = room.topic();
-        let players: Vec<User> = alive.iter().chain(dead.iter()).cloned().collect();
-        if room.bot_is_op() {
-            start_mafia_night(room, alive, dead, night)?;
-            Ok(Self {
-                room,
-                players,
-                prev_topic,
-                active: true,
-            })
-        } else {
-            Ok(Self {
-                room,
-                players,
-                prev_topic,
-                active: false,
-            })
-        }
-    }
-}
-
-impl Drop for MafiaRoomGuard<'_> {
-    fn drop(&mut self) {
-        if self.active && self.room.bot_is_op() {
-            let _ = self.room.set_mode("-m", &[]);
-            let _ = self.room.devoice_many(&self.players);
-            let _ = self.room.set_topic(self.prev_topic.as_deref().unwrap_or(""));
-        }
-    }
-}
-
 /// Lobby entrypoint: recruits 4–5 players (`1–2 Werewolves`, `1 Bodyguard`, `2 Villagers`) and runs a round.
 pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(mut players) = crate::recruit_players(
@@ -118,12 +76,18 @@ pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     Ok(crate::PlayOutcome::Completed)
 }
 
-/// Sets channel topic, `+m`, devoices `dead`, and voices `alive` at nightfall.
-pub fn start_mafia_night(room: &Room, alive: &[User], dead: &[User], night: u32) -> Result<()> {
-    room.set_topic(format!("🌙 Mafia — Night {night} ({} alive)", alive.len()))?;
-    room.set_mode("+m", &[])?;
-    room.devoice_many(dead)?;
-    room.voice_many(alive)?;
+/// Enters nightfall on `guard` (if the bot holds chanop): updates the channel topic, sets `+m`,
+/// devoices `dead`, and voices `alive`, with RAII restoration on [`ModerationGuard`] drop.
+pub fn start_mafia_night(
+    guard: &mut ModerationGuard,
+    alive: &[User],
+    dead: &[User],
+    night: u32,
+) -> Result<()> {
+    guard.set_topic(format!("🌙 Mafia — Night {night} ({} alive)", alive.len()))?;
+    guard.set_moderated(true)?;
+    guard.devoice_many(dead)?;
+    guard.voice_many(alive)?;
     Ok(())
 }
 
@@ -234,7 +198,14 @@ pub async fn run_mafia_round(
     let mut alive: Vec<User> = wolves.iter().chain(townsfolk.iter()).cloned().collect();
     let mut dead: Vec<User> = Vec::new();
     let graveyard = bot.breakout(&crate::breakout_slug(room, "graveyard")).await?;
-    let _room_guard = MafiaRoomGuard::enter_night(room, &alive, &dead, 1)?;
+    let mut room_guard = match room.moderation_guard() {
+        Ok(mut guard) => {
+            start_mafia_night(&mut guard, &alive, &dead, 1)?;
+            Some(guard)
+        }
+        Err(Error::NotChannelOp { .. }) => None,
+        Err(fatal) => return Err(fatal),
+    };
 
     // Brief online Bodyguards without failing if one disconnected (`exclusive_available`):
     {
@@ -291,8 +262,8 @@ pub async fn run_mafia_round(
                 victim.nick().bold().red(),
             ))?;
             alive.retain(|u| u != &victim);
-            if room.bot_is_op() {
-                let _ = room.devoice(&victim);
+            if let Some(ref mut guard) = room_guard {
+                let _ = guard.devoice(&victim);
             }
             dead.push(victim);
             // Non-blocking dead-chat invite (`invite_available` won't fail if victim is AFK/offline):

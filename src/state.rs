@@ -25,6 +25,8 @@ pub(crate) struct ChanModes {
     pub(crate) param_always_b: String,
     /// Category C: modes that take a parameter on `+` only, never on `-` (e.g. `l`).
     pub(crate) param_set_c: String,
+    /// Category D: parameterless channel flags advertised by `005 CHANMODES` (`None` before `005`).
+    pub(crate) flag_d: Option<String>,
 }
 
 impl Default for ChanModes {
@@ -33,6 +35,25 @@ impl Default for ChanModes {
             list_a: "beI".into(),
             param_always_b: "k".into(),
             param_set_c: "l".into(),
+            flag_d: None,
+        }
+    }
+}
+
+impl ChanModes {
+    /// Returns `true` if `flag` is a valid parameterless channel mode flag (not in categories
+    /// A/B/C, and present in category D once `005 CHANMODES` has been observed).
+    pub(crate) fn supports_flag(&self, flag: char) -> bool {
+        if !flag.is_ascii_alphabetic()
+            || self.list_a.contains(flag)
+            || self.param_always_b.contains(flag)
+            || self.param_set_c.contains(flag)
+        {
+            return false;
+        }
+        match &self.flag_d {
+            Some(d) => d.contains(flag),
+            None => true,
         }
     }
 }
@@ -355,9 +376,9 @@ impl WorldState {
 
     /// Single source of truth for whether the bot may act in `channel`:
     /// - any `need`: `Left`, or a synced roster without the bot, -> `Error::BotLeftRoom`;
-    /// - `BotPresence::Op` additionally rejects untracked (never joined) channels with
-    ///   `Error::BotLeftRoom` and a synced roster where the bot lacks `+o` with
-    ///   `Error::NotChannelOp`.
+    /// - `BotPresence::Op` additionally rejects untracked/parting channels with
+    ///   `Error::BotLeftRoom`, modeless `+` channels (RFC 2811) with `Error::NotChannelOp`, and
+    ///   unsynced (`Joining`) or non-`+o` channels with `Error::NotChannelOp`.
     pub(crate) fn check_bot_in_channel(&self, channel: &str, need: BotPresence) -> Result<(), Error> {
         let not_in_channel = || Error::BotLeftRoom {
             channel: channel.to_owned(),
@@ -372,13 +393,32 @@ impl WorldState {
         if let Some(err) = chan.left_error() {
             return Err(err);
         }
-        if chan.members().is_some() {
-            let self_occ = self.self_occupant(chan).ok_or_else(not_in_channel)?;
-            if need == BotPresence::Op && !self.occupant_is_op(self_occ) {
+        if need == BotPresence::Op {
+            if matches!(chan.phase, ChannelPhase::Parting { .. }) {
+                return Err(not_in_channel());
+            }
+            if channel.starts_with('+') {
                 return Err(Error::NotChannelOp {
                     channel: channel.to_owned(),
                 });
             }
+            let Some(members) = chan.members() else {
+                return Err(Error::NotChannelOp {
+                    channel: channel.to_owned(),
+                });
+            };
+            let self_occ = self
+                .self_track_id
+                .and_then(|id| members.get(&id))
+                .or_else(|| chan.member_by_nick(&self.current_nick))
+                .ok_or_else(not_in_channel)?;
+            if !self.occupant_is_op(self_occ) {
+                return Err(Error::NotChannelOp {
+                    channel: channel.to_owned(),
+                });
+            }
+        } else if chan.members().is_some() {
+            let _ = self.self_occupant(chan).ok_or_else(not_in_channel)?;
         }
         Ok(())
     }
@@ -504,6 +544,8 @@ impl WorldState {
                     self.targmax_kick = 1;
                 } else if negated.eq_ignore_ascii_case("MODES") {
                     self.max_modes = 4;
+                } else if negated.eq_ignore_ascii_case("CHANMODES") {
+                    self.chan_modes = ChanModes::default();
                 }
                 continue;
             }
@@ -549,6 +591,7 @@ impl WorldState {
                             list_a: parts[0].to_owned(),
                             param_always_b: parts[1].to_owned(),
                             param_set_c: parts[2].to_owned(),
+                            flag_d: Some(parts[3].to_owned()),
                         };
                     }
                 }
