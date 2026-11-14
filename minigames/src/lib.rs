@@ -9,7 +9,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -108,11 +107,11 @@ pub(crate) fn breakout_slug(lobby: &Room, kind: &str) -> String {
 }
 
 /// Shared lobby recruitment helper: collects `count` (`min..=max`) distinct players via `!join`
-/// within `join_window` (deduplicating via [`UserId`] even across `/nick` changes). A recruit who
-/// parts, is kicked, or quits before the game starts loses their seat (and may `!join` again).
+/// (with `!leave` to step back out) within `join_window`, deduplicating via [`UserId`] across
+/// `/nick` changes and evicting recruits who `PART`, are `KICK`ed, or `QUIT` before launch.
 ///
-/// Finishes immediately as soon as `max` players join, or when `join_window` expires if at least
-/// `min` players have joined. Returns `Ok(None)` if fewer than `min` players joined in time.
+/// Finishes immediately as soon as `max` players are in, or when `join_window` expires if at least
+/// `min` players are in. Returns `Ok(None)` if fewer than `min` players joined in time.
 pub async fn recruit_players(
     room: &Room,
     game_title: &str,
@@ -132,60 +131,38 @@ pub async fn recruit_players(
         format!("{min_players}–{max_players} players")
     };
 
-    let mut inbox = room.inbox();
-    room.say(irc_format!(
-        "{} {} — {count_desc}! Type {} ({}s):",
-        "🎲".bold(),
-        game_title.bold().cyan(),
-        "!join".bold().green(),
-        join_window.as_secs(),
-    ))?;
-
-    enum Lobby {
-        Join(User),
-        Leave(User),
-    }
-
-    let mut seen = HashSet::with_capacity(max_players);
-    let mut players: Vec<User> = Vec::with_capacity(max_players);
-    let collect = async {
-        while players.len() < max_players {
-            let event = inbox
-                .wait_event_map(|ev| match ev {
-                    Event::Chat(msg) if msg.is_cmd("!join") => Some(Lobby::Join(msg.sender.clone())),
-                    Event::Parted { user, .. }
-                    | Event::Kicked { user, .. }
-                    | Event::Quit { user, .. } => Some(Lobby::Leave(user.clone())),
-                    _ => None,
-                })
-                .await?;
-            match event {
-                Lobby::Join(user) => {
-                    if seen.insert(user.id()) {
-                        room.say(irc_format!(
-                            "{} joined! ({}/{max_players})",
-                            user.nick().bold(),
-                            players.len() + 1,
-                        ))?;
-                        players.push(user);
-                    }
+    let signups = room
+        .ask_many(
+            irc_format!(
+                "{} {} — {count_desc}! Type {} ({}s):",
+                "🎲".bold(),
+                game_title.bold().cyan(),
+                "!join".bold().green(),
+                join_window.as_secs(),
+            ),
+            |m| {
+                if m.is_cmd("!join") {
+                    AskMatch::accept_say(true, irc_format!("{} joined!", m.nick.as_str().bold()))
+                } else if m.is_cmd("!leave") {
+                    AskMatch::accept_say(
+                        false,
+                        irc_format!("{} left the lobby.", m.nick.as_str().bold()),
+                    )
+                } else {
+                    AskMatch::ignore()
                 }
-                // A recruit who leaves the lobby before the game starts gives up their seat:
-                Lobby::Leave(user) => {
-                    if seen.remove(&user.id()) {
-                        players.retain(|p| p != &user);
-                        room.say(irc_format!(
-                            "{} left. ({}/{max_players})",
-                            user.nick().bold(),
-                            players.len(),
-                        ))?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    };
-    collect.run_for(join_window).await?;
+            },
+        )
+        .allow_change(true)
+        .reply_timeout(join_window)
+        .no_timeout_message()
+        .stop_when(|a| a.values().filter(|&&joined| joined).count() >= max_players)
+        .await?;
+
+    let players: Vec<User> = signups
+        .into_iter()
+        .filter_map(|(u, joined)| joined.then_some(u))
+        .collect();
 
     if players.len() >= min_players {
         Ok(Some(players))

@@ -35,7 +35,7 @@ async fn blackjack_round_handles_hit_stand_timeout_dealer_settlement_and_mid_han
     });
     server.flush().await;
 
-    // Spectator `!deal` is ignored by `room.ask_users(&players, ...)`:
+    // Spectator `!deal` is ignored by `room.ask(...).from_users(&players)`:
     server.chat("Spectator", "#bj", "!deal");
     server.chat("Bob", "#bj", "!deal");
     server.settle().await;

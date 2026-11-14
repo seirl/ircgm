@@ -19,7 +19,7 @@ use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox, InboxRegistry, InboxScope};
 use crate::outbound::{
     build_chat_commands, validate_param, validate_target, OutboundChatKind, OutboundSink, Priority,
-    RawTransport, WriteReceipt,
+    RawTransport,
 };
 use crate::pump::{run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
@@ -276,22 +276,23 @@ impl BotCore {
     ) {
         let mut ws = self.state.write().unwrap();
         ws.mark_parting(channel, evict_on_leave);
-        let _ = self.outbound.enqueue_batch(priority, cmds);
+        self.outbound.enqueue_batch(priority, cmds);
     }
 
-    /// Enqueues a validated, line-wrapped outbound chat message and returns its [`WriteReceipt`].
+    /// Enqueues a validated, line-wrapped outbound chat message.
     pub(crate) fn send_chat(
         &self,
         kind: OutboundChatKind,
         target: &str,
         text: Text,
-    ) -> Result<WriteReceipt> {
+    ) -> Result<()> {
         self.check_connected()?;
         validate_target(target, "message target")?;
         let ws = self.state.read().unwrap();
         let cmds = build_chat_commands(kind, target, text, &ws, self.max_payload_bytes);
         drop(ws);
-        Ok(self.outbound.enqueue_batch(Priority::Interactive, cmds))
+        self.outbound.enqueue_batch(Priority::Interactive, cmds);
+        Ok(())
     }
 }
 
@@ -569,10 +570,11 @@ impl Bot {
             .collect()
     }
 
-    /// Strict channel-free group DM deliberation guard.
+    /// Strict channel-free group DM deliberation guard (`[<name>] <<nick>> <msg>`).
     #[track_caller]
     pub fn huddle<I, U>(
         &self,
+        name: impl Into<irc_colors::Text>,
         users: I,
     ) -> impl Future<Output = Result<Huddle>> + Send + '_
     where
@@ -580,10 +582,11 @@ impl Bot {
         U: Borrow<User>,
     {
         let caller = Location::caller();
+        let name = name.into();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
             let (leases, _) = acquire_dm_leases(&self.owner.core, collected, true, caller).await?;
-            Ok(self.build_huddle(leases, None, caller))
+            Ok(self.build_huddle(name, leases, None, caller))
         }
     }
 
@@ -591,6 +594,7 @@ impl Bot {
     #[track_caller]
     pub fn huddle_available<I, U>(
         &self,
+        name: impl Into<irc_colors::Text>,
         users: I,
     ) -> impl Future<Output = Result<Huddle>> + Send + '_
     where
@@ -598,16 +602,18 @@ impl Bot {
         U: Borrow<User>,
     {
         let caller = Location::caller();
+        let name = name.into();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
             let (leases, initial_offline) =
                 acquire_dm_leases(&self.owner.core, collected, false, caller).await?;
-            Ok(self.build_huddle(leases, initial_offline, caller))
+            Ok(self.build_huddle(name, leases, initial_offline, caller))
         }
     }
 
     fn build_huddle(
         &self,
+        name: irc_colors::Text,
         leases: Vec<DmLease>,
         initial_offline: Option<(String, Option<String>)>,
         caller: &'static Location<'static>,
@@ -624,6 +630,7 @@ impl Bot {
         );
         Huddle::new(
             Arc::clone(core),
+            name,
             leases,
             initial_offline,
             inbox,
@@ -903,17 +910,14 @@ impl Bot {
         tokio::task::yield_now().await;
 
         // 2. Drain both Interactive and Background queues followed by QUIT:
-        let quit_receipt = core.outbound.enqueue_quit(reason);
-
         let deadline = crate::future::deadline_after(core.handshake_timeout);
-        if tokio::time::timeout_at(deadline, quit_receipt.wait())
-            .await
-            .is_err()
-        {
-            core.finalize_quit();
-            return Err(Error::HandshakeTimeout {
-                operation: "quit outbound drain",
-            });
+        if let Some(quit_rx) = core.outbound.enqueue_quit(reason) {
+            if tokio::time::timeout_at(deadline, quit_rx).await.is_err() {
+                core.finalize_quit();
+                return Err(Error::HandshakeTimeout {
+                    operation: "quit outbound drain",
+                });
+            }
         }
 
         // Best-effort wait (within the remaining `handshake_timeout` budget) for the peer to close

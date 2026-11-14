@@ -399,6 +399,7 @@ impl InboxRegistry {
             latched_departure: None,
             last_user_departure: None,
             departed_users,
+            on_chat: None,
         }
     }
 
@@ -649,6 +650,7 @@ pub struct Inbox {
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
+    pub(crate) on_chat: Option<Arc<dyn Fn(&ChatMessage) + Send + Sync>>,
 }
 
 impl fmt::Debug for Inbox {
@@ -690,6 +692,32 @@ impl Inbox {
             latched_departure: None,
             last_user_departure: None,
             departed_users: HashSet::new(),
+            on_chat: None,
+        }
+    }
+
+    pub(crate) fn core(&self) -> Option<&Arc<BotCore>> {
+        match &self.sub {
+            InboxSub::Active { core, .. } => Some(core),
+            InboxSub::Disconnected | InboxSub::InvalidSession => None,
+        }
+    }
+
+    pub(crate) fn is_invalid_session(&self) -> bool {
+        matches!(self.sub, InboxSub::InvalidSession)
+    }
+
+    pub(crate) fn is_departed_in_room(&self, track_id: u64) -> bool {
+        self.departed_users.contains(&track_id)
+    }
+
+    pub(crate) fn set_opened_at(&mut self, opened_at: &'static Location<'static>) {
+        self.opened_at = opened_at;
+        if let InboxSub::Active { core, slot_id, .. } = &self.sub {
+            let mut inner = core.inboxes.inner.lock().unwrap();
+            if let Some(slot) = inner.slots.get_mut(slot_id) {
+                slot.opened_at = opened_at;
+            }
         }
     }
 
@@ -761,25 +789,8 @@ impl Inbox {
         }
     }
 
-    /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`] and [`crate::Ask`].
-    ///
-    /// `f` sees every reply candidate (chat, plus human notices if `accept_notices`);
-    /// `on_other` sees every other wire event (bounces, departures, ...) and may end the wait.
-    pub(crate) async fn wait_reply_map<B, F, T>(
-        &mut self,
-        ignore_commands: bool,
-        accept_notices: bool,
-        on_other: B,
-        f: F,
-    ) -> Result<T>
-    where
-        B: FnMut(&WireEvent) -> Option<Error>,
-        F: FnMut(&ChatMessage) -> Option<T>,
-    {
-        self.wait_reply_map_inner(TimeLimit::None, ignore_commands, accept_notices, on_other, f)
-            .await
-    }
-
+    /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`], [`Inbox::wait_cmd`], and
+    /// [`Inbox::next_chat`].
     async fn wait_reply_map_inner<B, F, T>(
         &mut self,
         read_limit: TimeLimit,
@@ -1043,7 +1054,7 @@ impl Inbox {
         };
         match rx.try_recv() {
             Ok(wire) => {
-                self.latch_in_stream_departure(&wire);
+                self.on_wire_received(&wire);
                 Ok(Some(wire))
             }
             Err(mpsc::error::TryRecvError::Disconnected) => Err(self.disconnected_error()),
@@ -1064,7 +1075,7 @@ impl Inbox {
         };
         match rx.poll_recv(cx) {
             Poll::Ready(Some(wire)) => {
-                self.latch_in_stream_departure(&wire);
+                self.on_wire_received(&wire);
                 Poll::Ready(Ok(wire))
             }
             Poll::Ready(None) => Poll::Ready(Err(self.disconnected_error())),
@@ -1073,6 +1084,15 @@ impl Inbox {
                     return Poll::Ready(Err(err));
                 }
                 Poll::Pending
+            }
+        }
+    }
+
+    fn on_wire_received(&mut self, wire: &WireEvent) {
+        self.latch_in_stream_departure(wire);
+        if let WireKind::Event(Event::Chat(msg)) = &wire.kind {
+            if let Some(ref on_chat) = self.on_chat {
+                on_chat(msg);
             }
         }
     }

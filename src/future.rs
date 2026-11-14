@@ -126,10 +126,9 @@ pub(crate) fn deadline_after(duration: Duration) -> Instant {
 }
 
 /// Shared core of [`WithTimeout`] and [`RunFor`]: `fut` raced against a `deadline` fixed
-/// eagerly at construction (matching `tokio::time::timeout` and keeping `Timed` single-state;
-/// by contrast, `Ask` defers `Duration -> Instant` until `WriteReceipt` resolves so outbound
-/// flood pacing never eats into a player's reply window). `Sleep` itself is armed lazily on
-/// first poll so constructing combinators outside an active Tokio runtime never panics.
+/// eagerly at construction (matching `tokio::time::timeout` and keeping `Timed` single-state).
+/// `Sleep` itself is armed lazily on first poll so constructing combinators outside an active
+/// Tokio runtime never panics.
 struct Timed<F> {
     fut: Pin<Box<F>>,
     deadline: Instant,

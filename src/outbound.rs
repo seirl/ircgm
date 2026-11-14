@@ -1,9 +1,6 @@
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use irc::proto::Command;
@@ -118,38 +115,6 @@ pub(crate) enum Priority {
     Background,
 }
 
-/// Resolves when the final line of an outbound prompt batch has actually been written by [`OutboundSink`].
-pub(crate) struct WriteReceipt {
-    rx: Option<oneshot::Receiver<()>>,
-}
-
-impl WriteReceipt {
-    pub(crate) fn immediate() -> Self {
-        Self { rx: None }
-    }
-
-    fn from_rx(rx: oneshot::Receiver<()>) -> Self {
-        Self { rx: Some(rx) }
-    }
-
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(rx) = self.rx.as_mut() else {
-            return Poll::Ready(());
-        };
-        match Pin::new(rx).poll(cx) {
-            Poll::Ready(_) => {
-                self.rx = None;
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    pub(crate) async fn wait(mut self) {
-        std::future::poll_fn(|cx| self.poll(cx)).await
-    }
-}
-
 pub(crate) enum RawTransport {
     Irc(irc::client::Sender),
     #[cfg(any(test, feature = "testing"))]
@@ -194,7 +159,6 @@ impl RawTransport {
 struct QueuedCmd {
     cmd: Command,
     bg_channel: Option<FoldedStr>,
-    receipt_tx: Option<oneshot::Sender<()>>,
 }
 
 struct SchedulerState {
@@ -217,22 +181,18 @@ impl SchedulerState {
             || self.quit_pending.is_some()
     }
 
-    fn pop_next_item(&mut self) -> Option<QueuedCmd> {
+    fn pop_next_item(&mut self) -> Option<(Command, Option<oneshot::Sender<()>>)> {
         if let Some(item) = self.interactive.pop_front() {
-            return Some(item);
+            return Some((item.cmd, None));
         }
 
         if let Some(bg) = self.background.pop_front() {
-            return Some(bg);
+            return Some((bg.cmd, None));
         }
 
         if let Some((reason, done_tx)) = self.quit_pending.take() {
             self.closed = true;
-            return Some(QueuedCmd {
-                cmd: Command::QUIT(reason),
-                bg_channel: None,
-                receipt_tx: Some(done_tx),
-            });
+            return Some((Command::QUIT(reason), Some(done_tx)));
         }
 
         None
@@ -272,16 +232,16 @@ impl SchedulerState {
                 return Some(oldest + self.window);
             }
 
-            let Some(item) = self.pop_next_item() else {
+            let Some((cmd, done_tx)) = self.pop_next_item() else {
                 self.pacing_warned = false;
                 return None;
             };
 
-            let _ = self.transport.send(item.cmd);
+            let _ = self.transport.send(cmd);
             if self.burst != usize::MAX {
                 self.sent_timestamps.push_back(now);
             }
-            if let Some(tx) = item.receipt_tx {
+            if let Some(tx) = done_tx {
                 let _ = tx.send(());
             }
         }
@@ -366,19 +326,18 @@ impl OutboundSink {
         }
     }
 
-    /// Enqueues a batch of commands under `priority` and returns a [`WriteReceipt`] resolved
-    /// when the final command in `cmds` is written to the underlying sink (allocating a
-    /// `oneshot` only when the batch could not be flushed synchronously).
-    pub(crate) fn enqueue_batch(&self, priority: Priority, cmds: Vec<Command>) -> WriteReceipt {
+    /// Enqueues a batch of commands under `priority`, flushing immediately within the active
+    /// burst allowance and pacing any remainder in the background.
+    pub(crate) fn enqueue_batch(&self, priority: Priority, cmds: Vec<Command>) {
         if cmds.is_empty() {
-            return WriteReceipt::immediate();
+            return;
         }
 
         let casemap = self.casemap.load();
-        let (needs_wake, receipt) = {
+        let needs_wake = {
             let mut st = self.state.lock().unwrap();
             if st.closed || st.aborted || st.quit_pending.is_some() {
-                return WriteReceipt::immediate();
+                return;
             }
             self.enqueue_seq.fetch_add(1, Ordering::Release);
 
@@ -393,7 +352,10 @@ impl OutboundSink {
                             let mut remaining = VecDeque::with_capacity(st.background.len());
                             while let Some(bg_item) = st.background.pop_front() {
                                 if bg_item.bg_channel.as_ref() == Some(&target_key) {
-                                    st.interactive.push_back(bg_item);
+                                    st.interactive.push_back(QueuedCmd {
+                                        cmd: bg_item.cmd,
+                                        bg_channel: None,
+                                    });
                                 } else {
                                     remaining.push_back(bg_item);
                                 }
@@ -413,56 +375,34 @@ impl OutboundSink {
                 } else {
                     None
                 };
-                let q = QueuedCmd {
-                    cmd,
-                    bg_channel,
-                    receipt_tx: None,
-                };
+                let q = QueuedCmd { cmd, bg_channel };
                 match priority {
                     Priority::Interactive => st.interactive.push_back(q),
                     Priority::Background => st.background.push_back(q),
                 }
             }
 
-            let needs_wake = st.try_flush_ready(Instant::now()).is_some();
-
-            // `try_flush_ready` only pops from the front of each queue and nothing else can push
-            // while we hold the lock, so if our queue is still non-empty its back is our final
-            // command; otherwise the whole batch was already written synchronously.
-            let queue = match priority {
-                Priority::Interactive => &mut st.interactive,
-                Priority::Background => &mut st.background,
-            };
-            let receipt = match queue.back_mut() {
-                Some(last) => {
-                    let (tx, rx) = oneshot::channel();
-                    last.receipt_tx = Some(tx);
-                    WriteReceipt::from_rx(rx)
-                }
-                None => WriteReceipt::immediate(),
-            };
-            (needs_wake, receipt)
+            st.try_flush_ready(Instant::now()).is_some()
         };
 
         if needs_wake {
             self.notify.notify_one();
         }
-        receipt
     }
 
-    pub(crate) fn enqueue_one(&self, priority: Priority, cmd: Command) -> WriteReceipt {
-        self.enqueue_batch(priority, vec![cmd])
+    pub(crate) fn enqueue_one(&self, priority: Priority, cmd: Command) {
+        self.enqueue_batch(priority, vec![cmd]);
     }
 
     /// Schedules `QUIT` after all currently queued `Interactive` and `Background` commands drain,
-    /// returning a [`WriteReceipt`] resolved once `QUIT` has been written.
-    pub(crate) fn enqueue_quit(&self, reason: Option<&str>) -> WriteReceipt {
+    /// returning a `oneshot::Receiver` resolved once `QUIT` has been written.
+    pub(crate) fn enqueue_quit(&self, reason: Option<&str>) -> Option<oneshot::Receiver<()>> {
         let clean_reason = reason.map(sanitize_reason);
         let (tx, rx) = oneshot::channel();
         let needs_wake = {
             let mut st = self.state.lock().unwrap();
             if st.closed || st.aborted {
-                return WriteReceipt::immediate();
+                return None;
             }
             self.enqueue_seq.fetch_add(1, Ordering::Release);
             st.quit_pending = Some((clean_reason, tx));
@@ -471,7 +411,7 @@ impl OutboundSink {
         if needs_wake {
             self.notify.notify_one();
         }
-        WriteReceipt::from_rx(rx)
+        Some(rx)
     }
 
     pub(crate) fn abort(&self) {

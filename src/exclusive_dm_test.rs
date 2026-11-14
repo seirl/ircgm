@@ -71,6 +71,10 @@ async fn acquire_many_and_available_reject_foreign_and_duplicate_users() {
     };
     assert!(dup(bot1.exclusive_many([&alice1, &alice1]).await.map(drop)));
     assert!(dup(bot1.exclusive_available([&alice1, &alice1]).await.map(drop)));
-    assert!(dup(bot1.huddle([&alice1, &alice1]).await.map(drop)));
-    assert!(dup(bot1.huddle_available([&alice1, &alice1]).await.map(drop)));
+    assert!(dup(bot1.huddle("Pack", [&alice1, &alice1]).await.map(drop)));
+    assert!(dup(
+        bot1.huddle_available("Pack", [&alice1, &alice1])
+            .await
+            .map(drop)
+    ));
 }

@@ -11,9 +11,10 @@ use irc::proto::Command;
 use irc_colors::Text;
 
 use crate::ask::AskConfig;
+use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
-use crate::message::{Event, WireKind};
+use crate::message::{Event, Target, WireKind};
 use crate::outbound::{sanitize_reason, sanitize_text, Priority};
 use crate::room::Room;
 use crate::user::{User, UserStatus};
@@ -231,6 +232,20 @@ impl Breakout {
 
     pub fn set_ask_config(&mut self, cfg: &AskConfig) {
         self.room = self.room.with_ask_config(cfg);
+    }
+
+    #[track_caller]
+    pub fn inbox(&self) -> crate::inbox::Inbox {
+        self.room.inbox()
+    }
+
+    #[track_caller]
+    pub fn inbox_users<I, U>(&self, users: I) -> crate::inbox::Inbox
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
+        self.room.inbox_users(users)
     }
 
     /// Strict all-or-nothing invite handshake.
@@ -537,6 +552,74 @@ impl Breakout {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+impl Chat for Breakout {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.say(text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.notice(text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.action(text)
+    }
+
+    #[track_caller]
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Owned(self.room.inbox())
+    }
+
+    fn target(&self) -> Target {
+        (&self.room).target()
+    }
+}
+
+impl GroupChat for Breakout {
+    fn has_user(&self, user: &User) -> bool {
+        self.room.has_user(user)
+    }
+
+    #[track_caller]
+    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
+        InboxRef::Owned(self.room.inbox_users(users))
+    }
+}
+
+impl Chat for &Breakout {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.say(text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.notice(text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        self.room.action(text)
+    }
+
+    #[track_caller]
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Owned(self.room.inbox())
+    }
+
+    fn target(&self) -> Target {
+        (&self.room).target()
+    }
+}
+
+impl GroupChat for &Breakout {
+    fn has_user(&self, user: &User) -> bool {
+        self.room.has_user(user)
+    }
+
+    #[track_caller]
+    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
+        InboxRef::Owned(self.room.inbox_users(users))
     }
 }
 

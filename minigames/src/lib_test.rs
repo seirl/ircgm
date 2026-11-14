@@ -97,6 +97,8 @@ async fn recruit_players_drops_recruits_who_part_get_kicked_or_quit() {
     srv.part_user("Alice", "#lobby", None);
     srv.kick_user("GM", "#lobby", "Bob", Some("no idling"));
     srv.chat("Dave", "#lobby", "!join");
+    srv.chat("Dave", "#lobby", "!leave");
+    srv.chat("Dave", "#lobby", "!join");
     srv.quit_user("Carol", Some("bye"));
     srv.advance(Duration::from_secs(10)).await;
 

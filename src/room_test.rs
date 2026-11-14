@@ -62,7 +62,6 @@ async fn room_queries_and_moderation_batching_respect_world_state() {
     assert_eq!(room.topic().as_deref(), Some("Championship Round"));
     let nicks: Vec<String> = room.members().into_iter().map(|m| m.nick).collect();
     assert_eq!(nicks, vec!["alice", "bob", "carol", "gm"]);
-    assert_eq!(room.nicks(), vec!["alice", "bob", "carol", "gm"]);
     assert!(room.has_nick("ALICE"));
 
     let alice = bot.user("alice").unwrap();
@@ -100,7 +99,7 @@ async fn room_queries_and_moderation_batching_respect_world_state() {
 }
 
 #[tokio::test]
-async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_players_leave() {
+async fn room_inbox_users_and_ask_from_users_ignore_spectators_and_end_when_all_players_leave() {
     let (bot, mut server) = test_harness("gm");
     let join_task = tokio::spawn({
         let bot = bot.clone();
@@ -114,15 +113,14 @@ async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_playe
     let alice = bot.user("alice").unwrap();
     let bob = bot.user("bob").unwrap();
 
-    // `ask_users` ignores spectator chatter and survives one listed player parting:
+    // `ask(...).from_users(...)` ignores spectator chatter and survives one listed player parting:
     let ask_task = tokio::spawn({
         let room = room.clone();
         let players = vec![alice.clone(), bob.clone()];
         async move {
-            room.ask_users(&players, "Type !deal", |m| {
-                m.is_cmd("!deal").then(|| m.sender.nick())
-            })
-            .await
+            room.ask("Type !deal", |m| m.is_cmd("!deal").then(|| m.sender.nick()))
+                .from_users(&players)
+                .await
         }
     });
     server.flush().await;
@@ -135,7 +133,7 @@ async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_playe
     let dealer = ask_task.await.unwrap().unwrap().unwrap();
     assert_eq!(dealer, "bob");
 
-    // Once `bob` also parts, `inbox_users` fails with `Error::UserLeft` and `ask_users` resolves
+    // Once `bob` also parts, `inbox_users` fails with `Error::UserLeft` and `from_users` resolves
     // to `Answer::Left`:
     let mut sub_inbox = room.inbox_users([&alice, &bob]);
     server.part_user("bob", "#table", Some("cashout"));
@@ -148,7 +146,8 @@ async fn room_inbox_users_and_ask_users_ignore_spectators_and_end_when_all_playe
     }
 
     assert!(matches!(
-        room.ask_users([&alice, &bob], "Anyone left?", |m| Some(m.text.clone()))
+        room.ask("Anyone left?", |m| Some(m.text.clone()))
+            .from_users([&alice, &bob])
             .await,
         Ok(crate::Answer::Left { .. })
     ));

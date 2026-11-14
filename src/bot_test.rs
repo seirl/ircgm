@@ -176,18 +176,18 @@ async fn socket_eof_aborts_throttled_outbound_write_receipt_immediately() {
         ))
     );
 
-    // Spawn an `Ask` whose prompt is parked in `OutboundSink` awaiting `WriteReceipt::wait`:
+    // Spawn an `Ask` whose prompt is throttled in `OutboundSink`:
     let ask_task = tokio::spawn(async move {
         room.ask("throttled prompt", |m| Some(m.text.clone())).await
     });
     tokio::task::yield_now().await;
     assert!(server.try_recv_sent().is_none());
 
-    // Socket EOF must abort `OutboundSink` atomically so `WriteReceipt::wait` unblocks immediately:
+    // Socket EOF aborts `OutboundSink` and closes the inbox so the `Ask` unblocks immediately:
     server.disconnect();
     let res = tokio::time::timeout(Duration::from_secs(1), ask_task)
         .await
-        .expect("throttled Ask stalled on WriteReceipt::wait after EOF")
+        .expect("throttled Ask stalled after EOF")
         .unwrap();
     assert!(matches!(
         res,

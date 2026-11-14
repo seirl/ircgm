@@ -1,134 +1,36 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
+use crate::ask::{Ask, AskConfig, AskMany, IntoAskMatch};
 use crate::bot::BotCore;
+use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
 use crate::exclusive_dm::DmLease;
 use crate::inbox::Inbox;
-use crate::message::ChatMessage;
-use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::user::{User, UserId, UserStatus};
+use crate::message::{ChatMessage, Target};
+use crate::outbound::OutboundChatKind;
+use crate::user::User;
 
-/// Disjoint outbound view of a [`Huddle`] so [`Ask`] can send prompts, countdown warnings,
-/// rejects, and banter relays while mutably polling `Huddle::inbox`.
-pub(crate) struct HuddleSender<'a> {
-    core: &'a Arc<BotCore>,
-    leases: &'a [DmLease],
-    initial_offline: &'a Option<(String, Option<String>)>,
-    relay_prefix: &'a Option<Text>,
-    relay_commands: bool,
-}
-
-impl<'a> HuddleSender<'a> {
-    pub(crate) fn core(&self) -> &'a Arc<BotCore> {
-        self.core
-    }
-
-    pub(crate) fn has_relay(&self) -> bool {
-        self.relay_prefix.is_some()
-    }
-
-    pub(crate) fn broadcast_prompt_with_receipt(&self, prompt: Text) -> Result<WriteReceipt> {
-        self.core.check_connected()?;
-        let mut last_receipt: Option<WriteReceipt> = None;
-        let mut last_offline_err: Option<Error> = None;
-
-        for lease in self.leases {
-            match lease
-                .user()
-                .send_chat(OutboundChatKind::Privmsg, prompt.clone())
-            {
-                Ok(r) => last_receipt = Some(r),
-                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
-                Err(e) => return Err(e),
-            }
-        }
-
-        last_receipt.ok_or_else(|| {
-            last_offline_err
-                .or_else(|| {
-                    self.initial_offline
-                        .clone()
-                        .map(|(nick, reason)| Error::UserLeft { nick, reason })
-                })
-                .unwrap_or(Error::InvalidInput("Huddle has no members"))
-        })
-    }
-
-    pub(crate) fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
-        self.core.check_connected()?;
-        for lease in self.leases {
-            match lease.user().send_chat(kind, text.clone()) {
-                Ok(_) | Err(Error::UserLeft { .. }) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn relay_to_others(&self, msg: &ChatMessage) -> Result<()> {
-        self.core.check_connected()?;
-        if !self.relay_commands && self.core.is_command_text(&msg.text) {
-            return Ok(());
-        }
-        let empty = Text::new();
-        let prefix = self.relay_prefix.as_ref().unwrap_or(&empty);
-        let rendered = irc_format!("{prefix}<{}> {}", msg.nick, msg.to_styled());
-        let sender_id = msg.sender.id();
-        for user in self.leases.iter().map(DmLease::user) {
-            if user.id() == sender_id {
-                continue;
-            }
-            match user.send_chat(OutboundChatKind::Privmsg, rendered.clone()) {
-                Ok(_) | Err(Error::UserLeft { .. }) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn find_matching_user(&self, target_user_id: Option<u64>) -> Option<&'a User> {
-        let uid = UserId(target_user_id?);
-        self.leases
-            .iter()
-            .map(DmLease::user)
-            .find(|u| u.id() == uid)
-    }
-
-    /// Whether any member had neither bounced nor quit as of wire position `seq` (judged by
-    /// `QUIT` position, so a departure the reader has not reached yet still counts as online).
-    pub(crate) fn any_reachable_at(&self, bounced_users: &HashSet<UserId>, seq: u64) -> bool {
-        self.leases.iter().map(DmLease::user).any(|u| {
-            !bounced_users.contains(&u.id())
-                && match u.track().status() {
-                    UserStatus::Online => true,
-                    UserStatus::Quit { at_seq, .. } => at_seq > seq,
-                }
-        })
-    }
-}
-
-/// RAII channel-free group DM guard (`bot.huddle(&users)` / `bot.huddle_available(&users)`).
+/// RAII channel-free group DM guard (`bot.huddle(name, &users)` / `bot.huddle_available(name, &users)`).
 ///
 /// Holds the DM prompt locks of all members (the same per-user lock [`crate::ExclusiveDm`]
-/// takes) plus one wire-ordered [`Inbox`] over all members' DMs, releasing all locks on `Drop`.
+/// takes) plus one wire-ordered [`Inbox`] over all members' DMs that automatically relays
+/// `[<name>] <<nick>> <msg>` to fellow members, releasing all locks on `Drop`.
 pub struct Huddle {
     core: Arc<BotCore>,
+    name: Text,
     leases: Vec<DmLease>,
     initial_offline: Option<(String, Option<String>)>,
     inbox: Inbox,
     ask_config: AskConfig,
-    relay_prefix: Option<Text>,
-    relay_commands: bool,
 }
 
 impl fmt::Debug for Huddle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Huddle")
+            .field("name", &self.name.plain())
             .field("users", &self.leases)
             .finish_non_exhaustive()
     }
@@ -137,42 +39,70 @@ impl fmt::Debug for Huddle {
 impl Huddle {
     pub(crate) fn new(
         core: Arc<BotCore>,
+        name: Text,
         leases: Vec<DmLease>,
         initial_offline: Option<(String, Option<String>)>,
         mut inbox: Inbox,
         ask_config: AskConfig,
     ) -> Self {
         ask_config.apply_to_locked_inbox(&mut inbox);
+        let users: Vec<User> = leases.iter().map(|l| l.user().clone()).collect();
+        let relay_core = Arc::clone(&core);
+        let relay_name = name.clone();
+        inbox.on_chat = Some(Arc::new(move |msg: &ChatMessage| {
+            if relay_core.check_connected().is_err() {
+                return;
+            }
+            let rendered = if relay_name.is_empty() {
+                irc_format!("<{}> {}", msg.nick, msg.to_styled())
+            } else {
+                irc_format!("[{relay_name}] <{}> {}", msg.nick, msg.to_styled())
+            };
+            let sender_id = msg.sender.id();
+            for user in &users {
+                if user.id() != sender_id {
+                    let _ = user.send_chat(OutboundChatKind::Privmsg, rendered.clone());
+                }
+            }
+        }));
         Self {
             core,
+            name,
             leases,
             initial_offline,
             inbox,
             ask_config,
-            relay_prefix: None,
-            relay_commands: false,
         }
     }
 
-    fn sender_view(&self) -> HuddleSender<'_> {
-        HuddleSender {
-            core: &self.core,
-            leases: &self.leases,
-            initial_offline: &self.initial_offline,
-            relay_prefix: &self.relay_prefix,
-            relay_commands: self.relay_commands,
+    fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
+        self.core.check_connected()?;
+        let mut sent_any = false;
+        let mut last_offline_err: Option<Error> = None;
+
+        for lease in &self.leases {
+            match lease.user().send_chat(kind, text.clone()) {
+                Ok(()) => sent_any = true,
+                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+
+        if sent_any {
+            Ok(())
+        } else {
+            Err(last_offline_err
+                .or_else(|| {
+                    self.initial_offline
+                        .clone()
+                        .map(|(nick, reason)| Error::UserLeft { nick, reason })
+                })
+                .unwrap_or(Error::InvalidInput("Huddle has no members")))
         }
     }
 
-    pub(crate) fn split_for_ask(&mut self) -> (HuddleSender<'_>, &mut Inbox) {
-        let sender = HuddleSender {
-            core: &self.core,
-            leases: &self.leases,
-            initial_offline: &self.initial_offline,
-            relay_prefix: &self.relay_prefix,
-            relay_commands: self.relay_commands,
-        };
-        (sender, &mut self.inbox)
+    pub fn name(&self) -> &Text {
+        &self.name
     }
 
     pub fn users(&self) -> Vec<User> {
@@ -229,98 +159,45 @@ impl Huddle {
         self
     }
 
-    pub fn with_relay(mut self, prefix: impl Into<Text>) -> Self {
-        self.relay_prefix = Some(prefix.into());
-        self
-    }
-
-    /// Changes relaying on a live `Huddle` (e.g. pausing banter during a vote); `None` stops it.
-    pub fn set_relay(&mut self, prefix: Option<Text>) {
-        self.relay_prefix = prefix;
-    }
-
-    /// Controls whether lines starting with `BotConfig::command_prefixes` (default `"!"`)
-    /// are relayed to fellow huddle members (default: `false`, so `!help` / `!status` or
-    /// mistyped commands aren't echoed to teammates even when `.ignore_commands()` is off).
-    pub fn with_relay_commands(mut self, enabled: bool) -> Self {
-        self.relay_commands = enabled;
-        self
-    }
-
-    pub fn set_relay_commands(&mut self, enabled: bool) {
-        self.relay_commands = enabled;
-    }
-
     /// Broadcasts to all currently-online huddle users (skipping any user who disconnected mid-huddle).
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        self.sender_view()
-            .broadcast_kind(OutboundChatKind::Privmsg, text.into())
+        self.broadcast_kind(OutboundChatKind::Privmsg, text.into())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        self.sender_view()
-            .broadcast_kind(OutboundChatKind::Notice, text.into())
+        self.broadcast_kind(OutboundChatKind::Notice, text.into())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        self.sender_view()
-            .broadcast_kind(OutboundChatKind::Action, text.into())
+        self.broadcast_kind(OutboundChatKind::Action, text.into())
     }
 
-    /// Relays `msg` to all other online huddle users (`<prefix><<msg.nick>> <msg.to_styled()>`),
-    /// skipping command-prefixed messages unless [`Huddle::with_relay_commands`] is enabled.
-    pub fn relay_to_others(&self, msg: &ChatMessage) -> Result<()> {
-        self.sender_view().relay_to_others(msg)
-    }
-
+    #[track_caller]
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let base_cfg = self.ask_config.clone();
-        Ask::new(
-            AskSource::BorrowedHuddle { huddle: self },
-            base_cfg,
-            prompt.into(),
-            matcher,
-        )
+        let cfg = self.ask_config.clone();
+        Ask::from_group_with_config(self, cfg, prompt.into(), matcher)
     }
 
-    /// Prompts a single `Huddle` member in DM without leaking the prompt to teammates.
-    ///
-    /// Replies are read from the huddle's own [`Inbox`] (so they are never seen twice) and are
-    /// not relayed. Other members' messages arriving meanwhile are relayed if
-    /// [`Huddle::with_relay`] is set, and otherwise discarded, as with [`Huddle::ask`].
-    pub fn ask_user<'a, F, R>(
+    /// Broadcasts `prompt` to all online huddle members and collects up to one answer per member
+    /// (or restricted subset via [`AskMany::from_users`]) while relaying member chat.
+    #[track_caller]
+    pub fn ask_many<'a, F, R>(
         &'a mut self,
-        user: &User,
         prompt: impl Into<Text>,
         matcher: F,
-    ) -> Ask<'a, F, R>
+    ) -> AskMany<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let base_cfg = self.ask_config.clone();
-        let source = if !user.belongs_to(&self.core) {
-            AskSource::ImmediateErr(Error::InvalidInput(
-                "User handle belongs to a different Bot session",
-            ))
-        } else if let Some(lease) = self.leases.iter().find(|l| l.user() == user) {
-            AskSource::HuddleMember {
-                user: lease.user().clone(),
-                huddle: self,
-            }
-        } else {
-            let err = user
-                .quit_error()
-                .unwrap_or(Error::InvalidInput("User is not a member of this Huddle"));
-            AskSource::ImmediateErr(err)
-        };
-        Ask::new(source, base_cfg, prompt.into(), matcher)
+        let cfg = self.ask_config.clone();
+        AskMany::from_group_with_config(self, cfg, prompt.into(), matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {
@@ -328,7 +205,38 @@ impl Huddle {
     }
 }
 
+impl Chat for Huddle {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        Huddle::say(self, text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        Huddle::notice(self, text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        Huddle::action(self, text)
+    }
+
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Borrowed(&mut self.inbox)
+    }
+
+    fn target(&self) -> Target {
+        Target::Dm
+    }
+
+    fn participants(&self) -> Option<Vec<User>> {
+        Some(self.users())
+    }
+}
+
+impl GroupChat for Huddle {
+    fn has_user(&self, user: &User) -> bool {
+        Huddle::has_user(self, user)
+    }
+}
+
 #[cfg(test)]
 #[path = "huddle_test.rs"]
 mod test;
-

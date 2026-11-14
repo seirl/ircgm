@@ -22,12 +22,11 @@
 //!   `warn_remaining` countdown warnings.
 //! - **PM-block bounce isolation (`+g` `716` / `+R` `486`):** Default [`ircgm::Ask`] maps server DM
 //!   rejection numerics directly to [`Answer::Unreachable`].
-//! - **Identity-safe channel ballot collection:** [`Inbox::wait_map`] + [`UserId`] keys block
-//!   self-votes and double-votes even across mid-round `/nick` changes.
+//! - **Identity-safe channel ballot collection:** [`Room::ask_many`] with `.allow_change(true)`
+//!   collects revocable per-user ballots while blocking self-votes across mid-round `/nick` changes.
 //! - **Drop-out tolerant [`Bot::huddle_available`] + [`Huddle::ask`] tiebreaker:** Locks online
 //!   finalists in canonical order and adjudicates packet-burst ties strictly by wire arrival (`seq`).
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -138,7 +137,7 @@ pub async fn tiebreaker_buzz_in(
     room: &Room,
     finalists: &[User],
 ) -> Result<Option<User>> {
-    let mut huddle = bot.huddle_available(finalists).await?;
+    let mut huddle = bot.huddle_available("Tiebreaker", finalists).await?;
     if huddle.is_empty() {
         return Ok(None);
     }
@@ -190,16 +189,17 @@ pub async fn vote_on_quips(
         return Ok(Some(winner));
     }
 
-    room.say("🗳️ Vote for the funniest answer with `!pick <number>` (20s):".bold())?;
+    let mut prompt =
+        Text::from("🗳️ Vote for the funniest answer with `!pick <number>` (20s):".bold());
     for (idx, (_author, quip)) in submissions.iter().enumerate() {
-        room.say(format_args!("  #{}: \"{quip}\"", idx + 1))?;
+        prompt += format!("\n  #{}: \"{quip}\"", idx + 1);
     }
 
-    let mut inbox = room.inbox();
-    let mut ballots: HashMap<UserId, usize> = HashMap::new();
-    let collect = async {
-        loop {
-            let msg = inbox.wait_cmd("!pick").await?;
+    let ballots = room
+        .ask_many(prompt, |msg| {
+            if !msg.is_cmd("!pick") {
+                return AskMatch::ignore();
+            }
             match msg
                 .cmd_arg("!pick")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -208,27 +208,33 @@ pub async fn vote_on_quips(
                 Some(choice) => {
                     let idx = choice - 1;
                     if submissions[idx].0 != msg.sender {
-                        ballots.insert(msg.sender.id(), idx);
-                        msg.sender
-                            .notice(format_args!("✔ Vote recorded for quip #{choice}!").green())?;
+                        let _ = msg
+                            .sender
+                            .notice(format_args!("✔ Vote recorded for quip #{choice}!").green());
+                        AskMatch::accept(idx)
                     } else {
-                        msg.sender
-                            .notice("You can't vote for your own quip!".yellow())?;
+                        let _ = msg
+                            .sender
+                            .notice("You can't vote for your own quip!".yellow());
+                        AskMatch::ignore()
                     }
                 }
                 None => {
-                    msg.sender.notice(
+                    let _ = msg.sender.notice(
                         format_args!("Pick a quip number from 1 to {}!", submissions.len())
                             .yellow(),
-                    )?;
+                    );
+                    AskMatch::ignore()
                 }
             }
-        }
-    };
-    collect.run_for(Duration::from_secs(20)).await?;
+        })
+        .allow_change(true)
+        .reply_timeout(Duration::from_secs(20))
+        .no_timeout_message()
+        .await?;
 
     let mut counts = vec![0usize; submissions.len()];
-    for &idx in ballots.values() {
+    for (_voter, idx) in ballots {
         counts[idx] += 1;
     }
     let top_votes = counts.iter().copied().max().unwrap_or(0);

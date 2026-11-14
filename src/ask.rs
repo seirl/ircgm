@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::panic::Location;
@@ -12,13 +13,13 @@ use tokio::time::Instant;
 use tracing::Instrument as _;
 
 use crate::bot::BotCore;
+use crate::casemap::CaseMap;
+use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
-use crate::exclusive_dm::ExclusiveDm;
-use crate::huddle::{Huddle, HuddleSender};
 use crate::inbox::Inbox;
 use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
-use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::room::Room;
+use crate::outbound::OutboundChatKind;
+use crate::state::BotPresence;
 use crate::user::{User, UserId};
 
 mod private {
@@ -34,8 +35,8 @@ enum AskMatchInner<T> {
     Ignore,
 }
 
-/// Outcome returned by [`Ask`] matchers that want to send an inline confirmation or
-/// validation feedback without restarting the reply timer or leaving the `Ask` loop.
+/// Outcome returned by [`Ask`] / [`AskMany`] matchers that want to send an inline confirmation or
+/// validation feedback without restarting the reply timer or leaving the prompt loop.
 ///
 /// Construct with [`AskMatch::accept`], [`AskMatch::accept_say`], [`AskMatch::reject`], or
 /// [`AskMatch::ignore`].
@@ -43,21 +44,19 @@ enum AskMatchInner<T> {
 pub struct AskMatch<T>(AskMatchInner<T>);
 
 impl<T> AskMatch<T> {
-    /// Accepts `val` silently and resolves the [`Ask`] with [`Answer::Ok`].
+    /// Accepts `val` silently and records the answer.
     pub fn accept(val: T) -> Self {
         Self(AskMatchInner::Accept(val, None))
     }
 
-    /// Accepts `val`, immediately enqueues `msg` to the prompt's target (in-channel for
-    /// [`Room`], in-DM while [`ExclusiveDm`] is still held for [`User`]/[`ExclusiveDm`], or
-    /// broadcast to all members for [`Huddle`]), and resolves the [`Ask`] with [`Answer::Ok`].
-    /// `msg` is sent as a `NOTICE` when the accepted reply was one.
+    /// Accepts `val` and immediately enqueues `msg` to the prompt's target (sent as a `NOTICE`
+    /// when the accepted reply was one).
     pub fn accept_say(val: T, msg: impl Into<Text>) -> Self {
         Self(AskMatchInner::Accept(val, Some(msg.into())))
     }
 
-    /// Sends validation feedback `msg` to the responder (as a `NOTICE` if the reply was one) and
-    /// keeps waiting without resetting the reply timer.
+    /// Sends validation feedback `msg` to the prompt's target (as a `NOTICE` if the reply was one)
+    /// and keeps waiting without resetting the reply timer.
     pub fn reject(msg: impl Into<Text>) -> Self {
         Self(AskMatchInner::Reject(msg.into()))
     }
@@ -176,11 +175,9 @@ impl<T> Answer<T> {
         match self {
             Answer::Ok(val) => val,
             Answer::TimedOut => panic!("called `Answer::unwrap()` on `Answer::TimedOut`"),
-            Answer::Left { nick, reason } => {
-                panic!(
-                    "called `Answer::unwrap()` on `Answer::Left {{ nick: {nick:?}, reason: {reason:?} }}`"
-                )
-            }
+            Answer::Left { nick, reason } => panic!(
+                "called `Answer::unwrap()` on `Answer::Left {{ nick: {nick:?}, reason: {reason:?} }}`"
+            ),
             Answer::Unreachable {
                 nick,
                 code,
@@ -209,19 +206,13 @@ impl<T> Answer<T> {
 }
 
 /// Context passed to [`AskConfig::timeout_message_fn`] and [`Ask::timeout_message_fn`]
-/// when an [`Ask`]'s own reply timer expires.
+/// when a prompt's reply timer expires.
 pub struct TimeoutCtx<'a> {
-    /// Where the prompt was sent (and where any timeout message will be sent):
-    /// `Target::Channel("#blackjack")` or `Target::Dm`.
+    /// Where the prompt was sent: `Target::Channel("#blackjack")` or `Target::Dm`.
     pub target: &'a Target,
-    /// The specific player being waited on (`Some(user)` on `room.ask_user`, `user.ask`, `dm.ask`;
-    /// `None` on open-floor `room.ask` and group `huddle.ask`).
+    /// The single remaining player being waited on (`Some(user)` when waiting on one responder;
+    /// `None` when waiting on an open room or multiple unanswered responders).
     pub user: Option<&'a User>,
-    /// `Some(dur)` when configured with a relative timeout (`reply_timeout`),
-    /// or `None` when configured with an absolute `Instant` (`reply_deadline`).
-    pub configured_timeout: Option<Duration>,
-    /// Actual wall-clock time spent waiting on the reply after `OutboundSink`'s write receipt resolved.
-    pub elapsed: Duration,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -265,7 +256,7 @@ impl fmt::Debug for TimeoutHandler {
     }
 }
 
-/// Reusable [`Ask`] configuration sharing an exact 1-to-1 builder vocabulary with [`Ask`].
+/// Reusable prompt configuration sharing a 1-to-1 builder vocabulary with [`Ask`] and [`AskMany`].
 #[derive(Clone, Debug)]
 pub struct AskConfig {
     pub(crate) time_limit: TimeLimit,
@@ -327,14 +318,13 @@ impl AskConfig {
         self
     }
 
-    /// Undoes [`AskConfig::ignore_commands`]: command-prefixed lines are matched again (the
-    /// default).
+    /// Undoes [`AskConfig::ignore_commands`]: command-prefixed lines are matched again.
     pub fn allow_commands(mut self) -> Self {
         self.ignore_commands = false;
         self
     }
 
-    /// Undoes [`AskConfig::accept_notices`]: human `NOTICE`s are skipped again (the default).
+    /// Undoes [`AskConfig::accept_notices`]: human `NOTICE`s are skipped again.
     pub fn ignore_notices(mut self) -> Self {
         self.accept_notices = false;
         self
@@ -370,217 +360,162 @@ impl AskConfig {
     }
 }
 
-pub(crate) enum AskSource<'a> {
-    RoomOpen {
-        room: &'a Room,
-        caller: &'static Location<'static>,
-    },
-    RoomUser {
-        room: &'a Room,
-        user: &'a User,
-        caller: &'static Location<'static>,
-    },
-    RoomUsers {
-        room: &'a Room,
-        users: Vec<User>,
+/// Sends `prompt` to any [`Chat`] (such as `&room`, `&breakout`, `&mut huddle`, `&mut dm`, or
+/// `&mut generic_chat`) and returns a lazy [`Ask`] future awaiting one reply.
+#[track_caller]
+pub fn ask<'a, C, F, R>(chat: C, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
+where
+    C: Chat + 'a,
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    Ask::from_chat_with_config(chat, AskConfig::default(), prompt.into(), matcher)
+}
+
+/// Sends `prompt` to any [`GroupChat`] (such as `&room`, `&breakout`, `&mut huddle`, or
+/// `&mut generic_group`) and returns a lazy [`AskMany`] future collecting `0..=N` replies.
+#[track_caller]
+pub fn ask_many<'a, G, F, R>(group: G, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
+where
+    G: GroupChat + 'a,
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    AskMany::from_group_with_config(group, AskConfig::default(), prompt.into(), matcher)
+}
+
+trait ChatDyn: Send + Sync {
+    fn say_text(&self, text: Text) -> Result<()>;
+    fn notice_text(&self, text: Text) -> Result<()>;
+    fn target(&self) -> Target;
+    fn participants(&self) -> Option<Vec<User>>;
+    fn inbox(&mut self) -> InboxRef<'_>;
+}
+
+impl<C: Chat + ?Sized> ChatDyn for C {
+    fn say_text(&self, text: Text) -> Result<()> {
+        self.say(text)
+    }
+    fn notice_text(&self, text: Text) -> Result<()> {
+        self.notice(text)
+    }
+    fn target(&self) -> Target {
+        Chat::target(self)
+    }
+    fn participants(&self) -> Option<Vec<User>> {
+        Chat::participants(self)
+    }
+    fn inbox(&mut self) -> InboxRef<'_> {
+        Chat::inbox(self)
+    }
+}
+
+trait PromptEndpoint: Send + Sync {
+    fn chat(&self) -> &dyn ChatDyn;
+    fn chat_mut(&mut self) -> &mut dyn ChatDyn;
+    fn is_group(&self) -> bool {
+        false
+    }
+    fn group_has_user(&self, _user: &User) -> Option<bool> {
+        None
+    }
+    fn inbox_for(&mut self, _users: Option<&[User]>) -> InboxRef<'_> {
+        self.chat_mut().inbox()
+    }
+}
+
+struct ChatEndpoint<C>(C);
+
+impl<C: Chat> PromptEndpoint for ChatEndpoint<C> {
+    fn chat(&self) -> &dyn ChatDyn {
+        &self.0
+    }
+    fn chat_mut(&mut self) -> &mut dyn ChatDyn {
+        &mut self.0
+    }
+}
+
+struct GroupEndpoint<G>(G);
+
+impl<G: GroupChat> PromptEndpoint for GroupEndpoint<G> {
+    fn chat(&self) -> &dyn ChatDyn {
+        &self.0
+    }
+    fn chat_mut(&mut self) -> &mut dyn ChatDyn {
+        &mut self.0
+    }
+    fn is_group(&self) -> bool {
+        true
+    }
+    fn group_has_user(&self, user: &User) -> Option<bool> {
+        Some(self.0.has_user(user))
+    }
+    fn inbox_for(&mut self, users: Option<&[User]>) -> InboxRef<'_> {
+        match users {
+            Some(us) => self.0.inbox_users(us),
+            None => self.0.inbox(),
+        }
+    }
+}
+
+enum LazyState<'a, U, Out> {
+    Unstarted(Box<U>),
+    Running(Pin<Box<dyn Future<Output = Out> + Send + 'a>>),
+    Done,
+}
+
+impl<'a, U, Out> LazyState<'a, U, Out> {
+    fn new(unstarted: U) -> Self {
+        Self::Unstarted(Box::new(unstarted))
+    }
+
+    fn map_unstarted(&mut self, f: impl FnOnce(&mut U)) {
+        match self {
+            Self::Unstarted(u) => f(u),
+            Self::Running(_) | Self::Done => {
+                unreachable!("prompt builder methods consume self before polling")
+            }
+        }
+    }
+
+    fn poll_with<Fut>(&mut self, cx: &mut Context<'_>, start: impl FnOnce(U) -> Fut) -> Poll<Out>
+    where
+        Fut: Future<Output = Out> + Send + 'a,
+    {
+        if matches!(self, Self::Unstarted(_)) {
+            let Self::Unstarted(u) = std::mem::replace(self, Self::Done) else {
+                unreachable!()
+            };
+            *self = Self::Running(Box::pin(start(*u)));
+        }
+        match self {
+            Self::Running(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(res) => {
+                    *self = Self::Done;
+                    Poll::Ready(res)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            Self::Done => panic!("prompt future polled after completion"),
+            Self::Unstarted(_) => unreachable!(),
+        }
+    }
+}
+
+enum AskSource<'a> {
+    Endpoint {
+        endpoint: Box<dyn PromptEndpoint + 'a>,
+        restricted_users: Option<Vec<User>>,
         caller: &'static Location<'static>,
     },
     UserDm {
         user: &'a User,
         caller: &'static Location<'static>,
     },
-    BorrowedDm {
-        dm: &'a mut ExclusiveDm,
-    },
-    BorrowedHuddle {
-        huddle: &'a mut Huddle,
-    },
-    HuddleMember {
-        huddle: &'a mut Huddle,
-        user: User,
-    },
-    ImmediateErr(Error),
+    Invalid(&'static str),
 }
-
-/// Delivery bookkeeping of one running [`Ask`], owned by its wire-event hook (see
-/// [`EndpointSender::check_event`]): which DM recipients bounced, and how many times each one's
-/// prompt was re-sent after a `401` rename race.
-#[derive(Default)]
-struct DeliveryState {
-    bounced: HashSet<UserId>,
-    rename_retries: HashMap<UserId, u8>,
-}
-
-enum EndpointSender<'a> {
-    RoomOpen {
-        room: &'a Room,
-    },
-    RoomUser {
-        room: &'a Room,
-        user: &'a User,
-    },
-    Dm {
-        core: &'a Arc<BotCore>,
-        user: &'a User,
-        prompt: Text,
-    },
-    Huddle {
-        sender: HuddleSender<'a>,
-        prompt: Text,
-    },
-}
-
-impl<'a> EndpointSender<'a> {
-    fn timeout_target_and_user(&self) -> (Target, Option<&'a User>) {
-        match self {
-            EndpointSender::RoomOpen { room } => (Target::Channel(room.name().to_owned()), None),
-            EndpointSender::RoomUser { room, user } => {
-                (Target::Channel(room.name().to_owned()), Some(user))
-            }
-            EndpointSender::Dm { user, .. } => (Target::Dm, Some(user)),
-            EndpointSender::Huddle { .. } => (Target::Dm, None),
-        }
-    }
-
-    /// Sends `text` where the prompt went: the channel, the DM'd user, or every huddle member.
-    fn send_to_target(&self, kind: OutboundChatKind, text: Text) {
-        match self {
-            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
-                let _ = room.send_chat(kind, text);
-            }
-            EndpointSender::Dm { user, .. } => {
-                let _ = user.send_chat(kind, text);
-            }
-            EndpointSender::Huddle { sender, .. } => {
-                let _ = sender.broadcast_kind(kind, text);
-            }
-        }
-    }
-
-    fn send_reject(&self, sender_user: &User, kind: OutboundChatKind, feedback: Text) {
-        match self {
-            EndpointSender::RoomOpen { .. }
-            | EndpointSender::RoomUser { .. }
-            | EndpointSender::Dm { .. } => self.send_to_target(kind, feedback),
-            EndpointSender::Huddle { .. } => {
-                let _ = sender_user.send_chat(kind, feedback);
-            }
-        }
-    }
-
-    fn handle_ignore(&self, msg: &ChatMessage) {
-        if let EndpointSender::Huddle { sender, .. } = self {
-            if sender.has_relay() {
-                let _ = sender.relay_to_others(msg);
-            }
-        }
-    }
-
-    /// Judges a non-reply wire event: returns the error that ends the prompt once its
-    /// responders are out of reach, or `None` to keep waiting.
-    ///
-    /// Reachability is tracked across both kinds of event that can take a responder away: DM
-    /// bounces (`401`, `716`, `486`, ...) and `QUIT`s.
-    fn check_event(&self, wire: &WireEvent, state: &mut DeliveryState) -> Option<Error> {
-        match &wire.kind {
-            WireKind::Event(Event::DeliveryFailed {
-                target,
-                code,
-                message,
-                ..
-            }) => self.check_send_error(wire, target, *code, message, state),
-            WireKind::Event(Event::Quit {
-                user: quitter,
-                nick,
-                reason,
-                ..
-            }) => {
-                let gone = || Error::UserLeft {
-                    nick: nick.clone(),
-                    reason: reason.clone(),
-                };
-                match self {
-                    // `UsersInRoom` inboxes end on their own once every awaited user is gone:
-                    EndpointSender::RoomOpen { .. } | EndpointSender::RoomUser { .. } => None,
-                    EndpointSender::Dm { user, .. } => (quitter == *user).then(gone),
-                    EndpointSender::Huddle { sender, .. } => {
-                        // A member quitting can leave only bounced members behind, which the
-                        // huddle inbox (alive while any member is online) never notices:
-                        sender.find_matching_user(Some(quitter.track_id()))?;
-                        (!sender.any_reachable_at(&state.bounced, wire.seq)).then(gone)
-                    }
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn check_send_error(
-        &self,
-        wire: &WireEvent,
-        target: &str,
-        code: u16,
-        message: &str,
-        state: &mut DeliveryState,
-    ) -> Option<Error> {
-        let target_user_id = wire.bounce_user_id();
-        let unreachable = || Error::UserUnreachable {
-            nick: target.to_owned(),
-            code,
-            message: message.to_owned(),
-        };
-        match self {
-            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => room
-                .casemap()
-                .str_eq(target, room.name())
-                .then(|| Error::ChannelSendFailed {
-                    channel: target.to_owned(),
-                    code,
-                    message: message.to_owned(),
-                }),
-            EndpointSender::Dm { core, user, prompt } => {
-                if target_user_id != Some(user.track_id()) {
-                    return None;
-                }
-                if code == 401 && Self::resend_to_renamed(core, user, target, prompt, state) {
-                    return None;
-                }
-                Some(unreachable())
-            }
-            EndpointSender::Huddle { sender, prompt } => {
-                let member = sender.find_matching_user(target_user_id)?;
-                if code == 401
-                    && Self::resend_to_renamed(sender.core(), member, target, prompt, state)
-                {
-                    return None;
-                }
-                state.bounced.insert(member.id());
-                (!sender.any_reachable_at(&state.bounced, wire.seq)).then(unreachable)
-            }
-        }
-    }
-
-    /// On a `401` for `user`'s former nick, re-sends `prompt` to their current nick (bounded per
-    /// user), returning `true` if it did.
-    fn resend_to_renamed(
-        core: &Arc<BotCore>,
-        user: &User,
-        bounced_nick: &str,
-        prompt: &Text,
-        state: &mut DeliveryState,
-    ) -> bool {
-        let retries = state.rename_retries.entry(user.id()).or_insert(0);
-        match user.track().next_rename_retry_nick(bounced_nick, retries) {
-            Some(new_nick) => {
-                let _ = core.send_chat(OutboundChatKind::Privmsg, &new_nick, prompt.clone());
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-type BoxAskFuture<'a, O> = Pin<Box<dyn Future<Output = Result<O>> + Send + 'a>>;
 
 struct AskUnstarted<'a, F> {
     cfg: AskConfig,
@@ -589,14 +524,9 @@ struct AskUnstarted<'a, F> {
     matcher: F,
 }
 
-enum AskState<'a, F, O> {
-    Unstarted(Box<AskUnstarted<'a, F>>),
-    Running(BoxAskFuture<'a, O>),
-    Done,
-}
-
-/// Lazy prompt-and-reply future returned by [`Room::ask`], [`Room::ask_user`], [`Room::ask_users`],
-/// [`User::ask`], [`ExclusiveDm::ask`], and [`Huddle::ask`].
+/// Lazy single-answer prompt future returned by [`ask`], [`crate::Room::ask`],
+/// [`crate::Room::ask_user`], [`User::ask`], [`crate::ExclusiveDm::ask`], and
+/// [`crate::Huddle::ask`].
 ///
 /// Awaiting an `Ask` resolves to `Result<Answer<T>>` so timeouts, player departures, and DM
 /// bounces are handled explicitly while broken sessions/channels propagate via `?`. Chain
@@ -604,92 +534,147 @@ enum AskState<'a, F, O> {
 /// promote non-answers into `Err(Error::...)`.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Ask<'a, F, R: IntoAskMatch> {
-    state: AskState<'a, F, R::Output>,
+    state: LazyState<'a, AskUnstarted<'a, F>, Result<Answer<R::Output>>>,
 }
 
 impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
-    pub(crate) fn new(
-        source: AskSource<'a>,
-        base_cfg: AskConfig,
+    #[track_caller]
+    pub(crate) fn from_chat_with_config<C: Chat + 'a>(
+        chat: C,
+        cfg: AskConfig,
         prompt: Text,
         matcher: F,
     ) -> Self {
+        Self::new(
+            AskSource::Endpoint {
+                endpoint: Box::new(ChatEndpoint(chat)),
+                restricted_users: None,
+                caller: Location::caller(),
+            },
+            cfg,
+            prompt,
+            matcher,
+        )
+    }
+
+    #[track_caller]
+    pub(crate) fn from_group_with_config<G: GroupChat + 'a>(
+        group: G,
+        cfg: AskConfig,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
+        Self::new(
+            AskSource::Endpoint {
+                endpoint: Box::new(GroupEndpoint(group)),
+                restricted_users: None,
+                caller: Location::caller(),
+            },
+            cfg,
+            prompt,
+            matcher,
+        )
+    }
+
+    pub(crate) fn from_user_dm(
+        user: &'a User,
+        caller: &'static Location<'static>,
+        cfg: AskConfig,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
+        Self::new(AskSource::UserDm { user, caller }, cfg, prompt, matcher)
+    }
+
+    fn new(source: AskSource<'a>, cfg: AskConfig, prompt: Text, matcher: F) -> Self {
         Self {
-            state: AskState::Unstarted(Box::new(AskUnstarted {
-                cfg: base_cfg,
+            state: LazyState::new(AskUnstarted {
+                cfg,
                 source,
                 prompt,
                 matcher,
-            })),
+            }),
         }
     }
 
     fn map_cfg(mut self, f: impl FnOnce(AskConfig) -> AskConfig) -> Self {
-        match &mut self.state {
-            AskState::Unstarted(unstarted) => {
-                let taken = std::mem::take(&mut unstarted.cfg);
-                unstarted.cfg = f(taken);
-                self
-            }
-            AskState::Running(_) | AskState::Done => {
-                unreachable!("Ask builder methods consume self before polling")
-            }
-        }
+        self.state.map_unstarted(|u| {
+            let taken = std::mem::take(&mut u.cfg);
+            u.cfg = f(taken);
+        });
+        self
     }
 
-    /// Applies a reusable [`AskConfig`] value to this prompt.
+    /// Restricts a group prompt so only `user` may answer (and sets [`TimeoutCtx::user`] to
+    /// `Some(user)`).
+    pub fn from_user(self, user: &User) -> Self {
+        self.from_users(std::iter::once(user))
+    }
+
+    /// Restricts a group prompt so only users in `users` may answer (first valid reply wins;
+    /// non-listed users are ignored).
+    pub fn from_users<I, U>(mut self, users: I) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
+        self.state.map_unstarted(|u| match &mut u.source {
+            AskSource::Endpoint {
+                endpoint,
+                restricted_users,
+                ..
+            } if endpoint.is_group() => {
+                *restricted_users = Some(collected);
+            }
+            AskSource::Endpoint { .. } | AskSource::UserDm { .. } => {
+                u.source = AskSource::Invalid("from_user / from_users requires a group prompt");
+            }
+            AskSource::Invalid(_) => {}
+        });
+        self
+    }
+
     pub fn config(self, cfg: &AskConfig) -> Self {
         self.map_cfg(|_| cfg.clone())
     }
 
-    /// Overrides the post-write reply deadline for this prompt.
     pub fn reply_timeout(self, duration: Duration) -> Self {
         self.map_cfg(|c| c.reply_timeout(duration))
     }
 
-    /// Overrides the post-write deadline for this prompt using an absolute [`Instant`].
     pub fn reply_deadline(self, instant: Instant) -> Self {
         self.map_cfg(|c| c.reply_deadline(instant))
     }
 
-    /// Disables the reply deadline for this prompt.
     pub fn no_reply_timeout(self) -> Self {
         self.map_cfg(AskConfig::no_reply_timeout)
     }
 
-    /// Schedules a countdown warning `msg` when `remaining` time is left on this `Ask`'s
-    /// post-write reply clock.
     pub fn warn_remaining(self, remaining: Duration, msg: impl Into<Text>) -> Self {
         self.map_cfg(|c| c.warn_remaining(remaining, msg))
     }
 
-    /// Clears any countdown warnings inherited from the handle's or `config`'s [`AskConfig`].
     pub fn clear_warnings(self) -> Self {
         self.map_cfg(AskConfig::clear_warnings)
     }
 
-    /// Opt-in command skipping for this prompt (`BotConfig::command_prefixes`, default `["!"]`).
     pub fn ignore_commands(self) -> Self {
         self.map_cfg(AskConfig::ignore_commands)
     }
 
-    /// Opt-in human `NOTICE` acceptance for this prompt (`MessageKind::Notice`).
     pub fn accept_notices(self) -> Self {
         self.map_cfg(AskConfig::accept_notices)
     }
 
-    /// Matches command-prefixed lines on this prompt even if the handle's [`AskConfig`] ignores
-    /// them.
     pub fn allow_commands(self) -> Self {
         self.map_cfg(AskConfig::allow_commands)
     }
 
-    /// Skips human `NOTICE`s on this prompt even if the handle's [`AskConfig`] accepts them.
     pub fn ignore_notices(self) -> Self {
         self.map_cfg(AskConfig::ignore_notices)
     }
 
-    /// Overrides the message sent to the target if *this `Ask`'s own reply timer* expires.
     pub fn timeout_message(self, msg: impl Into<Text>) -> Self {
         self.map_cfg(|c| c.timeout_message(msg))
     }
@@ -702,313 +687,9 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
         self.map_cfg(|c| c.timeout_message_fn(f))
     }
 
-    /// Suppresses any inherited timeout message on this prompt.
     pub fn no_timeout_message(self) -> Self {
         self.map_cfg(AskConfig::no_timeout_message)
     }
-}
-
-fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
-    let timeout_ms = match cfg.time_limit {
-        TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-        TimeLimit::Deadline(_) | TimeLimit::None => None,
-    };
-    match source {
-        AskSource::RoomOpen { room, .. } | AskSource::RoomUsers { room, .. } => {
-            tracing::debug_span!(
-                "ircgm::ask",
-                target = room.name(),
-                user = Option::<&str>::None,
-                timeout_ms = timeout_ms
-            )
-        }
-        AskSource::RoomUser { room, user, .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = room.name(),
-            user = %user.nick(),
-            timeout_ms = timeout_ms
-        ),
-        AskSource::UserDm { user, .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = "DM",
-            user = %user.nick(),
-            timeout_ms = timeout_ms
-        ),
-        AskSource::BorrowedDm { dm } => tracing::debug_span!(
-            "ircgm::ask",
-            target = "DM",
-            user = %dm.user().nick(),
-            timeout_ms = timeout_ms
-        ),
-        AskSource::BorrowedHuddle { .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = "Huddle",
-            user = Option::<&str>::None,
-            timeout_ms = timeout_ms
-        ),
-        AskSource::HuddleMember { user, .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = "Huddle",
-            user = %user.nick(),
-            timeout_ms = timeout_ms
-        ),
-        AskSource::ImmediateErr(_) => tracing::debug_span!("ircgm::ask", timeout_ms = timeout_ms),
-    }
-}
-
-fn compute_schedule(
-    cfg: &AskConfig,
-    write_completed_at: Instant,
-) -> (Option<Duration>, Option<Instant>, Vec<(Instant, Text)>) {
-    let Some(deadline) = cfg.time_limit.deadline_from(write_completed_at) else {
-        return (None, None, Vec::new());
-    };
-    let configured_timeout = match cfg.time_limit {
-        TimeLimit::Duration(dur) => Some(dur),
-        TimeLimit::None | TimeLimit::Deadline(_) => None,
-    };
-    let budget = deadline.saturating_duration_since(write_completed_at);
-    let mut warns: Vec<_> = cfg
-        .warnings
-        .iter()
-        .filter(|(rem, _)| !rem.is_zero() && budget > *rem)
-        .map(|(rem, msg)| (deadline - *rem, msg.clone()))
-        .collect();
-    warns.sort_by_key(|(at, _)| *at);
-    (configured_timeout, Some(deadline), warns)
-}
-
-async fn await_ask_loop<'a, F, R>(
-    cfg: &AskConfig,
-    matcher: &mut F,
-    sender: EndpointSender<'a>,
-    inbox: &mut Inbox,
-    receipt: WriteReceipt,
-) -> Result<R::Output>
-where
-    F: FnMut(&ChatMessage) -> R + Send,
-    R: IntoAskMatch,
-{
-    receipt.wait().await;
-    let write_completed_at = Instant::now();
-    tracing::debug!("ask prompt written; waiting for reply");
-
-    let (configured_timeout, deadline, warnings) = compute_schedule(cfg, write_completed_at);
-
-    let mut delivery = DeliveryState::default();
-    let reply_fut = inbox.wait_reply_map(
-        cfg.ignore_commands,
-        cfg.accept_notices,
-        |wire| {
-            let err = sender.check_event(wire, &mut delivery);
-            if let Some(ref e) = err {
-                tracing::debug!(error = %e, "ask responders out of reach");
-            }
-            err
-        },
-        |msg| match matcher(msg).into_ask_match().0 {
-            // Answers to a reply mirror its kind: a `NOTICE` must never trigger an automatic
-            // `PRIVMSG` (RFC 2812 §3.3.2).
-            AskMatchInner::Accept(val, ack) => {
-                tracing::debug!(
-                    sender = %msg.nick,
-                    has_ack = ack.is_some(),
-                    "ask reply accepted"
-                );
-                if let Some(ack_msg) = ack {
-                    sender.send_to_target(msg.reply_kind(), ack_msg);
-                }
-                Some(val)
-            }
-            AskMatchInner::Reject(feedback) => {
-                sender.send_reject(&msg.sender, msg.reply_kind(), feedback);
-                None
-            }
-            AskMatchInner::Ignore => {
-                sender.handle_ignore(msg);
-                None
-            }
-        },
-    );
-
-    let timer_fut = async {
-        match deadline {
-            None => std::future::pending::<()>().await,
-            Some(dl) => {
-                let send_warnings = async {
-                    for (warn_at, warn_msg) in warnings {
-                        tokio::time::sleep_until(warn_at).await;
-                        if Instant::now() < dl {
-                            sender.send_to_target(OutboundChatKind::Privmsg, warn_msg);
-                        }
-                    }
-                    std::future::pending::<()>().await
-                };
-                tokio::select! {
-                    biased;
-                    () = tokio::time::sleep_until(dl) => {}
-                    () = send_warnings => {}
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        biased;
-        res = reply_fut => {
-            if let Err(ref e) = res {
-                tracing::debug!(error = %e, "ask interrupted");
-            }
-            res
-        }
-        () = timer_fut => {
-            if let Some(handler) = &cfg.timeout_handler {
-                let (target, user_ref) = sender.timeout_target_and_user();
-                let ctx = TimeoutCtx {
-                    target: &target,
-                    user: user_ref,
-                    configured_timeout,
-                    elapsed: write_completed_at.elapsed(),
-                };
-                sender.send_to_target(OutboundChatKind::Privmsg, handler.render(&ctx));
-            }
-            tracing::debug!("ask reply timer expired");
-            Err(Error::TimedOut)
-        }
-    }
-}
-
-async fn run_ask<'a, F, R>(
-    cfg: AskConfig,
-    source: AskSource<'a>,
-    prompt: Text,
-    mut matcher: F,
-) -> Result<R::Output>
-where
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    if prompt.is_empty() {
-        return Err(Error::InvalidInput("Ask prompt cannot be empty"));
-    }
-    match source {
-        AskSource::ImmediateErr(err) => Err(err),
-        AskSource::RoomOpen { room, caller } => {
-            let inbox = room.inbox_at(caller);
-            let sender = EndpointSender::RoomOpen { room };
-            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
-        }
-        AskSource::RoomUser { room, user, caller } => {
-            if !user.belongs_to(room.core()) {
-                return Err(Error::InvalidInput(
-                    "User handle belongs to a different Bot session",
-                ));
-            }
-            room.ensure_user_askable(user)?;
-            let inbox = room.inbox_users_at(std::slice::from_ref(user), caller);
-            let sender = EndpointSender::RoomUser { room, user };
-            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
-        }
-        AskSource::RoomUsers {
-            room,
-            users,
-            caller,
-        } => {
-            room.ensure_any_user_askable(&users)?;
-            let inbox = room.inbox_users_at(&users, caller);
-            let sender = EndpointSender::RoomOpen { room };
-            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
-        }
-        AskSource::UserDm { user, caller } => {
-            let mut dm = match user.exclusive_at(caller).await {
-                Ok(dm) => dm,
-                Err(e) => {
-                    tracing::debug!(error = %e, "ask aborted before DM prompt write");
-                    return Err(e);
-                }
-            };
-            ask_in_dm(&cfg, &mut matcher, &mut dm, prompt).await
-        }
-        AskSource::BorrowedDm { dm } => ask_in_dm(&cfg, &mut matcher, dm, prompt).await,
-        AskSource::BorrowedHuddle { huddle } => {
-            let (sender, inbox) = huddle.split_for_ask();
-            // Fail before clearing the shared inbox, which holds other members' unread messages:
-            sender.core().check_connected()?;
-            inbox.clear();
-            let receipt = sender.broadcast_prompt_with_receipt(prompt.clone())?;
-            let sender = EndpointSender::Huddle { sender, prompt };
-            await_ask_loop(&cfg, &mut matcher, sender, inbox, receipt).await
-        }
-        AskSource::HuddleMember { huddle, user } => {
-            let (members, inbox) = huddle.split_for_ask();
-            // Fail before clearing the shared inbox, which holds other members' unread messages:
-            members.core().check_connected()?;
-            if let Some(err) = user.quit_error() {
-                return Err(err);
-            }
-            inbox.clear();
-            let receipt = user.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
-            // Only `user` answers, over the huddle's single inbox; teammates' banter meanwhile is
-            // relayed (if enabled) rather than matched:
-            let mut member_matcher = |msg: &ChatMessage| {
-                if msg.sender == user {
-                    matcher(msg).into_ask_match()
-                } else {
-                    if members.has_relay() {
-                        let _ = members.relay_to_others(msg);
-                    }
-                    AskMatch::ignore()
-                }
-            };
-            // The huddle inbox outlives `user`, so `Dm`'s own `QUIT` check ends the prompt:
-            let sender = EndpointSender::Dm {
-                core: members.core(),
-                user: &user,
-                prompt,
-            };
-            await_ask_loop(&cfg, &mut member_matcher, sender, inbox, receipt).await
-        }
-    }
-}
-
-/// Channel prompt: writes `prompt` to `room` (which fails if the bot is known to be out of it)
-/// and awaits a reply on the already-subscribed `inbox`.
-async fn ask_in_room<F, R>(
-    cfg: &AskConfig,
-    matcher: &mut F,
-    room: &Room,
-    mut inbox: Inbox,
-    sender: EndpointSender<'_>,
-    prompt: Text,
-) -> Result<R::Output>
-where
-    F: FnMut(&ChatMessage) -> R + Send,
-    R: IntoAskMatch,
-{
-    let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
-    await_ask_loop(cfg, matcher, sender, &mut inbox, receipt).await
-}
-
-/// DM prompt over a held [`ExclusiveDm`]: drops any backlog, writes `prompt` (which fails if
-/// the session or the user is gone) and awaits a reply on the DM's own inbox.
-async fn ask_in_dm<F, R>(
-    cfg: &AskConfig,
-    matcher: &mut F,
-    dm: &mut ExclusiveDm,
-    prompt: Text,
-) -> Result<R::Output>
-where
-    F: FnMut(&ChatMessage) -> R + Send,
-    R: IntoAskMatch,
-{
-    dm.inbox().clear();
-    let receipt = dm
-        .user()
-        .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
-    let (core, user, inbox) = dm.split_for_ask();
-    let sender = EndpointSender::Dm { core, user, prompt };
-    await_ask_loop(cfg, matcher, sender, inbox, receipt).await
 }
 
 impl<'a, F, R> Future for Ask<'a, F, R>
@@ -1020,39 +701,1187 @@ where
     type Output = Result<Answer<R::Output>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if matches!(this.state, AskState::Unstarted(_)) {
-            let AskState::Unstarted(unstarted) =
-                std::mem::replace(&mut this.state, AskState::Done)
-            else {
-                unreachable!()
-            };
-            let AskUnstarted {
-                cfg,
-                source,
-                prompt,
-                matcher,
-            } = *unstarted;
-            let span = make_span(&cfg, &source);
-            let fut = run_ask(cfg, source, prompt, matcher).instrument(span);
-            this.state = AskState::Running(Box::pin(fut));
-        }
+        self.get_mut().state.poll_with(cx, |u| {
+            let span = make_ask_span(&u.cfg, &u.source);
+            run_ask(u.cfg, u.source, u.prompt, u.matcher).instrument(span)
+        })
+    }
+}
 
-        match &mut this.state {
-            AskState::Running(fut) => match fut.as_mut().poll(cx) {
-                Poll::Ready(res) => {
-                    this.state = AskState::Done;
-                    Poll::Ready(Answer::from_result(res))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            AskState::Done => panic!("Ask polled after completion"),
-            AskState::Unstarted(_) => unreachable!(),
+/// Collection of responses returned by [`ask_many`], [`crate::Room::ask_many`], and
+/// [`crate::Huddle::ask_many`].
+///
+/// Iterating over `Answers<T>` or `&Answers<T>` yields accepted `(User, T)` pairs in order
+/// (input order for closed rosters via [`AskMany::from_users`] or [`crate::Huddle::ask_many`], and
+/// first-response order for open [`crate::Room::ask_many`] prompts). For closed-roster prompts,
+/// [`Answers::answer_for`] and [`Answers::into_per_user`] also inspect per-player
+/// [`Answer::TimedOut`], [`Answer::Left`], and [`Answer::Unreachable`] outcomes.
+#[derive(Clone, Debug)]
+pub struct Answers<T> {
+    entries: Vec<(User, Option<Answer<T>>)>,
+    index_by_id: HashMap<UserId, usize>,
+}
+
+impl<T> Default for Answers<T> {
+    fn default() -> Self {
+        Self::new_open()
+    }
+}
+
+impl<T> Answers<T> {
+    fn new_open() -> Self {
+        Self {
+            entries: Vec::new(),
+            index_by_id: HashMap::new(),
         }
     }
+
+    fn new_closed(voters: Vec<User>) -> Self {
+        let mut entries = Vec::with_capacity(voters.len());
+        let mut index_by_id = HashMap::with_capacity(voters.len());
+        for u in voters {
+            if let std::collections::hash_map::Entry::Vacant(e) = index_by_id.entry(u.id()) {
+                e.insert(entries.len());
+                entries.push((u, None));
+            }
+        }
+        Self {
+            entries,
+            index_by_id,
+        }
+    }
+
+    fn record_answer(&mut self, user: &User, val: T) {
+        if let Some(&idx) = self.index_by_id.get(&user.id()) {
+            self.entries[idx].1 = Some(Answer::Ok(val));
+        } else {
+            let idx = self.entries.len();
+            self.index_by_id.insert(user.id(), idx);
+            self.entries.push((user.clone(), Some(Answer::Ok(val))));
+        }
+    }
+
+    fn has_answered(&self, uid: UserId) -> bool {
+        self.index_by_id
+            .get(&uid)
+            .is_some_and(|&idx| matches!(self.entries[idx].1, Some(Answer::Ok(_))))
+    }
+
+    fn record_left_if_pending(
+        &mut self,
+        idx: usize,
+        nick: String,
+        reason: Option<String>,
+        last_terminal: &mut Option<Answer<()>>,
+    ) {
+        if self.entries[idx].1.is_none() {
+            *last_terminal = Some(Answer::Left {
+                nick: nick.clone(),
+                reason: reason.clone(),
+            });
+            self.entries[idx].1 = Some(Answer::Left { nick, reason });
+        }
+    }
+
+    fn record_unreachable_if_pending(
+        &mut self,
+        idx: usize,
+        nick: String,
+        code: u16,
+        message: String,
+        last_terminal: &mut Option<Answer<()>>,
+    ) {
+        if self.entries[idx].1.is_none() {
+            *last_terminal = Some(Answer::Unreachable {
+                nick: nick.clone(),
+                code,
+                message: message.clone(),
+            });
+            self.entries[idx].1 = Some(Answer::Unreachable {
+                nick,
+                code,
+                message,
+            });
+        }
+    }
+
+    fn evict_open(&mut self, uid: UserId) -> bool {
+        let Some(removed_idx) = self.index_by_id.remove(&uid) else {
+            return false;
+        };
+        self.entries.remove(removed_idx);
+        for (new_idx, (u, _)) in self.entries.iter().enumerate().skip(removed_idx) {
+            self.index_by_id.insert(u.id(), new_idx);
+        }
+        true
+    }
+
+    /// Number of accepted answers currently stored.
+    pub fn len(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, a)| matches!(a, Some(Answer::Ok(_))))
+            .count()
+    }
+
+    /// Returns `true` if no accepted answers are stored.
+    pub fn is_empty(&self) -> bool {
+        !self
+            .entries
+            .iter()
+            .any(|(_, a)| matches!(a, Some(Answer::Ok(_))))
+    }
+
+    /// Returns `true` if `user` has an accepted answer.
+    pub fn contains_user(&self, user: &User) -> bool {
+        self.get(user).is_some()
+    }
+
+    /// Borrows `user`'s accepted answer, if any.
+    pub fn get(&self, user: &User) -> Option<&T> {
+        let &idx = self.index_by_id.get(&user.id())?;
+        self.entries[idx].1.as_ref()?.as_ok()
+    }
+
+    /// Iterates over accepted `(&User, &T)` pairs in order.
+    pub fn iter(&self) -> AnswersIter<'_, T> {
+        AnswersIter(self.entries.iter())
+    }
+
+    /// Iterates over every [`User`] who submitted an accepted answer.
+    pub fn users(&self) -> impl Iterator<Item = &User> {
+        self.iter().map(|(u, _)| u)
+    }
+
+    /// Iterates over accepted answer values in order.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    /// Borrows `user`'s full [`Answer`] outcome (`Ok`, `TimedOut`, `Left`, or `Unreachable`) when
+    /// `user` was part of this prompt's roster or submitted an answer.
+    pub fn answer_for(&self, user: &User) -> Option<Answer<&T>> {
+        let &idx = self.index_by_id.get(&user.id())?;
+        Some(match &self.entries[idx].1 {
+            Some(Answer::Ok(val)) => Answer::Ok(val),
+            None | Some(Answer::TimedOut) => Answer::TimedOut,
+            Some(Answer::Left { nick, reason }) => Answer::Left {
+                nick: nick.clone(),
+                reason: reason.clone(),
+            },
+            Some(Answer::Unreachable {
+                nick,
+                code,
+                message,
+            }) => Answer::Unreachable {
+                nick: nick.clone(),
+                code: *code,
+                message: message.clone(),
+            },
+        })
+    }
+
+    /// Consumes `self` into per-user `(User, Answer<T>)` outcomes in deduplicated roster order
+    /// (including `TimedOut`, `Left`, and `Unreachable` entries for closed-roster prompts).
+    pub fn into_per_user(self) -> Vec<(User, Answer<T>)> {
+        self.entries
+            .into_iter()
+            .map(|(u, ans)| (u, ans.unwrap_or(Answer::TimedOut)))
+            .collect()
+    }
+}
+
+/// Borrowing iterator over accepted `(&User, &T)` pairs in [`Answers`].
+pub struct AnswersIter<'a, T>(std::slice::Iter<'a, (User, Option<Answer<T>>)>);
+
+impl<'a, T> Iterator for AnswersIter<'a, T> {
+    type Item = (&'a User, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (u, ans) in self.0.by_ref() {
+            if let Some(Answer::Ok(val)) = ans {
+                return Some((u, val));
+            }
+        }
+        None
+    }
+}
+
+/// Owning iterator over accepted `(User, T)` pairs in [`Answers`].
+pub struct AnswersIntoIter<T>(std::vec::IntoIter<(User, Option<Answer<T>>)>);
+
+impl<T> Iterator for AnswersIntoIter<T> {
+    type Item = (User, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (u, ans) in self.0.by_ref() {
+            if let Some(Answer::Ok(val)) = ans {
+                return Some((u, val));
+            }
+        }
+        None
+    }
+}
+
+impl<T> IntoIterator for Answers<T> {
+    type Item = (User, T);
+    type IntoIter = AnswersIntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        AnswersIntoIter(self.entries.into_iter())
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Answers<T> {
+    type Item = (&'a User, &'a T);
+    type IntoIter = AnswersIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+type StopPredicate<'a, O> = Box<dyn FnMut(&Answers<O>) -> bool + Send + 'a>;
+
+struct AskManyUnstarted<'a, F, O> {
+    endpoint: Box<dyn PromptEndpoint + 'a>,
+    caller: &'static Location<'static>,
+    restricted_users: Option<Vec<User>>,
+    cfg: AskConfig,
+    prompt: Text,
+    matcher: F,
+    allow_change: bool,
+    stop_pred: Option<StopPredicate<'a, O>>,
+    invalid_max_zero: bool,
+}
+
+/// Lazy multi-responder prompt future returned by [`ask_many`], [`crate::Room::ask_many`], and
+/// [`crate::Huddle::ask_many`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct AskMany<'a, F, R: IntoAskMatch> {
+    state: LazyState<'a, AskManyUnstarted<'a, F, R::Output>, Result<Answers<R::Output>>>,
+}
+
+impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
+    #[track_caller]
+    pub(crate) fn from_group_with_config<G: GroupChat + 'a>(
+        group: G,
+        cfg: AskConfig,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
+        Self {
+            state: LazyState::new(AskManyUnstarted {
+                endpoint: Box::new(GroupEndpoint(group)),
+                caller: Location::caller(),
+                restricted_users: None,
+                cfg,
+                prompt,
+                matcher,
+                allow_change: false,
+                stop_pred: None,
+                invalid_max_zero: false,
+            }),
+        }
+    }
+
+    fn map_cfg(mut self, f: impl FnOnce(AskConfig) -> AskConfig) -> Self {
+        self.state.map_unstarted(|u| {
+            let taken = std::mem::take(&mut u.cfg);
+            u.cfg = f(taken);
+        });
+        self
+    }
+
+    /// Restricts eligible responders to `users` (deduplicated in input order).
+    pub fn from_users<I, U>(mut self, users: I) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
+        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
+        self.state
+            .map_unstarted(|u| u.restricted_users = Some(collected));
+        self
+    }
+
+    /// Allows responders to overwrite an already-accepted answer until the deadline or
+    /// [`AskMany::stop_when`] / [`AskMany::max_answers`] completes the prompt.
+    pub fn allow_change(mut self, allow: bool) -> Self {
+        self.state.map_unstarted(|u| u.allow_change = allow);
+        self
+    }
+
+    /// Stops early as soon as `max` distinct users have active accepted answers (`max >= 1`).
+    pub fn max_answers(mut self, max: usize) -> Self
+    where
+        R::Output: 'a,
+    {
+        self.state.map_unstarted(|u| {
+            if max == 0 {
+                u.invalid_max_zero = true;
+            } else {
+                u.invalid_max_zero = false;
+                u.stop_pred = Some(Box::new(move |answers: &Answers<R::Output>| {
+                    answers.len() >= max
+                }));
+            }
+        });
+        self
+    }
+
+    /// Installs a custom early-stopping predicate evaluated against [`Answers`] whenever an answer
+    /// is recorded (or an open-room responder departs).
+    pub fn stop_when<P>(mut self, predicate: P) -> Self
+    where
+        P: FnMut(&Answers<R::Output>) -> bool + Send + 'a,
+    {
+        self.state.map_unstarted(|u| {
+            u.invalid_max_zero = false;
+            u.stop_pred = Some(Box::new(predicate));
+        });
+        self
+    }
+
+    pub fn config(self, cfg: &AskConfig) -> Self {
+        self.map_cfg(|_| cfg.clone())
+    }
+
+    pub fn reply_timeout(self, duration: Duration) -> Self {
+        self.map_cfg(|c| c.reply_timeout(duration))
+    }
+
+    pub fn reply_deadline(self, instant: Instant) -> Self {
+        self.map_cfg(|c| c.reply_deadline(instant))
+    }
+
+    pub fn no_reply_timeout(self) -> Self {
+        self.map_cfg(AskConfig::no_reply_timeout)
+    }
+
+    pub fn warn_remaining(self, remaining: Duration, msg: impl Into<Text>) -> Self {
+        self.map_cfg(|c| c.warn_remaining(remaining, msg))
+    }
+
+    pub fn clear_warnings(self) -> Self {
+        self.map_cfg(AskConfig::clear_warnings)
+    }
+
+    pub fn ignore_commands(self) -> Self {
+        self.map_cfg(AskConfig::ignore_commands)
+    }
+
+    pub fn accept_notices(self) -> Self {
+        self.map_cfg(AskConfig::accept_notices)
+    }
+
+    pub fn allow_commands(self) -> Self {
+        self.map_cfg(AskConfig::allow_commands)
+    }
+
+    pub fn ignore_notices(self) -> Self {
+        self.map_cfg(AskConfig::ignore_notices)
+    }
+
+    pub fn timeout_message(self, msg: impl Into<Text>) -> Self {
+        self.map_cfg(|c| c.timeout_message(msg))
+    }
+
+    pub fn timeout_message_fn<G, M>(self, f: G) -> Self
+    where
+        G: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
+        M: Into<Text>,
+    {
+        self.map_cfg(|c| c.timeout_message_fn(f))
+    }
+
+    pub fn no_timeout_message(self) -> Self {
+        self.map_cfg(AskConfig::no_timeout_message)
+    }
+}
+
+impl<'a, F, R> Future for AskMany<'a, F, R>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    type Output = Result<Answers<R::Output>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().state.poll_with(cx, |u| {
+            let timeout_ms = match u.cfg.time_limit {
+                TimeLimit::Duration(d) => Some(d.as_millis() as u64),
+                TimeLimit::Deadline(_) | TimeLimit::None => None,
+            };
+            let target = u.endpoint.chat().target();
+            let span = tracing::debug_span!(
+                "ircgm::ask_many",
+                target = %target_span_label(&target),
+                restricted = u.restricted_users.as_ref().map(Vec::len),
+                timeout_ms = timeout_ms,
+            );
+            run_ask_many(u).instrument(span)
+        })
+    }
+}
+
+fn target_span_label(target: &Target) -> &str {
+    match target {
+        Target::Channel(ch) => ch.as_str(),
+        Target::Dm => "DM",
+    }
+}
+
+fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
+    let timeout_ms = match cfg.time_limit {
+        TimeLimit::Duration(d) => Some(d.as_millis() as u64),
+        TimeLimit::Deadline(_) | TimeLimit::None => None,
+    };
+    match source {
+        AskSource::Endpoint {
+            endpoint,
+            restricted_users,
+            ..
+        } => {
+            let target = endpoint.chat().target();
+            let single_nick = match restricted_users.as_deref() {
+                Some([only]) => Some(only.nick()),
+                None => match endpoint.chat().participants().as_deref() {
+                    Some([only]) if !endpoint.is_group() => Some(only.nick()),
+                    _ => None,
+                },
+                Some(_) => None,
+            };
+            tracing::debug_span!(
+                "ircgm::ask",
+                target = %target_span_label(&target),
+                user = single_nick.as_deref(),
+                timeout_ms = timeout_ms
+            )
+        }
+        AskSource::UserDm { user, .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = "DM",
+            user = %user.nick(),
+            timeout_ms = timeout_ms
+        ),
+        AskSource::Invalid(_) => tracing::debug_span!("ircgm::ask", timeout_ms = timeout_ms),
+    }
+}
+
+fn compute_schedule(
+    cfg: &AskConfig,
+    sent_at: Instant,
+) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
+    let Some(deadline) = cfg.time_limit.deadline_from(sent_at) else {
+        return (None, VecDeque::new());
+    };
+    let budget = deadline.saturating_duration_since(sent_at);
+    let mut warns: Vec<_> = cfg
+        .warnings
+        .iter()
+        .filter(|(rem, _)| !rem.is_zero() && budget > *rem)
+        .map(|(rem, msg)| (deadline - *rem, msg.clone()))
+        .collect();
+    warns.sort_by_key(|(at, _)| *at);
+    (Some(deadline), VecDeque::from(warns))
+}
+
+#[derive(Default)]
+struct DeliveryState {
+    rename_retries: HashMap<UserId, u8>,
+}
+
+fn resend_to_renamed(
+    core: &Arc<BotCore>,
+    user: &User,
+    bounced_nick: &str,
+    prompt: &Text,
+    state: &mut DeliveryState,
+) -> bool {
+    let retries = state.rename_retries.entry(user.id()).or_insert(0);
+    match user.track().next_rename_retry_nick(bounced_nick, retries) {
+        Some(new_nick) => {
+            let _ = core.send_chat(OutboundChatKind::Privmsg, &new_nick, prompt.clone());
+            true
+        }
+        None => false,
+    }
+}
+
+struct PromptRunOutcome<T> {
+    answers: Answers<T>,
+    last_terminal: Option<Answer<()>>,
+    timed_out: bool,
+}
+
+impl<T> PromptRunOutcome<T> {
+    fn into_single_answer(self) -> Answer<T> {
+        if let Some((_, val)) = self.answers.into_iter().next() {
+            return Answer::Ok(val);
+        }
+        if self.timed_out {
+            return Answer::TimedOut;
+        }
+        match self.last_terminal {
+            Some(Answer::Left { nick, reason }) => Answer::Left { nick, reason },
+            Some(Answer::Unreachable {
+                nick,
+                code,
+                message,
+            }) => Answer::Unreachable {
+                nick,
+                code,
+                message,
+            },
+            Some(Answer::TimedOut | Answer::Ok(())) | None => Answer::TimedOut,
+        }
+    }
+}
+
+fn dedup_users(users: Vec<User>) -> Vec<User> {
+    let mut out = Vec::with_capacity(users.len());
+    let mut seen = HashSet::with_capacity(users.len());
+    for u in users {
+        if seen.insert(u.id()) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+fn send_reply_kind(chat: &dyn ChatDyn, kind: OutboundChatKind, text: Text) {
+    match kind {
+        OutboundChatKind::Notice => {
+            let _ = chat.notice_text(text);
+        }
+        OutboundChatKind::Privmsg | OutboundChatKind::Action => {
+            let _ = chat.say_text(text);
+        }
+    }
+}
+
+fn snapshot_all_departed<T>(
+    voters: &Option<Vec<User>>,
+    owned_inbox: Option<&Inbox>,
+    answers: &mut Answers<T>,
+    departed: &mut HashSet<UserId>,
+    last_terminal: &mut Option<Answer<()>>,
+) -> bool {
+    let Some(vs) = voters.as_deref() else {
+        return false;
+    };
+    if vs.is_empty() {
+        return false;
+    }
+    for (idx, u) in vs.iter().enumerate() {
+        if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
+            answers.record_left_if_pending(idx, nick, reason, last_terminal);
+            departed.insert(u.id());
+        } else if owned_inbox.is_some_and(|ib| ib.is_departed_in_room(u.track_id())) {
+            answers.record_left_if_pending(idx, u.nick(), None, last_terminal);
+            departed.insert(u.id());
+        }
+    }
+    departed.len() == vs.len()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_prompt<'a, F, R>(
+    endpoint: &mut (dyn PromptEndpoint + 'a),
+    caller: &'static Location<'static>,
+    restricted_users: Option<Vec<User>>,
+    cfg: AskConfig,
+    prompt: Text,
+    mut matcher: F,
+    allow_change: bool,
+    mut stop_pred: Option<StopPredicate<'a, R::Output>>,
+) -> Result<PromptRunOutcome<R::Output>>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    if let Some(ref users) = restricted_users {
+        if users.is_empty() {
+            return Err(Error::InvalidInput(
+                "from_users requires at least one User",
+            ));
+        }
+        if !endpoint.is_group() {
+            return Err(Error::InvalidInput(
+                "from_user / from_users requires a group prompt",
+            ));
+        }
+    }
+
+    let base_participants = endpoint.chat().participants();
+    let voters = match restricted_users {
+        Some(users) => Some(dedup_users(users)),
+        None => base_participants.clone().map(dedup_users),
+    };
+    let mut answers = match &voters {
+        Some(vs) if !vs.is_empty() => Answers::new_closed(vs.clone()),
+        _ => Answers::new_open(),
+    };
+
+    let mut departed: HashSet<UserId> = HashSet::new();
+    let mut last_terminal: Option<Answer<()>> = None;
+
+    let (mut owned_inbox, inbox_core) = {
+        let initial_ref = endpoint.inbox_for(voters.as_deref());
+        if initial_ref.is_invalid_session() {
+            return Err(Error::InvalidInput(
+                "User handle belongs to a different Bot session",
+            ));
+        }
+        let inbox_core = initial_ref.core().cloned();
+        let is_owned = matches!(initial_ref, InboxRef::Owned(_));
+        let owned = match initial_ref {
+            InboxRef::Owned(mut ib) => {
+                ib.set_opened_at(caller);
+                cfg.apply_flags_to_inbox(&mut ib);
+                Some(ib)
+            }
+            InboxRef::Borrowed(_) => None,
+        };
+
+        if let Some(ref core) = inbox_core {
+            if let Some(ref vs) = voters {
+                for u in vs {
+                    if !u.belongs_to(core) {
+                        return Err(Error::InvalidInput(
+                            "User handle belongs to a different Bot session",
+                        ));
+                    }
+                }
+            }
+            core.check_connected()?;
+            if let Target::Channel(ch) = endpoint.chat().target() {
+                core.state
+                    .read()
+                    .unwrap()
+                    .check_bot_in_channel(&ch, BotPresence::Tracked)?;
+            }
+        }
+        if base_participants.is_some() {
+            if let Some(ref vs) = voters {
+                for u in vs {
+                    if endpoint.group_has_user(u) == Some(false) {
+                        return Err(u.quit_error().unwrap_or(Error::InvalidInput(
+                            "User is not a member of this group",
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !is_owned {
+            if snapshot_all_departed(
+                &voters,
+                None,
+                &mut answers,
+                &mut departed,
+                &mut last_terminal,
+            ) {
+                return Ok(PromptRunOutcome {
+                    answers,
+                    last_terminal,
+                    timed_out: false,
+                });
+            }
+            endpoint.chat_mut().inbox().clear();
+        }
+        if snapshot_all_departed(
+            &voters,
+            owned.as_ref(),
+            &mut answers,
+            &mut departed,
+            &mut last_terminal,
+        ) {
+            return Ok(PromptRunOutcome {
+                answers,
+                last_terminal,
+                timed_out: false,
+            });
+        }
+        (owned, inbox_core)
+    };
+
+    match endpoint.chat().say_text(prompt.clone()) {
+        Ok(()) => {}
+        Err(Error::UserLeft { nick, reason }) => {
+            last_terminal = Some(Answer::Left {
+                nick: nick.clone(),
+                reason: reason.clone(),
+            });
+            for idx in 0..answers.entries.len() {
+                answers.record_left_if_pending(
+                    idx,
+                    nick.clone(),
+                    reason.clone(),
+                    &mut last_terminal,
+                );
+            }
+            return Ok(PromptRunOutcome {
+                answers,
+                last_terminal,
+                timed_out: false,
+            });
+        }
+        Err(fatal) => return Err(fatal),
+    }
+
+    let sent_at = Instant::now();
+    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at);
+    let endpoint_target = endpoint.chat().target();
+    let casemap = inbox_core
+        .as_ref()
+        .map_or_else(CaseMap::default, |c| c.casemap());
+
+    let is_naturally_complete =
+        |voters: &Option<Vec<User>>, answers: &Answers<R::Output>, departed: &HashSet<UserId>| {
+            let Some(vs) = voters.as_deref() else {
+                return false;
+            };
+            if allow_change {
+                departed.len() == vs.len()
+            } else {
+                vs.iter()
+                    .all(|u| answers.has_answered(u.id()) || departed.contains(&u.id()))
+            }
+        };
+
+    enum LoopStep {
+        Wire(Result<Arc<WireEvent>>),
+        Warn,
+        Deadline,
+    }
+
+    let mut delivery = DeliveryState::default();
+    let mut timed_out = false;
+
+    loop {
+        let step = {
+            let mut borrowed_inbox;
+            let active_inbox: &mut Inbox = match &mut owned_inbox {
+                Some(inbox) => inbox,
+                None => {
+                    borrowed_inbox = endpoint.chat_mut().inbox();
+                    &mut borrowed_inbox
+                }
+            };
+            let next_warn_at = pending_warnings.front().map(|(at, _)| *at);
+            tokio::select! {
+                biased;
+                res = std::future::poll_fn(|cx| active_inbox.poll_next_wire(cx)) => LoopStep::Wire(res),
+                () = async {
+                    match deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => LoopStep::Deadline,
+                () = async {
+                    match next_warn_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => LoopStep::Warn,
+            }
+        };
+
+        match step {
+            LoopStep::Warn => {
+                if let Some((_, warn_msg)) = pending_warnings.pop_front() {
+                    if deadline.is_some_and(|dl| Instant::now() < dl) {
+                        let _ = endpoint.chat().say_text(warn_msg);
+                    }
+                }
+            }
+            LoopStep::Deadline => {
+                timed_out = true;
+                let (should_notify, single_user) = match voters.as_deref() {
+                    Some(vs) => {
+                        let mut timed_out_indices = Vec::new();
+                        for (idx, (_, slot)) in answers.entries.iter_mut().enumerate() {
+                            if slot.is_none() {
+                                *slot = Some(Answer::TimedOut);
+                                timed_out_indices.push(idx);
+                            }
+                        }
+                        let user = match timed_out_indices.as_slice() {
+                            [only] => Some(&vs[*only]),
+                            _ => None,
+                        };
+                        (!timed_out_indices.is_empty(), user)
+                    }
+                    None => (answers.is_empty(), None),
+                };
+                if should_notify {
+                    if let Some(handler) = &cfg.timeout_handler {
+                        let ctx = TimeoutCtx {
+                            target: &endpoint_target,
+                            user: single_user,
+                        };
+                        let _ = endpoint.chat().say_text(handler.render(&ctx));
+                    }
+                }
+                break;
+            }
+            LoopStep::Wire(wire_res) => {
+                let wire = match wire_res {
+                    Ok(w) => w,
+                    Err(Error::UserLeft { nick, reason }) => {
+                        last_terminal = Some(Answer::Left {
+                            nick: nick.clone(),
+                            reason: reason.clone(),
+                        });
+                        for idx in 0..answers.entries.len() {
+                            answers.record_left_if_pending(
+                                idx,
+                                nick.clone(),
+                                reason.clone(),
+                                &mut last_terminal,
+                            );
+                        }
+                        break;
+                    }
+                    Err(fatal) => return Err(fatal),
+                };
+
+                match &wire.kind {
+                    WireKind::BotLeftRoom { channel, reason } => {
+                        if let Target::Channel(ref expected_chan) = endpoint_target {
+                            if casemap.str_eq(channel, expected_chan) {
+                                return Err(Error::BotLeftRoom {
+                                    channel: channel.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
+                        }
+                    }
+                    WireKind::Event(Event::DeliveryFailed {
+                        target,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        if let Target::Channel(ref expected_chan) = endpoint_target {
+                            if casemap.str_eq(target, expected_chan) {
+                                return Err(Error::ChannelSendFailed {
+                                    channel: target.clone(),
+                                    code: *code,
+                                    message: message.clone(),
+                                });
+                            }
+                        }
+                        let pool = base_participants.as_deref().or(voters.as_deref());
+                        if let (Some(pool), Some(tid)) = (pool, wire.bounce_user_id()) {
+                            if let Some(member) = pool.iter().find(|u| u.track_id() == tid) {
+                                if matches!(endpoint_target, Target::Dm) && *code == 401 {
+                                    if let Some(ref core) = inbox_core {
+                                        if resend_to_renamed(
+                                            core,
+                                            member,
+                                            target,
+                                            &prompt,
+                                            &mut delivery,
+                                        ) {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Some(&idx) = answers.index_by_id.get(&member.id()) {
+                                    departed.insert(member.id());
+                                    answers.record_unreachable_if_pending(
+                                        idx,
+                                        target.clone(),
+                                        *code,
+                                        message.clone(),
+                                        &mut last_terminal,
+                                    );
+                                    if is_naturally_complete(&voters, &answers, &departed) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    WireKind::Event(
+                        Event::Parted {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                            ..
+                        }
+                        | Event::Kicked {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                            ..
+                        },
+                    ) => {
+                        if let Target::Channel(ref expected_chan) = endpoint_target {
+                            if casemap.str_eq(channel, expected_chan)
+                                && on_user_departure(
+                                    &voters,
+                                    user.id(),
+                                    nick.clone(),
+                                    reason.clone(),
+                                    &mut answers,
+                                    &mut departed,
+                                    &mut last_terminal,
+                                    &mut stop_pred,
+                                    allow_change,
+                                )
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    WireKind::Event(Event::Quit {
+                        user, nick, reason, ..
+                    }) => {
+                        if on_user_departure(
+                            &voters,
+                            user.id(),
+                            nick.clone(),
+                            reason.clone(),
+                            &mut answers,
+                            &mut departed,
+                            &mut last_terminal,
+                            &mut stop_pred,
+                            allow_change,
+                        ) {
+                            break;
+                        }
+                    }
+                    _ => {
+                        let candidate = match &wire.kind {
+                            WireKind::Event(Event::Chat(msg)) => Some(msg),
+                            WireKind::Event(Event::Notice { .. }) if cfg.accept_notices => {
+                                wire.human_notice()
+                            }
+                            _ => None,
+                        };
+                        let Some(msg) = candidate else {
+                            continue;
+                        };
+
+                        let target_matches = match (&endpoint_target, &msg.target) {
+                            (Target::Dm, Target::Dm) => true,
+                            (Target::Channel(expected), Target::Channel(actual)) => {
+                                casemap.str_eq(expected, actual)
+                            }
+                            _ => false,
+                        };
+                        if !target_matches {
+                            continue;
+                        }
+                        if voters.is_some()
+                            && (!answers.index_by_id.contains_key(&msg.sender.id())
+                                || departed.contains(&msg.sender.id()))
+                        {
+                            continue;
+                        }
+                        if (!allow_change && answers.has_answered(msg.sender.id()))
+                            || (cfg.ignore_commands
+                                && inbox_core
+                                    .as_ref()
+                                    .is_some_and(|c| c.is_command_text(&msg.text)))
+                        {
+                            continue;
+                        }
+
+                        match matcher(msg).into_ask_match().0 {
+                            // Mirror reply kind: a `NOTICE` must never trigger an automatic
+                            // `PRIVMSG` (RFC 2812 §3.3.2).
+                            AskMatchInner::Accept(val, ack) => {
+                                if let Some(ack_msg) = ack {
+                                    send_reply_kind(endpoint.chat(), msg.reply_kind(), ack_msg);
+                                }
+                                answers.record_answer(&msg.sender, val);
+                                if let Some(ref mut pred) = stop_pred {
+                                    if pred(&answers) {
+                                        break;
+                                    }
+                                }
+                                if is_naturally_complete(&voters, &answers, &departed) {
+                                    break;
+                                }
+                            }
+                            AskMatchInner::Reject(feedback) => {
+                                send_reply_kind(endpoint.chat(), msg.reply_kind(), feedback);
+                            }
+                            AskMatchInner::Ignore => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PromptRunOutcome {
+        answers,
+        last_terminal,
+        timed_out,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_user_departure<O>(
+    voters: &Option<Vec<User>>,
+    uid: UserId,
+    nick: String,
+    reason: Option<String>,
+    answers: &mut Answers<O>,
+    departed: &mut HashSet<UserId>,
+    last_terminal: &mut Option<Answer<()>>,
+    stop_pred: &mut Option<StopPredicate<'_, O>>,
+    allow_change: bool,
+) -> bool {
+    let Some(vs) = voters.as_deref() else {
+        if answers.evict_open(uid) && !answers.is_empty() {
+            if let Some(ref mut pred) = stop_pred {
+                return pred(answers);
+            }
+        }
+        return false;
+    };
+    let Some(&idx) = answers.index_by_id.get(&uid) else {
+        return false;
+    };
+    departed.insert(uid);
+    answers.record_left_if_pending(idx, nick, reason, last_terminal);
+    if allow_change {
+        departed.len() == vs.len()
+    } else {
+        vs.iter()
+            .all(|u| answers.has_answered(u.id()) || departed.contains(&u.id()))
+    }
+}
+
+async fn run_ask<'a, F, R>(
+    cfg: AskConfig,
+    source: AskSource<'a>,
+    prompt: Text,
+    matcher: F,
+) -> Result<Answer<R::Output>>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    if prompt.is_empty() {
+        return Err(Error::InvalidInput("Ask prompt cannot be empty"));
+    }
+    let stop_at_one: Option<StopPredicate<'a, R::Output>> =
+        Some(Box::new(|answers: &Answers<R::Output>| !answers.is_empty()));
+
+    let res = match source {
+        AskSource::Invalid(msg) => return Err(Error::InvalidInput(msg)),
+        AskSource::Endpoint {
+            mut endpoint,
+            restricted_users,
+            caller,
+        } => {
+            run_prompt(
+                endpoint.as_mut(),
+                caller,
+                restricted_users,
+                cfg,
+                prompt,
+                matcher,
+                false,
+                stop_at_one,
+            )
+            .await
+        }
+        AskSource::UserDm { user, caller } => match user.exclusive_at(caller).await {
+            Ok(dm) => {
+                let mut endpoint = ChatEndpoint(dm);
+                run_prompt(
+                    &mut endpoint,
+                    caller,
+                    None,
+                    cfg,
+                    prompt,
+                    matcher,
+                    false,
+                    stop_at_one,
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "ask aborted before DM prompt write");
+                return Answer::from_result(Err(e));
+            }
+        },
+    };
+
+    match res {
+        Ok(outcome) => Ok(outcome.into_single_answer()),
+        Err(e) => Answer::from_result(Err(e)),
+    }
+}
+
+async fn run_ask_many<'a, F, R>(
+    unstarted: AskManyUnstarted<'a, F, R::Output>,
+) -> Result<Answers<R::Output>>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    let AskManyUnstarted {
+        mut endpoint,
+        caller,
+        restricted_users,
+        cfg,
+        prompt,
+        matcher,
+        allow_change,
+        stop_pred,
+        invalid_max_zero,
+    } = unstarted;
+
+    if prompt.is_empty() {
+        return Err(Error::InvalidInput("Ask prompt cannot be empty"));
+    }
+    if invalid_max_zero {
+        return Err(Error::InvalidInput("AskMany::max_answers requires max >= 1"));
+    }
+    let is_open_group = endpoint.chat().participants().is_none() && restricted_users.is_none();
+    if matches!(cfg.time_limit, TimeLimit::None) && stop_pred.is_none() {
+        if allow_change {
+            return Err(Error::InvalidInput(
+                "AskMany::allow_change(true) without stop_when/max_answers requires a reply_timeout or reply_deadline",
+            ));
+        }
+        if is_open_group {
+            return Err(Error::InvalidInput(
+                "open Room::ask_many without from_users or stop_when/max_answers requires a reply_timeout or reply_deadline",
+            ));
+        }
+    }
+
+    run_prompt(
+        endpoint.as_mut(),
+        caller,
+        restricted_users,
+        cfg,
+        prompt,
+        matcher,
+        allow_change,
+        stop_pred,
+    )
+    .await
+    .map(|out| out.answers)
 }
 
 #[cfg(test)]
 #[path = "ask_test.rs"]
 mod test;
-

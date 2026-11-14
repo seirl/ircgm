@@ -22,7 +22,7 @@
 //! ## Library Mechanics Showcased
 //! - **`005 MODES`-batched channel moderation:** [`Room::bot_is_op`], [`Room::set_topic`],
 //!   [`Room::set_mode`], [`Room::devoice_many`], and [`Room::voice_many`].
-//! - **Drop-out resilient party primitives:** [`Bot::huddle_available`] (`with_relay`),
+//! - **Drop-out resilient party primitives:** [`Bot::huddle_available`],
 //!   [`Bot::exclusive_available`], and [`Breakout::invite_available`] skip offline/AFK players
 //!   cleanly without stalling or aborting the session.
 //! - **Concurrent `0..=N` DM prompts:** Joins every online bodyguard's `!protect` prompt, so dawn
@@ -98,9 +98,8 @@ pub async fn werewolf_pack_kill(
     townsfolk: &[User],
 ) -> Result<Option<User>> {
     let mut pack = bot
-        .huddle_available(wolves)
+        .huddle_available("Wolves".red().bold(), wolves)
         .await?
-        .with_relay("[Wolves] ".red().bold())
         .with_ask_config(
             &AskConfig::new()
                 .reply_timeout(Duration::from_secs(30))

@@ -6,15 +6,15 @@ use std::sync::Arc;
 use irc::proto::Command;
 use irc_colors::Text;
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
+use crate::ask::{Ask, AskConfig, AskMany, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::CaseMap;
+use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, Target};
 use crate::outbound::{
     sanitize_reason, sanitize_text, validate_param, validate_target, OutboundChatKind, Priority,
-    WriteReceipt,
 };
 use crate::state::BotPresence;
 use crate::user::{User, UserId};
@@ -71,46 +71,6 @@ impl Room {
         ws.check_bot_in_channel(&self.channel_name, BotPresence::Tracked)
     }
 
-    pub(crate) fn ensure_user_askable(&self, user: &User) -> Result<()> {
-        self.core.check_connected()?;
-        if let Some(err) = user.quit_error() {
-            return Err(err);
-        }
-        let ws = self.core.state.read().unwrap();
-        ws.check_bot_in_channel(&self.channel_name, BotPresence::Tracked)?;
-        let synced = ws.channel(&self.channel_name).and_then(|c| c.members());
-        if synced.is_some_and(|members| !members.contains_key(&user.track_id())) {
-            return Err(Error::UserLeft {
-                nick: user.nick(),
-                reason: None,
-            });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn ensure_any_user_askable(&self, users: &[User]) -> Result<()> {
-        self.ensure_bot_in_room_if_tracked()?;
-        if users.is_empty() {
-            return Err(Error::InvalidInput("ask_users requires at least one User"));
-        }
-        for u in users {
-            if !u.belongs_to(&self.core) {
-                return Err(Error::InvalidInput(
-                    "User handle belongs to a different Bot session",
-                ));
-            }
-        }
-        let mut last_offline_err: Option<Error> = None;
-        for u in users {
-            match self.ensure_user_askable(u) {
-                Ok(()) => return Ok(()),
-                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
-                Err(fatal) => return Err(fatal),
-            }
-        }
-        Err(last_offline_err.expect("non-empty users with no askable user must have UserLeft"))
-    }
-
     fn ensure_can_moderate(&self) -> Result<usize> {
         self.core.check_connected()?;
         let ws = self.core.state.read().unwrap();
@@ -118,7 +78,7 @@ impl Room {
         Ok(ws.max_modes.max(1))
     }
 
-    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
+    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
         self.ensure_bot_in_room_if_tracked()?;
         self.core.send_chat(kind, &self.channel_name, text)
     }
@@ -148,17 +108,14 @@ impl Room {
 
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Privmsg, text.into())
-            .map(|_| ())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Notice, text.into())
-            .map(|_| ())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Action, text.into())
-            .map(|_| ())
     }
 
     /// Sends `INVITE <user> <channel>`. Fails immediately with `Err(Error::UserLeft { .. })`
@@ -233,11 +190,6 @@ impl Room {
             is_voiced: ws.occupant_is_voiced(occ),
             prefixes: occ.prefixes.clone(),
         })
-    }
-
-    /// Returns the sorted current nicknames of all occupants in this room.
-    pub fn nicks(&self) -> Vec<String> {
-        self.members().into_iter().map(|m| m.nick).collect()
     }
 
     pub fn has_user(&self, user: &User) -> bool {
@@ -427,22 +379,15 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let caller = Location::caller();
-        Ask::new(
-            AskSource::RoomOpen {
-                room: self,
-                caller,
-            },
-            (*self.ask_config).clone(),
-            prompt.into(),
-            matcher,
-        )
+        Ask::from_group_with_config(self, (*self.ask_config).clone(), prompt.into(), matcher)
     }
 
+    /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`crate::TimeoutCtx::user`]
+    /// to `Some(user)`).
     #[track_caller]
     pub fn ask_user<'a, F, R>(
         &'a self,
-        user: &'a User,
+        user: &User,
         prompt: impl Into<Text>,
         matcher: F,
     ) -> Ask<'a, F, R>
@@ -451,47 +396,23 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let caller = Location::caller();
-        Ask::new(
-            AskSource::RoomUser {
-                room: self,
-                user,
-                caller,
-            },
-            (*self.ask_config).clone(),
-            prompt.into(),
-            matcher,
-        )
+        self.ask(prompt, matcher).from_user(user)
     }
 
-    /// Prompts the channel and accepts replies only from `users` (ignoring spectators and
-    /// resolving with [`crate::Answer::Left`] only if *every* listed user leaves/quits).
+    /// Prompts this channel once and collects answers from `1..N` responders (`Result<Answers<T>>`).
+    ///
+    /// By default anyone in the room (including newcomers joining mid-prompt) may respond; chain
+    /// [`AskMany::from_users`] to restrict to a specific set of players, [`AskMany::allow_change`]
+    /// to let responders update their answer, and [`AskMany::max_answers`] or
+    /// [`AskMany::stop_when`] to customize early completion.
     #[track_caller]
-    pub fn ask_users<'a, I, U, F, R>(
-        &'a self,
-        users: I,
-        prompt: impl Into<Text>,
-        matcher: F,
-    ) -> Ask<'a, F, R>
+    pub fn ask_many<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
     where
-        I: IntoIterator<Item = U>,
-        U: std::borrow::Borrow<User>,
         F: FnMut(&ChatMessage) -> R + Send + 'a,
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let caller = Location::caller();
-        let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
-        Ask::new(
-            AskSource::RoomUsers {
-                room: self,
-                users: collected,
-                caller,
-            },
-            (*self.ask_config).clone(),
-            prompt.into(),
-            matcher,
-        )
+        AskMany::from_group_with_config(self, (*self.ask_config).clone(), prompt.into(), matcher)
     }
 
     #[track_caller]
@@ -569,6 +490,74 @@ impl Room {
         // stay config-free so session routers and stop triggers start unfiltered.
         self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
+    }
+}
+
+impl Chat for Room {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        Room::say(self, text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        Room::notice(self, text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        Room::action(self, text)
+    }
+
+    #[track_caller]
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Owned(Room::inbox(self))
+    }
+
+    fn target(&self) -> Target {
+        Target::Channel(self.channel_name.clone())
+    }
+}
+
+impl GroupChat for Room {
+    fn has_user(&self, user: &User) -> bool {
+        Room::has_user(self, user)
+    }
+
+    #[track_caller]
+    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
+        InboxRef::Owned(self.inbox_users_at(users, Location::caller()))
+    }
+}
+
+impl Chat for &Room {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        Room::say(self, text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        Room::notice(self, text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        Room::action(self, text)
+    }
+
+    #[track_caller]
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Owned(Room::inbox(self))
+    }
+
+    fn target(&self) -> Target {
+        Target::Channel(self.channel_name.clone())
+    }
+}
+
+impl GroupChat for &Room {
+    fn has_user(&self, user: &User) -> bool {
+        Room::has_user(self, user)
+    }
+
+    #[track_caller]
+    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
+        InboxRef::Owned(self.inbox_users_at(users, Location::caller()))
     }
 }
 

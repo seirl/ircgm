@@ -12,7 +12,7 @@
 //!    every surviving hand (`WIN`, `PUSH`, or `LOSE`).
 //!
 //! ## Library Mechanics Showcased
-//! - **Player-subset & single-player channel turns ([`Room::ask_users`] & [`Room::ask_user`]):**
+//! - **Player-subset & single-player channel turns ([`ircgm::Ask::from_users`] & [`Room::ask_user`]):**
 //!   Restricts `!deal` to seated players (ignoring spectators) and scopes each `hit`/`stand` turn
 //!   to one [`User`] inside a busy public channel.
 //! - **Timed lobby seat collection ([`ircgm::GameFutureExt::run_for`]):** Runs a `20s` join loop
@@ -83,11 +83,11 @@ pub async fn run_round_with_shoe(
             }),
     );
 
-    room.ask_users(
-        players,
+    room.ask(
         "Seated players: anyone type `!deal` to cut the deck!",
         |m| m.is_cmd("!deal").then_some(()),
     )
+    .from_users(players)
     .await?
     .required()?;
 

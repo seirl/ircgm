@@ -157,7 +157,7 @@ async fn ask_match_accept_say_preserves_wire_order_across_queued_dm_asks_and_bro
     let h_alice = alice.clone();
     let h_bob = bob.clone();
     let h_task = tokio::spawn(async move {
-        let mut huddle = h_bot.huddle([&h_alice, &h_bob]).await?;
+        let mut huddle = h_bot.huddle("Camp", [&h_alice, &h_bob]).await?;
         huddle
             .ask("Who takes watch?", |m| {
                 m.cmd_arg("!watch").map_or_else(AskMatch::ignore, |who| {
@@ -182,7 +182,10 @@ async fn ask_match_accept_say_preserves_wire_order_across_queued_dm_asks_and_bro
     );
     assert_eq!(
         server.take_messages_to("Bob"),
-        vec!["✔ Alice assigned Bob to watch!"]
+        vec![
+            "[Camp] <Alice> !watch Bob",
+            "✔ Alice assigned Bob to watch!",
+        ]
     );
 }
 
@@ -229,31 +232,27 @@ async fn write_receipt_pacing_single_timer_and_combinator_table() {
     assert_eq!(server.take_messages_to("P3"), vec!["Prompt 3"]);
     assert_eq!(server.take_messages_to("P4"), vec!["Prompt 4"]);
 
-    tokio::time::advance(Duration::from_secs(2)).await;
-    tokio::task::yield_now().await;
-    let (r1, e1) = t1.await.unwrap();
-    let (r2, e2) = t2.await.unwrap();
-    assert_eq!(r1.unwrap(), Answer::TimedOut);
-    assert_eq!(r2.unwrap(), Answer::TimedOut);
-    assert_eq!(e1, Duration::from_secs(10));
-    assert_eq!(e2, Duration::from_secs(10));
-    assert!(
-        !t3.is_finished(),
-        "Ask #3 expired prematurely before t=18s!"
-    );
-
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
     server.dm("P4", "ok");
     server.settle().await;
     let (r4, e4) = t4.await.unwrap();
     assert_eq!(r4.unwrap(), Answer::Ok(()));
-    assert_eq!(e4, Duration::from_secs(15));
+    assert_eq!(e4, Duration::from_secs(9));
+    assert!(!t1.is_finished());
+    assert!(!t2.is_finished());
     assert!(!t3.is_finished());
 
-    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    let (r1, e1) = t1.await.unwrap();
+    let (r2, e2) = t2.await.unwrap();
     let (r3, e3) = t3.await.unwrap();
+    assert_eq!(r1.unwrap(), Answer::TimedOut);
+    assert_eq!(r2.unwrap(), Answer::TimedOut);
     assert_eq!(r3.unwrap(), Answer::TimedOut);
-    assert_eq!(e3, Duration::from_secs(18));
+    assert_eq!(e1, Duration::from_secs(10));
+    assert_eq!(e2, Duration::from_secs(10));
+    assert_eq!(e3, Duration::from_secs(10));
 
     // Single-timer override on `ExclusiveDm::ask` + `Answer::required()`:
     let (bot2, server2) = test_harness("GM");
@@ -371,7 +370,6 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
         &AskConfig::new()
             .reply_timeout(Duration::from_secs(30))
             .timeout_message_fn(|ctx| {
-                assert_eq!(ctx.configured_timeout, Some(Duration::from_secs(30)));
                 assert_eq!(ctx.target, &Target::Channel("#r".into()));
                 let u = ctx.user.expect("room.ask_user sets TimeoutCtx::user");
                 format!("{} took too long (30s)!", u.nick())
@@ -660,7 +658,7 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
 
     // 3. `Huddle::ask` where `Wolf1` renames in flight (`401 Wolf1` -> re-sends to `AlphaWolf`) while
     //    `Wolf2` bounces `716`, then `AlphaWolf` also bounces `716` -> `Answer::Unreachable`:
-    let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
+    let mut pack = bot.huddle("Pack", [&w1, &w2]).await.unwrap();
     let huddle_fut = pack.ask("Target?", |m| Some(m.text.clone()));
     let drive_huddle = async {
         assert_eq!(server.recv_message_to("Wolf1").await, "Target?");

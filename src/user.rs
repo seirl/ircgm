@@ -9,14 +9,14 @@ use irc_colors::Text;
 use tokio::sync::watch;
 use tracing::Instrument as _;
 
-use crate::ask::{Ask, AskSource, IntoAskMatch};
+use crate::ask::{Ask, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::exclusive_dm::{acquire_dm_lease, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
 use crate::message::ChatMessage;
-use crate::outbound::{OutboundChatKind, WriteReceipt};
+use crate::outbound::OutboundChatKind;
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_RENAME_RETRIES: u8 = 3;
@@ -449,7 +449,7 @@ impl User {
         }
     }
 
-    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
+    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
         let core = self.upgrade_core()?;
         if let Some(err) = self.quit_error() {
             return Err(err);
@@ -480,17 +480,14 @@ impl User {
     /// Non-blocking one-way outbound DM (does NOT acquire `dm_mutex`).
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Privmsg, text.into())
-            .map(|_| ())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Notice, text.into())
-            .map(|_| ())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Action, text.into())
-            .map(|_| ())
     }
 
     /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`] initialized with
@@ -517,8 +514,7 @@ impl User {
         Ok(ExclusiveDm::from_lease(core, lease, caller))
     }
 
-    /// Acquires `exclusive()`, sends `prompt` in DM, starts the reply deadline *after*
-    /// `OutboundSink`'s write receipt resolves, and awaits one matching reply.
+    /// Acquires `exclusive()`, sends `prompt` in DM, and awaits one matching reply.
     #[track_caller]
     pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
     where
@@ -527,17 +523,12 @@ impl User {
         R::Output: Send + 'a,
     {
         let caller = Location::caller();
-        let base_cfg = self
+        let cfg = self
             .core
             .upgrade()
             .map(|c| (*c.ask_config).clone())
             .unwrap_or_default();
-        Ask::new(
-            AskSource::UserDm { user: self, caller },
-            base_cfg,
-            prompt.into(),
-            matcher,
-        )
+        Ask::from_user_dm(self, caller, cfg, prompt.into(), matcher)
     }
 
     /// Opens an unserialized DM [`Inbox`] tracking `NICK` changes and failing with

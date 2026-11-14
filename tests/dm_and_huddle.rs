@@ -217,11 +217,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
     assert!(bot.exclusive_available([&w3]).await.unwrap().is_empty());
 
     {
-        let mut pack = bot
-            .huddle_available([&w1, &w2, &w3])
-            .await
-            .unwrap()
-            .with_relay("[Pack] ");
+        let mut pack = bot.huddle_available("Pack", [&w1, &w2, &w3]).await.unwrap();
         assert_eq!(pack.len(), 2);
         assert!(!pack.is_empty());
 
@@ -255,18 +251,24 @@ async fn exclusive_many_available_and_huddle_semantics() {
         assert_eq!(killer, w2);
         assert_eq!(target, "Villager");
 
-        assert_eq!(server.take_messages_to("Wolf1"), vec!["Invalid target!"]);
+        assert_eq!(
+            server.take_messages_to("Wolf1"),
+            vec!["Invalid target!", "[Pack] <Wolf2> !kill Villager"]
+        );
         assert_eq!(
             server.take_messages_to("Wolf2"),
-            vec!["[Pack] <Wolf1> let's get Villager"]
+            vec![
+                "[Pack] <Wolf1> !status",
+                "[Pack] <Wolf1> let's get Villager",
+                "[Pack] <Wolf1> !kill Nobody",
+                "Invalid target!",
+            ]
         );
 
         pack.inbox().clear();
-        pack.set_relay_commands(true);
         server.dm("Wolf1", "!ping");
         server.settle().await;
-        let cmd_msg = pack.inbox().next_chat().await.unwrap();
-        pack.relay_to_others(&cmd_msg).unwrap();
+        let _cmd_msg = pack.inbox().next_chat().await.unwrap();
         assert_eq!(
             server.take_messages_to("Wolf2"),
             vec!["[Pack] <Wolf1> !ping"]
@@ -276,7 +278,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
     let _g = w1.exclusive().await.unwrap();
     drop(_g);
 
-    let mut empty_huddle = bot.huddle_available([&w3]).await.unwrap();
+    let mut empty_huddle = bot.huddle_available("Pack", [&w3]).await.unwrap();
     assert!(empty_huddle.is_empty());
     let empty_ans = empty_huddle.ask("Anyone?", |_| Some(())).await.unwrap();
     assert!(matches!(empty_ans, Answer::Left { ref nick, .. } if nick == "Wolf3"));

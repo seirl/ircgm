@@ -104,7 +104,7 @@ async fn crlf_splitting_ctcp_sanitization_and_396_wire_budget() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn priority_scheduling_same_channel_flush_and_write_receipts() {
+async fn priority_scheduling_same_channel_flush_and_quit_drain() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, _task) = OutboundSink::new(
         RawTransport::test_only(tx),
@@ -114,16 +114,14 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     );
 
     // Consume initial 2-message burst at t = 0:
-    let r1 = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
     );
-    let r2 = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
     );
-    r1.wait().await;
-    r2.wait().await;
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "m1".into())
@@ -143,29 +141,22 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
             Command::PART("#vault".into(), None),
         ],
     );
-    let r_prompt = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "urgent_prompt".into())],
     );
-    let r_rejoin = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::JOIN("#VAULT".into(), None, None)],
     );
-    let r_quit = sink.enqueue_quit(Some("bye"));
+    let r_quit = sink.enqueue_quit(Some("bye")).unwrap();
 
     assert!(rx.try_recv().is_err());
-
-    let start = Instant::now();
-    let prompt_task = tokio::spawn(async move {
-        r_prompt.wait().await;
-        start.elapsed()
-    });
 
     // t = 8s -> `urgent_prompt` + same-channel `KICK #vault Alice` pulled ahead of `JOIN #VAULT`:
     tokio::time::advance(Duration::from_secs(8)).await;
     tokio::task::yield_now().await;
 
-    assert_eq!(prompt_task.await.unwrap(), Duration::from_secs(8));
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "urgent_prompt".into())
@@ -178,7 +169,7 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
 
     // t = 16s -> `PART #vault`, then `JOIN #VAULT`:
     tokio::time::advance(Duration::from_secs(8)).await;
-    r_rejoin.wait().await;
+    tokio::task::yield_now().await;
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::PART("#vault".into(), None)
@@ -202,7 +193,7 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
 
     // t = 32s -> QUIT drains last!
     tokio::time::advance(Duration::from_secs(8)).await;
-    r_quit.wait().await;
+    r_quit.await.unwrap();
     assert_eq!(rx.try_recv().unwrap(), Command::QUIT(Some("bye".into())));
 }
 
@@ -220,37 +211,33 @@ async fn join_followed_by_later_background_part_preserves_join_before_part() {
     sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "warmup".into())],
-    )
-    .wait()
-    .await;
+    );
     let _ = rx.try_recv().unwrap();
 
     // Now rate-limited: enqueue `JOIN #c` (Interactive), THEN `PART #c` (Background):
-    let r_join = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![Command::JOIN("#c".into(), None, None)],
     );
-    let r_part = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Background,
         vec![Command::PART("#c".into(), None)],
     );
 
     tokio::time::advance(Duration::from_secs(8)).await;
-    r_join.wait().await;
+    tokio::task::yield_now().await;
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::JOIN("#c".into(), None, None)
     );
 
     tokio::time::advance(Duration::from_secs(8)).await;
-    r_part.wait().await;
+    tokio::task::yield_now().await;
     assert_eq!(rx.try_recv().unwrap(), Command::PART("#c".into(), None));
 }
 
 #[tokio::test(start_paused = true)]
-async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_synchronously() {
-    // `burst == usize::MAX` never throttles, so no pacer task is spawned and every batch is
-    // written synchronously without allocating a `oneshot`:
+async fn unthrottled_sink_skips_pacer_and_flushes_synchronously() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, task) = OutboundSink::new(
         RawTransport::test_only(tx),
@@ -259,14 +246,13 @@ async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_syn
         AtomicCaseMap::default(),
     );
     assert!(task.is_none());
-    let r = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Interactive,
         vec![
             Command::PRIVMSG("#lobby".into(), "a".into()),
             Command::PRIVMSG("#lobby".into(), "b".into()),
         ],
     );
-    assert!(r.rx.is_none());
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "a".into())
@@ -276,8 +262,6 @@ async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_syn
         Command::PRIVMSG("#lobby".into(), "b".into())
     );
 
-    // Throttled sink: synchronously flushed batches still skip the `oneshot`, while a batch left
-    // queued behind the rate limit gets a real receipt resolved by the pacer:
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     let (sink2, task2) = OutboundSink::new(
         RawTransport::test_only(tx2),
@@ -286,23 +270,21 @@ async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_syn
         AtomicCaseMap::default(),
     );
     assert!(task2.is_some());
-    let r_sync = sink2.enqueue_batch(
+    sink2.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
     );
-    assert!(r_sync.rx.is_none());
-    let r_queued = sink2.enqueue_batch(
+    sink2.enqueue_batch(
         Priority::Interactive,
         vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
     );
-    assert!(r_queued.rx.is_some());
     sink2.enqueue_one(
         Priority::Interactive,
         Command::PRIVMSG("#lobby".into(), "m3".into()),
     );
 
     tokio::time::advance(Duration::from_secs(8)).await;
-    r_queued.wait().await;
+    tokio::task::yield_now().await;
     assert_eq!(
         rx2.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "m1".into())

@@ -7,11 +7,12 @@ use std::time::Duration;
 use irc_colors::Text;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::ask::{Ask, AskConfig, AskSource, IntoAskMatch};
+use crate::ask::{Ask, AskConfig, IntoAskMatch};
 use crate::bot::BotCore;
+use crate::chat::{Chat, InboxRef};
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, Target};
 use crate::user::{User, UserStatus, UserTrack};
 
 /// Held lock on a [`User`]'s interactive DM prompt slot (`UserTrack::dm_mutex`).
@@ -47,7 +48,6 @@ impl DmLease {
 /// RAII guard holding exclusive access to a [`User`]'s interactive DM prompt slot
 /// plus a pre-subscribed [`Inbox`] and local [`AskConfig`].
 pub struct ExclusiveDm {
-    core: Arc<BotCore>,
     lease: DmLease,
     inbox: Inbox,
     ask_config: AskConfig,
@@ -80,15 +80,10 @@ impl ExclusiveDm {
         let ask_config = (*core.ask_config).clone();
         ask_config.apply_to_locked_inbox(&mut inbox);
         Self {
-            core,
             lease,
             inbox,
             ask_config,
         }
-    }
-
-    pub(crate) fn split_for_ask(&mut self) -> (&Arc<BotCore>, &User, &mut Inbox) {
-        (&self.core, &self.lease.user, &mut self.inbox)
     }
 
     pub fn user(&self) -> &User {
@@ -137,23 +132,45 @@ impl ExclusiveDm {
         self.user().action(text)
     }
 
+    #[track_caller]
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
     where
         F: FnMut(&ChatMessage) -> R + Send + 'a,
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        let base_cfg = self.ask_config.clone();
-        Ask::new(
-            AskSource::BorrowedDm { dm: self },
-            base_cfg,
-            prompt.into(),
-            matcher,
-        )
+        let cfg = self.ask_config.clone();
+        Ask::from_chat_with_config(self, cfg, prompt.into(), matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {
         &mut self.inbox
+    }
+}
+
+impl Chat for ExclusiveDm {
+    fn say(&self, text: impl Into<Text>) -> Result<()> {
+        ExclusiveDm::say(self, text)
+    }
+
+    fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        ExclusiveDm::notice(self, text)
+    }
+
+    fn action(&self, text: impl Into<Text>) -> Result<()> {
+        ExclusiveDm::action(self, text)
+    }
+
+    fn inbox(&mut self) -> InboxRef<'_> {
+        InboxRef::Borrowed(&mut self.inbox)
+    }
+
+    fn target(&self) -> Target {
+        Target::Dm
+    }
+
+    fn participants(&self) -> Option<Vec<User>> {
+        Some(vec![self.user().clone()])
     }
 }
 
