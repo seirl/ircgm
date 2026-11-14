@@ -872,8 +872,49 @@ impl Inbox {
         self.wait_map(|m| Some(m.clone())).await
     }
 
+    /// Non-blocking counterpart to [`Inbox::next_chat`]: returns `Ok(Some(msg))` if a matching
+    /// chat message (honoring [`Inbox::ignore_commands`] and [`Inbox::accept_notices`]) is already
+    /// buffered, `Ok(None)` if no matching message is currently queued, or `Err(...)` on lag,
+    /// departure, or disconnect.
+    pub fn try_next_chat(&mut self) -> Result<Option<ChatMessage>> {
+        let ignore_commands = self.ignore_commands;
+        let accept_notices = self.accept_notices;
+        while let Some(wire) = self.try_next_wire()? {
+            let candidate = match &wire.kind {
+                WireKind::Event(Event::Chat(msg)) => Some(msg),
+                WireKind::Event(Event::Notice { .. }) if accept_notices => wire.human_notice(),
+                _ => None,
+            };
+            let Some(msg) = candidate else {
+                continue;
+            };
+            if ignore_commands
+                && self
+                    .sub
+                    .core()
+                    .is_some_and(|c| c.is_command_text(&msg.text))
+            {
+                continue;
+            }
+            return Ok(Some(msg.clone()));
+        }
+        Ok(None)
+    }
+
     pub async fn next_event(&mut self) -> Result<Event> {
         self.wait_event_map(|ev| Some(ev.clone())).await
+    }
+
+    /// Non-blocking counterpart to [`Inbox::next_event`]: returns `Ok(Some(event))` if a public
+    /// [`Event`] is already buffered, `Ok(None)` if the queue is currently empty, or `Err(...)` on
+    /// lag, departure, or disconnect.
+    pub fn try_next_event(&mut self) -> Result<Option<Event>> {
+        while let Some(wire) = self.try_next_wire()? {
+            if let Some(ev) = wire.to_public_event() {
+                return Ok(Some(ev));
+            }
+        }
+        Ok(None)
     }
 
     /// Lossy supervision stop-trigger: enables `.lossy()` internally (so burst lag logs a warning
@@ -931,6 +972,11 @@ impl Inbox {
         Ok(Arc::clone(&wire.raw))
     }
 
+    /// Non-blocking counterpart to [`Inbox::next_raw`].
+    pub fn try_next_raw(&mut self) -> Result<Option<Arc<Message>>> {
+        Ok(self.try_next_wire()?.map(|wire| Arc::clone(&wire.raw)))
+    }
+
     pub async fn wait_raw_map<F, T>(&mut self, mut f: F) -> Result<T>
     where
         F: FnMut(&Message) -> Option<T>,
@@ -944,17 +990,16 @@ impl Inbox {
         }
     }
 
-    /// Cancel-safe raw wire frame poller.
-    pub(crate) fn poll_next_wire(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<WireEvent>>> {
+    fn pre_recv_check(&mut self) -> Result<()> {
         let skipped = self.dropped.swap(0, Ordering::AcqRel);
         if skipped > 0 {
             match self.lag_policy {
                 LagPolicy::Strict => {
-                    return Poll::Ready(Err(Error::Lagged {
+                    return Err(Error::Lagged {
                         scope: self.scope_label.clone(),
                         skipped,
                         opened_at: self.opened_at,
-                    }));
+                    });
                 }
                 LagPolicy::Lossy => {
                     tracing::warn!(
@@ -968,33 +1013,61 @@ impl Inbox {
         }
 
         if let Some(err) = self.latched_departure.take() {
-            return Poll::Ready(Err(err));
+            return Err(err);
         }
 
-        let polled = match &mut self.sub {
-            InboxSub::Active { rx, .. } => rx.poll_recv(cx),
-            InboxSub::Disconnected => {
-                return Poll::Ready(Err(Error::Disconnected(DisconnectReason::BotDropped)));
-            }
-            InboxSub::InvalidSession => {
-                return Poll::Ready(Err(Error::InvalidInput(
-                    "handle belongs to a different Bot session",
-                )));
-            }
+        match &self.sub {
+            InboxSub::Active { .. } => Ok(()),
+            InboxSub::Disconnected => Err(Error::Disconnected(DisconnectReason::BotDropped)),
+            InboxSub::InvalidSession => Err(Error::InvalidInput(
+                "handle belongs to a different Bot session",
+            )),
+        }
+    }
+
+    fn disconnected_error(&self) -> Error {
+        let reason = self
+            .sub
+            .core()
+            .and_then(|c| c.disconnect_reason())
+            .unwrap_or(DisconnectReason::BotDropped);
+        Error::Disconnected(reason)
+    }
+
+    /// Non-blocking wire frame popper sharing lag, latched-departure, and exhaustion semantics with
+    /// [`Inbox::poll_next_wire`].
+    pub(crate) fn try_next_wire(&mut self) -> Result<Option<Arc<WireEvent>>> {
+        self.pre_recv_check()?;
+        let InboxSub::Active { rx, .. } = &mut self.sub else {
+            unreachable!("checked by pre_recv_check")
         };
-        match polled {
+        match rx.try_recv() {
+            Ok(wire) => {
+                self.latch_in_stream_departure(&wire);
+                Ok(Some(wire))
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(self.disconnected_error()),
+            Err(mpsc::error::TryRecvError::Empty) => match self.check_scope_exhausted() {
+                Some(err) => Err(err),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Cancel-safe raw wire frame poller.
+    pub(crate) fn poll_next_wire(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<WireEvent>>> {
+        if let Err(err) = self.pre_recv_check() {
+            return Poll::Ready(Err(err));
+        }
+        let InboxSub::Active { rx, .. } = &mut self.sub else {
+            unreachable!("checked by pre_recv_check")
+        };
+        match rx.poll_recv(cx) {
             Poll::Ready(Some(wire)) => {
                 self.latch_in_stream_departure(&wire);
                 Poll::Ready(Ok(wire))
             }
-            Poll::Ready(None) => {
-                let reason = self
-                    .sub
-                    .core()
-                    .and_then(|c| c.disconnect_reason())
-                    .unwrap_or(DisconnectReason::BotDropped);
-                Poll::Ready(Err(Error::Disconnected(reason)))
-            }
+            Poll::Ready(None) => Poll::Ready(Err(self.disconnected_error())),
             Poll::Pending => {
                 if let Some(err) = self.check_scope_exhausted() {
                     return Poll::Ready(Err(err));

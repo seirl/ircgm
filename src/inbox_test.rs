@@ -349,3 +349,66 @@ async fn exact_role_buckets_route_only_matching_inboxes_and_prune_on_drop() {
     assert!(inner.users.is_empty());
     assert!(inner.all.is_empty() && inner.all_dms.is_empty());
 }
+
+#[tokio::test]
+async fn try_next_chat_event_and_raw_drain_without_blocking_and_preserve_errors() {
+    let (bot, srv) = test_harness("gm");
+    srv.complete_join("#lobby", &["alice", "bob"]);
+    srv.settle().await;
+
+    let room = bot.room("#lobby").unwrap();
+    let alice = bot.user("alice").unwrap();
+    let mut chat_in = room.inbox().ignore_commands().accept_notices();
+    let mut event_in = room.inbox();
+    let mut raw_in = room.inbox();
+    let mut alice_in = room.inbox_user(&alice);
+
+    assert!(chat_in.try_next_chat().unwrap().is_none());
+    assert!(event_in.try_next_event().unwrap().is_none());
+    assert!(raw_in.try_next_raw().unwrap().is_none());
+
+    srv.chat("alice", "#lobby", "!skipped");
+    srv.join_user("carol", "#lobby");
+    srv.notice("bob", "#lobby", "heads up");
+    srv.chat("alice", "#lobby", "hello");
+    srv.part_user("alice", "#lobby", Some("brb"));
+    srv.settle().await;
+
+    // `try_next_chat` skips `!skipped`, `JOIN`, and `PART`, while honoring `accept_notices`:
+    let mut drained = Vec::new();
+    while let Some(msg) = chat_in.try_next_chat().unwrap() {
+        drained.push((msg.nick, msg.text));
+    }
+    assert_eq!(
+        drained,
+        vec![
+            ("bob".into(), "heads up".into()),
+            ("alice".into(), "hello".into()),
+        ]
+    );
+    assert!(chat_in.try_next_chat().unwrap().is_none());
+
+    // `try_next_event` drains all 5 public events in wire order, then returns `Ok(None)`:
+    let mut events = 0;
+    while event_in.try_next_event().unwrap().is_some() {
+        events += 1;
+    }
+    assert_eq!(events, 5);
+    assert!(event_in.try_next_event().unwrap().is_none());
+
+    // `try_next_raw` drains all 5 raw wire messages:
+    let mut raws = 0;
+    while raw_in.try_next_raw().unwrap().is_some() {
+        raws += 1;
+    }
+    assert_eq!(raws, 5);
+
+    // `alice_in` (`UsersInRoom`) delivers Alice's buffered messages and then surfaces `UserLeft`:
+    assert_eq!(alice_in.try_next_chat().unwrap().unwrap().text, "!skipped");
+    assert_eq!(alice_in.try_next_chat().unwrap().unwrap().text, "hello");
+    assert!(matches!(
+        alice_in.try_next_chat(),
+        Err(Error::UserLeft { ref nick, ref reason })
+            if nick == "alice" && reason.as_deref() == Some("brb")
+    ));
+}
