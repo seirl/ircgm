@@ -270,3 +270,98 @@ async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
         assert_eq!(server.recv_sent().await, Some(expected));
     }
 }
+
+#[tokio::test]
+async fn ask_config_getters_let_handles_derive_tweaked_configs() {
+    let (bot, _server) = test_harness("gm");
+    let limit = |cfg: &AskConfig| match cfg.time_limit {
+        TimeLimit::Duration(d) => Some(d),
+        TimeLimit::Deadline(_) | TimeLimit::None => None,
+    };
+    assert_eq!(limit(bot.ask_config()), Some(Duration::from_secs(300)));
+
+    // Clone-and-tweak: a derived room view keeps the source's timeout and flags, adds one more,
+    // and leaves the source untouched.
+    let lobby = bot.room("#lobby").unwrap().with_ask_config(
+        &bot.ask_config()
+            .clone()
+            .reply_timeout(Duration::from_secs(9))
+            .ignore_commands(),
+    );
+    let tuned = lobby.with_ask_config(&lobby.ask_config().clone().accept_notices());
+    assert_eq!(limit(tuned.ask_config()), Some(Duration::from_secs(9)));
+    assert!(tuned.ask_config().ignore_commands);
+    assert!(tuned.ask_config().accept_notices);
+    assert!(!lobby.ask_config().accept_notices);
+
+    // Same on a DM and a huddle, whose shortcut builders show up in the reported config:
+    let alice = bot.user("alice").unwrap();
+    let mut dm = alice.exclusive().await.unwrap().accept_notices();
+    let shorter = dm.ask_config().clone().reply_timeout(Duration::from_secs(5));
+    dm.set_ask_config(&shorter);
+    assert_eq!(limit(dm.ask_config()), Some(Duration::from_secs(5)));
+    assert!(dm.ask_config().accept_notices);
+    drop(dm);
+
+    let mut pack = bot.huddle([&alice]).await.unwrap().ignore_commands();
+    let shorter = pack.ask_config().clone().reply_timeout(Duration::from_secs(5));
+    pack.set_ask_config(&shorter);
+    assert_eq!(limit(pack.ask_config()), Some(Duration::from_secs(5)));
+    assert!(pack.ask_config().ignore_commands);
+}
+
+#[tokio::test]
+async fn inherited_flags_can_be_undone_per_prompt_and_per_inbox() {
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#lobby", &["alice"]);
+    server.settle().await;
+    let alice = bot.user("alice").unwrap();
+    let room = bot
+        .room("#lobby")
+        .unwrap()
+        .with_ask_config(&AskConfig::new().ignore_commands());
+
+    // A prompt can match commands although its room ignores them:
+    let ask = room.ask("Go?", |m| Some(m.text.clone())).allow_commands();
+    let drive = async {
+        assert_eq!(server.recv_message_to("#lobby").await, "Go?");
+        server.chat("alice", "#lobby", "!go");
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(ask, drive);
+    assert_eq!(ans.unwrap().unwrap(), "!go");
+
+    // Room inboxes inherit the room's flags; both an in-place setter and a room view derived
+    // with `allow_commands()` switch skipping back off:
+    let mut inherited = room.inbox();
+    let mut derived = room
+        .with_ask_config(&room.ask_config().clone().allow_commands())
+        .inbox();
+    let mut skipping = room.inbox();
+    inherited.set_ignore_commands(false);
+    server.chat("alice", "#lobby", "!cmd");
+    server.chat("alice", "#lobby", "plain");
+    server.settle().await;
+    assert_eq!(inherited.next_chat().await.unwrap().text, "!cmd");
+    assert_eq!(derived.next_chat().await.unwrap().text, "!cmd");
+    assert_eq!(skipping.next_chat().await.unwrap().text, "plain");
+
+    // A DM that accepts notices can stop again, both on its borrowed inbox and per prompt:
+    let mut dm = alice.exclusive().await.unwrap().accept_notices();
+    dm.inbox().set_accept_notices(false);
+    server.notice("alice", "gm", "n1");
+    server.dm("alice", "p1");
+    server.settle().await;
+    assert_eq!(dm.inbox().next_chat().await.unwrap().text, "p1");
+
+    dm.inbox().set_accept_notices(true);
+    let ask = dm.ask("Pick?", |m| Some(m.text.clone())).ignore_notices();
+    let drive = async {
+        assert_eq!(server.recv_message_to("alice").await, "Pick?");
+        server.notice("alice", "gm", "n2");
+        server.dm("alice", "p2");
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(ask, drive);
+    assert_eq!(ans.unwrap().unwrap(), "p2");
+}

@@ -485,6 +485,12 @@ impl Bot {
         self.owner.core.casemap()
     }
 
+    /// The session-wide [`AskConfig`] (`BotConfig::ask_config`) that new rooms, DMs, and
+    /// huddles start from. Clone it to derive a tweaked config for one handle.
+    pub fn ask_config(&self) -> &AskConfig {
+        &self.owner.core.ask_config
+    }
+
     pub fn room(&self, channel: &str) -> Result<Room> {
         validate_target(channel, "channel name")?;
         let core = &self.owner.core;
@@ -746,7 +752,7 @@ impl Bot {
                 channel: Some(chan_name.clone()),
             };
 
-            let mut room = match self
+            let room = match self
                 .join_inner(&chan_name, None, opts.setup_timeout, JoinMode::Exclusive)
                 .await
             {
@@ -776,10 +782,6 @@ impl Bot {
 
             if let Some(ref mode_flags) = opts.modes {
                 room.set_mode(mode_flags, &[])?;
-            }
-
-            if let Some(ref cfg) = opts.ask_config {
-                room = room.with_ask_config(cfg);
             }
 
             rollback.channel = None;
@@ -828,7 +830,11 @@ impl Bot {
     }
 
     #[track_caller]
-    pub fn inbox_rooms<'a, I: IntoIterator<Item = &'a Room>>(&self, rooms: I) -> Inbox {
+    pub fn inbox_rooms<I, R>(&self, rooms: I) -> Inbox
+    where
+        I: IntoIterator<Item = R>,
+        R: Borrow<Room>,
+    {
         let caller = Location::caller();
         let scope = InboxScope::new().rooms(rooms);
         self.inbox_scope_at(scope, caller)

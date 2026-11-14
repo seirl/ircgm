@@ -97,7 +97,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     let b1_task = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(BreakoutOptions::exact("#b1").modes(None::<&str>))
+            bot.breakout_with(BreakoutOptions::exact("#b1").no_modes())
                 .await
         }
     });
@@ -130,7 +130,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     let b2_task = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(BreakoutOptions::exact("#b2").modes(None::<&str>))
+            bot.breakout_with(BreakoutOptions::exact("#b2").no_modes())
                 .await
         }
     });
@@ -219,7 +219,7 @@ async fn breakout_invite_and_wait_vs_invite_available_and_room_invite() {
     let vault_task = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(BreakoutOptions::exact("#vault").modes(None::<&str>))
+            bot.breakout_with(BreakoutOptions::exact("#vault").no_modes())
                 .await
         }
     });

@@ -291,7 +291,7 @@ async fn priority_scheduling_supervision_and_bot_quit_drain() {
     let vault_task = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(BreakoutOptions::exact("#vault").modes(None::<&str>))
+            bot.breakout_with(BreakoutOptions::exact("#vault").no_modes())
                 .await
         }
     });

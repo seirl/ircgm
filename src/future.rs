@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
+
 use tokio::time::{Instant, Sleep};
 
 use crate::error::{Error, Result};
@@ -49,7 +50,8 @@ impl<F: Future> Future for RaceAll<F> {
     }
 }
 
-/// Future returned by [`Until::or_until`], polling `first` before `second` (`biased` left-to-right).
+/// Future returned by [`Until::or_until`], polling `first` before `second` (`biased`
+/// left-to-right).
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct OrUntil<S1, S2> {
     first: Pin<Box<S1>>,
@@ -111,35 +113,6 @@ impl<G: Future, S: Future> Future for Until<G, S> {
     }
 }
 
-/// Future returned by [`GameFutureExt::map_output`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct MapOutput<F, M> {
-    fut: Pin<Box<F>>,
-    mapper: Option<M>,
-}
-
-impl<F, U, M> Future for MapOutput<F, M>
-where
-    F: Future,
-    M: FnOnce(F::Output) -> U + Unpin,
-{
-    type Output = U;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        match this.fut.as_mut().poll(cx) {
-            Poll::Ready(val) => {
-                let mapper = this
-                    .mapper
-                    .take()
-                    .expect("MapOutput polled after completion");
-                Poll::Ready(mapper(val))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 /// Safely computes `base + duration`, saturating far in the future instead of panicking on huge
 /// durations like `Duration::MAX` (matching `tokio::time::sleep`'s far-future saturation).
 pub(crate) fn deadline_after_from(base: Instant, duration: Duration) -> Instant {
@@ -152,6 +125,8 @@ pub(crate) fn deadline_after(duration: Duration) -> Instant {
     deadline_after_from(Instant::now(), duration)
 }
 
+/// Shared core of [`WithTimeout`] and [`RunFor`]: `fut` raced against a `deadline` fixed at
+/// construction. The timer itself is only armed on first poll.
 struct Timed<F> {
     fut: Pin<Box<F>>,
     deadline: Instant,
@@ -167,16 +142,16 @@ impl<F: Future> Timed<F> {
         }
     }
 
-    /// Polls `self.fut` first; if pending, polls the deadline timer (`Ok(val)` from `fut`, `Err(())` on expiry).
+    /// Polls `self.fut` first; if pending, polls the deadline timer (`Ok(val)` from `fut`,
+    /// `Err(())` on expiry).
     fn poll_timed(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<F::Output, ()>> {
+        if let Poll::Ready(res) = self.fut.as_mut().poll(cx) {
+            return Poll::Ready(Ok(res));
+        }
         let deadline = self.deadline;
         let sleep = self
             .sleep
             .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-
-        if let Poll::Ready(res) = self.fut.as_mut().poll(cx) {
-            return Poll::Ready(Ok(res));
-        }
         if sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(()));
         }
@@ -234,19 +209,11 @@ where
 pub trait GameFutureExt: Future + Sized {
     /// Races `self` against `stop` using `biased` selection (`stop` wins ties); chain
     /// `.or_until(...)` on the returned [`Until`] to attach arbitrarily many stop triggers.
+    /// Tag heterogeneous stop futures into one stop enum with `futures::FutureExt::map`.
     fn until<S: Future>(self, stop: S) -> Until<Self, S> {
         Until {
             game: Box::pin(self),
             stop: Box::pin(stop),
-        }
-    }
-
-    /// Lightweight output mapper (`Future<Output = A> -> Future<Output = U>`), handy for tagging
-    /// heterogeneous stop futures into a flat stop enum.
-    fn map_output<U, F: FnOnce(Self::Output) -> U + Unpin>(self, f: F) -> MapOutput<Self, F> {
-        MapOutput {
-            fut: Box::pin(self),
-            mapper: Some(f),
         }
     }
 

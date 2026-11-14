@@ -19,6 +19,15 @@ async fn inbox_scope_deduplicates_case_folded_rooms_and_same_user() {
 
     assert_eq!(scope.rooms.len(), 2);
     assert_eq!(scope.dm_users.len(), 2);
+
+    // Rooms, like users, can be passed owned as well as borrowed:
+    let owned = InboxScope::new()
+        .rooms(vec![r1.clone(), r3.clone()])
+        .dms_from(vec![bob.clone()]);
+    assert_eq!(owned.rooms.len(), 2);
+    assert_eq!(owned.dm_users.len(), 1);
+    let rooms_inbox = bot.inbox_rooms(vec![r1.clone(), r3.clone()]);
+    assert_eq!(rooms_inbox.scope_label, "rooms #Lobby, #Arena");
 }
 
 #[tokio::test]

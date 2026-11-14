@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use irc::proto::Command;
 use ircgm::prelude::*;
 use ircgm::testing::test_harness;
@@ -86,10 +87,10 @@ async fn external_supervisor_cancels_running_minigame_and_tears_down_breakout_on
             let starter_abort = alice
                 .inbox()
                 .on_cmd("!abort")
-                .map_output(|_| ExternalStop::StarterAbort);
+                .map(|_| ExternalStop::StarterAbort);
 
             run_heist(&bot, &lobby, &alice, &bob, Wire::Red)
-                .until(bot.shutdown_requested().map_output(|()| ExternalStop::Shutdown))
+                .until(bot.shutdown_requested().map(|()| ExternalStop::Shutdown))
                 .or_until(admin_stop)
                 .or_until(starter_abort)
                 .await

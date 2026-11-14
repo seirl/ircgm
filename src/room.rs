@@ -130,6 +130,12 @@ impl Room {
         self.core.casemap()
     }
 
+    /// The [`AskConfig`] this room's prompts and inboxes start from. Clone it to derive a
+    /// tweaked view: `room.with_ask_config(&room.ask_config().clone().reply_timeout(dur))`.
+    pub fn ask_config(&self) -> &AskConfig {
+        &self.ask_config
+    }
+
     /// Derives a lightweight `Room` view carrying `cfg` as its local [`AskConfig`].
     pub fn with_ask_config(&self, cfg: &AskConfig) -> Self {
         Self {

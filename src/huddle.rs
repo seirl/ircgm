@@ -201,6 +201,12 @@ impl Huddle {
         self.leases.is_empty()
     }
 
+    /// The [`AskConfig`] this huddle's prompts and inbox reads use. Clone it to derive a tweaked
+    /// one for [`Huddle::set_ask_config`].
+    pub fn ask_config(&self) -> &AskConfig {
+        &self.ask_config
+    }
+
     pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
         self.set_ask_config(cfg);
         self

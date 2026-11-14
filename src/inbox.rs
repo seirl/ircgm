@@ -45,9 +45,13 @@ impl InboxScope {
         self
     }
 
-    pub fn rooms<'a, I: IntoIterator<Item = &'a Room>>(mut self, rooms: I) -> Self {
+    pub fn rooms<I, R>(mut self, rooms: I) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: Borrow<Room>,
+    {
         for r in rooms {
-            self = self.room(r);
+            self = self.room(r.borrow());
         }
         self
     }
@@ -705,6 +709,18 @@ impl Inbox {
     pub fn accept_notices(mut self) -> Self {
         self.accept_notices = true;
         self
+    }
+
+    /// In-place form of [`Inbox::ignore_commands`], usable on a borrowed inbox
+    /// (`dm.inbox()`, `huddle.inbox()`) and able to switch skipping back off.
+    pub fn set_ignore_commands(&mut self, ignore: bool) {
+        self.ignore_commands = ignore;
+    }
+
+    /// In-place form of [`Inbox::accept_notices`], usable on a borrowed inbox and able to switch
+    /// notice delivery back off.
+    pub fn set_accept_notices(&mut self, accept: bool) {
+        self.accept_notices = accept;
     }
 
     pub fn lossy(mut self) -> Self {

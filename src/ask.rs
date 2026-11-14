@@ -327,6 +327,19 @@ impl AskConfig {
         self
     }
 
+    /// Undoes [`AskConfig::ignore_commands`]: command-prefixed lines are matched again (the
+    /// default).
+    pub fn allow_commands(mut self) -> Self {
+        self.ignore_commands = false;
+        self
+    }
+
+    /// Undoes [`AskConfig::accept_notices`]: human `NOTICE`s are skipped again (the default).
+    pub fn ignore_notices(mut self) -> Self {
+        self.accept_notices = false;
+        self
+    }
+
     pub fn timeout_message(mut self, msg: impl Into<Text>) -> Self {
         self.timeout_handler = Some(TimeoutHandler::Static(msg.into()));
         self
@@ -663,6 +676,17 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
     /// Opt-in human `NOTICE` acceptance for this prompt (`MessageKind::Notice`).
     pub fn accept_notices(self) -> Self {
         self.map_cfg(AskConfig::accept_notices)
+    }
+
+    /// Matches command-prefixed lines on this prompt even if the handle's [`AskConfig`] ignores
+    /// them.
+    pub fn allow_commands(self) -> Self {
+        self.map_cfg(AskConfig::allow_commands)
+    }
+
+    /// Skips human `NOTICE`s on this prompt even if the handle's [`AskConfig`] accepts them.
+    pub fn ignore_notices(self) -> Self {
+        self.map_cfg(AskConfig::ignore_notices)
     }
 
     /// Overrides the message sent to the target if *this `Ask`'s own reply timer* expires.

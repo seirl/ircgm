@@ -95,6 +95,12 @@ impl ExclusiveDm {
         self.lease.user()
     }
 
+    /// The [`AskConfig`] this DM's prompts and inbox reads use. Clone it to derive a tweaked
+    /// one for [`ExclusiveDm::set_ask_config`].
+    pub fn ask_config(&self) -> &AskConfig {
+        &self.ask_config
+    }
+
     pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
         self.set_ask_config(cfg);
         self

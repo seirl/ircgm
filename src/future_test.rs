@@ -1,10 +1,12 @@
+use futures::FutureExt as _;
+
 use super::*;
 use crate::error::DisconnectReason;
 
 #[tokio::test]
-async fn until_or_until_and_map_output() {
+async fn until_or_until_poll_stops_in_order() {
     let res = (async { 42 })
-        .until((async { 1 }).map_output(|n| format!("s{n}")))
+        .until((async { 1 }).map(|n| format!("s{n}")))
         .or_until(async { "s2".to_owned() })
         .or_until(async { "s3".to_owned() })
         .await;

@@ -68,8 +68,6 @@ pub struct BreakoutOptions {
     pub kick_on_drop: bool,
     pub kick_reason: Text,
     pub setup_timeout: Duration,
-    /// Optional local [`AskConfig`] applied to the created [`Breakout`].
-    pub ask_config: Option<AskConfig>,
 }
 
 impl BreakoutOptions {
@@ -83,7 +81,6 @@ impl BreakoutOptions {
             kick_on_drop: true,
             kick_reason: Text::from("Session ended"),
             setup_timeout: Duration::from_secs(15),
-            ask_config: None,
         }
     }
 
@@ -95,12 +92,13 @@ impl BreakoutOptions {
             kick_on_drop: true,
             kick_reason: Text::from("Session ended"),
             setup_timeout: Duration::from_secs(15),
-            ask_config: None,
         }
     }
 
-    pub fn modes(mut self, modes: Option<impl Into<String>>) -> Self {
-        self.modes = modes.map(Into::into);
+    /// Sets the modes applied upon creation (e.g. `"+im"`); see [`BreakoutOptions::no_modes`]
+    /// to apply none.
+    pub fn modes(mut self, modes: impl Into<String>) -> Self {
+        self.modes = Some(modes.into());
         self
     }
 
@@ -127,11 +125,6 @@ impl BreakoutOptions {
 
     pub fn setup_timeout(mut self, timeout: Duration) -> Self {
         self.setup_timeout = timeout;
-        self
-    }
-
-    pub fn ask_config(mut self, cfg: &AskConfig) -> Self {
-        self.ask_config = Some(cfg.clone());
         self
     }
 }

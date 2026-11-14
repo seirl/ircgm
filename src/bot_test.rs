@@ -256,7 +256,7 @@ async fn join_during_parting_breakout_rejoins_instead_of_returning_dying_room() 
     let setup = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(crate::BreakoutOptions::exact("#vault").modes(None::<&str>))
+            bot.breakout_with(crate::BreakoutOptions::exact("#vault").no_modes())
                 .await
         }
     });
@@ -327,7 +327,7 @@ async fn exact_breakout_on_already_joined_room_is_rejected_without_tearing_it_do
 
     // `BreakoutOptions::exact("#lobby")` must not adopt (and later KICK/PART) the active lobby:
     let res = bot
-        .breakout_with(crate::BreakoutOptions::exact("#LOBBY").modes(None::<&str>))
+        .breakout_with(crate::BreakoutOptions::exact("#LOBBY").no_modes())
         .await;
     assert!(matches!(res, Err(Error::InvalidInput(_))), "{res:?}");
     tokio::task::yield_now().await;
@@ -351,7 +351,7 @@ async fn exact_breakout_on_already_joined_room_is_rejected_without_tearing_it_do
         Some(Command::JOIN("#game".into(), None, None))
     );
     let res = bot
-        .breakout_with(crate::BreakoutOptions::exact("#game").modes(None::<&str>))
+        .breakout_with(crate::BreakoutOptions::exact("#game").no_modes())
         .await;
     assert!(matches!(res, Err(Error::InvalidInput(_))), "{res:?}");
     server.complete_join("#game", &[]);
@@ -375,7 +375,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     let setup = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(crate::BreakoutOptions::exact("#tmp").modes(None::<&str>))
+            bot.breakout_with(crate::BreakoutOptions::exact("#tmp").no_modes())
                 .await
         }
     });
@@ -391,7 +391,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     let setup = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(crate::BreakoutOptions::exact("#watched").modes(None::<&str>))
+            bot.breakout_with(crate::BreakoutOptions::exact("#watched").no_modes())
                 .await
         }
     });
@@ -444,7 +444,7 @@ async fn shared_join_refuses_to_coalesce_onto_breakout_pending_join() {
     let setup = tokio::spawn({
         let bot = bot.clone();
         async move {
-            bot.breakout_with(crate::BreakoutOptions::exact("#game").modes(None::<&str>))
+            bot.breakout_with(crate::BreakoutOptions::exact("#game").no_modes())
                 .await
         }
     });

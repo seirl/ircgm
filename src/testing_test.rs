@@ -50,7 +50,7 @@ async fn accept_breakout_and_presence_chat_helpers_preserve_unrelated_commands()
         async move {
             lobby.say("Opening breakout...")?;
             let vault = bot
-                .breakout_with(crate::BreakoutOptions::new("##vault").modes(Some("+im")))
+                .breakout_with(crate::BreakoutOptions::new("##vault").modes("+im"))
                 .await?;
             let mut inbox = vault.inbox().accept_notices();
             let act = inbox.next_chat().await?;

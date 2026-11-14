@@ -20,6 +20,7 @@
 
 use std::process::ExitCode;
 
+use futures::FutureExt as _;
 use ircgm::irc::client::data::Config as IrcConfig;
 use ircgm::prelude::*;
 use minigames::{play_by_name, PlayOutcome, GAMES};
@@ -530,7 +531,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
         };
 
         let outcome = game_with_busy_hint
-            .until(bot.shutdown_requested().map_output(|()| StopReason::Shutdown))
+            .until(bot.shutdown_requested().map(|()| StopReason::Shutdown))
             .or_until(admin_stop)
             .or_until(abort_stop)
             .await;
