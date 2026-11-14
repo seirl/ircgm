@@ -386,6 +386,16 @@ impl InboxRegistry {
                     .is_some_and(|v| !v.is_empty()))
     }
 
+    /// Returns `true` if a channel-scoped `Inbox` (`Room::inbox*`, `InboxScope::room`) watches
+    /// `channel`, i.e. someone still needs its `Left` state to report `BotLeftRoom`.
+    pub(crate) fn has_channel_listener(&self, channel: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .by_channel
+            .get(&inner.casemap.fold(channel))
+            .is_some_and(|v| !v.is_empty())
+    }
+
     pub(crate) fn rekey_casemap(&self, new_map: CaseMap) {
         let mut inner = self.inner.lock().unwrap();
         inner.casemap = new_map;
@@ -563,13 +573,10 @@ fn snapshot_departed_room_users(core: &BotCore, filter: &Filter) -> HashSet<u64>
         return HashSet::new();
     };
     let ws = core.state.read().unwrap();
-    let chan_key = ws.casemap.fold(channel_name);
-    let chan = ws.channels.get(&chan_key);
+    let members = ws.channel(channel_name).and_then(|c| c.members());
     let mut departed = HashSet::new();
     for track in tracks {
-        if !track.is_online()
-            || chan.is_some_and(|c| c.names_synced && !c.members.contains_key(&track.id))
-        {
+        if !track.is_online() || members.is_some_and(|m| !m.contains_key(&track.id)) {
             departed.insert(track.id);
         }
     }
@@ -1039,9 +1046,9 @@ impl Inbox {
                             rooms.iter().any(|r| {
                                 !ws.casemap.str_eq(r, channel)
                                     && ws
-                                        .lost_channels
-                                        .get(&ws.casemap.fold(r))
-                                        .is_none_or(|lost| lost.at_seq > wire.seq)
+                                        .channel(r)
+                                        .and_then(|c| c.left_at_seq())
+                                        .is_none_or(|at_seq| at_seq > wire.seq)
                             })
                         };
                         let any_live_user = dm_users.iter().any(|t| {
@@ -1063,9 +1070,9 @@ impl Inbox {
                         let any_live_room = {
                             let ws = core.state.read().unwrap();
                             rooms.iter().any(|r| {
-                                ws.lost_channels
-                                    .get(&ws.casemap.fold(r))
-                                    .is_none_or(|lost| lost.at_seq > wire.seq)
+                                ws.channel(r)
+                                    .and_then(|c| c.left_at_seq())
+                                    .is_none_or(|at_seq| at_seq > wire.seq)
                             })
                         };
                         let any_live_user = dm_users.iter().any(|t| {
@@ -1104,14 +1111,11 @@ impl Inbox {
                     return None;
                 }
                 let ws = core.state.read().unwrap();
-                let chan_key = ws.casemap.fold(channel_name);
-                if let Some(lost) = ws.lost_channels.get(&chan_key) {
-                    return Some(Error::BotLeftRoom {
-                        channel: lost.name.clone(),
-                        reason: lost.reason.clone(),
-                    });
+                let chan = ws.channel(channel_name);
+                if let Some(err) = chan.and_then(|c| c.left_error()) {
+                    return Some(err);
                 }
-                let chan = ws.channels.get(&chan_key);
+                let members = chan.and_then(|c| c.members());
                 let mut live_tracks = 0usize;
                 let mut fallback_left: Option<(String, Option<String>)> = None;
                 for track in tracks {
@@ -1119,13 +1123,11 @@ impl Inbox {
                         fallback_left = Some((nick, reason));
                         continue;
                     }
-                    if let Some(c) = chan {
-                        if c.names_synced && !c.members.contains_key(&track.id) {
-                            if fallback_left.is_none() {
-                                fallback_left = Some((track.nick(), None));
-                            }
-                            continue;
+                    if members.is_some_and(|m| !m.contains_key(&track.id)) {
+                        if fallback_left.is_none() {
+                            fallback_left = Some((track.nick(), None));
                         }
+                        continue;
                     }
                     live_tracks += 1;
                 }
@@ -1148,11 +1150,11 @@ impl Inbox {
                 let mut live_rooms = 0usize;
                 let mut last_lost_room: Option<(String, Option<String>)> = None;
                 for r in rooms {
-                    let key = ws.casemap.fold(r);
-                    if let Some(lost) = ws.lost_channels.get(&key) {
-                        last_lost_room = Some((lost.name.clone(), lost.reason.clone()));
-                    } else {
-                        live_rooms += 1;
+                    match ws.channel(r).and_then(|c| c.left_error()) {
+                        Some(Error::BotLeftRoom { channel, reason }) => {
+                            last_lost_room = Some((channel, reason));
+                        }
+                        _ => live_rooms += 1,
                     }
                 }
 

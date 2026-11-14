@@ -15,7 +15,7 @@ use crate::outbound::{
     sanitize_reason, sanitize_text, validate_param, validate_target, OutboundChatKind, Priority,
     WriteReceipt,
 };
-use crate::state::Occupant;
+use crate::state::BotPresence;
 use crate::user::User;
 
 /// Snapshot of a channel occupant in `WorldState`, preserving [`User`] identity and status prefixes.
@@ -64,28 +64,10 @@ impl Room {
         self.channel_name
     }
 
-    fn self_occupant<'a>(
-        ws: &'a crate::state::WorldState,
-        chan: &'a crate::state::ChannelState,
-    ) -> Option<&'a Occupant> {
-        if let Some(self_id) = ws.self_track_id {
-            chan.members.get(&self_id)
-        } else {
-            chan.member_by_nick(&ws.current_nick)
-        }
-    }
-
     pub(crate) fn ensure_bot_in_room_if_tracked(&self) -> Result<()> {
         self.core.check_connected()?;
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        if let Some(lost) = ws.lost_channels.get(&key) {
-            return Err(Error::BotLeftRoom {
-                channel: lost.name.clone(),
-                reason: lost.reason.clone(),
-            });
-        }
-        Ok(())
+        ws.check_bot_in_channel(&self.channel_name, BotPresence::Tracked)
     }
 
     pub(crate) fn ensure_user_askable(&self, user: &User) -> Result<()> {
@@ -94,28 +76,13 @@ impl Room {
             return Err(err);
         }
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        if let Some(lost) = ws.lost_channels.get(&key) {
-            return Err(Error::BotLeftRoom {
-                channel: lost.name.clone(),
-                reason: lost.reason.clone(),
+        ws.check_bot_in_channel(&self.channel_name, BotPresence::Tracked)?;
+        let synced = ws.channel(&self.channel_name).and_then(|c| c.members());
+        if synced.is_some_and(|members| !members.contains_key(&user.track_id())) {
+            return Err(Error::UserLeft {
+                nick: user.nick(),
+                reason: None,
             });
-        }
-        if let Some(chan) = ws.channels.get(&key) {
-            if chan.names_synced {
-                if Self::self_occupant(&ws, chan).is_none() {
-                    return Err(Error::BotLeftRoom {
-                        channel: self.channel_name.clone(),
-                        reason: None,
-                    });
-                }
-                if !chan.members.contains_key(&user.track_id()) {
-                    return Err(Error::UserLeft {
-                        nick: user.nick(),
-                        reason: None,
-                    });
-                }
-            }
         }
         Ok(())
     }
@@ -146,28 +113,7 @@ impl Room {
     fn ensure_can_moderate(&self) -> Result<usize> {
         self.core.check_connected()?;
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        if let Some(lost) = ws.lost_channels.get(&key) {
-            return Err(Error::BotLeftRoom {
-                channel: lost.name.clone(),
-                reason: lost.reason.clone(),
-            });
-        }
-        if let Some(chan) = ws.channels.get(&key) {
-            if chan.names_synced {
-                let Some(self_occ) = Self::self_occupant(&ws, chan) else {
-                    return Err(Error::BotLeftRoom {
-                        channel: self.channel_name.clone(),
-                        reason: None,
-                    });
-                };
-                if !ws.occupant_is_op(self_occ) {
-                    return Err(Error::NotChannelOp {
-                        channel: self.channel_name.clone(),
-                    });
-                }
-            }
-        }
+        ws.check_bot_in_channel(&self.channel_name, BotPresence::Op)?;
         Ok(ws.max_modes.max(1))
     }
 
@@ -232,22 +178,22 @@ impl Room {
     pub fn part(&self, reason: Option<&str>) -> Result<()> {
         self.core.check_connected()?;
         let clean = reason.map(sanitize_reason);
-        self.core.outbound.enqueue_one(
+        self.core.enqueue_part(
+            &self.channel_name,
             Priority::Interactive,
-            Command::PART(self.channel_name.clone(), clean),
+            vec![Command::PART(self.channel_name.clone(), clean)],
+            false,
         );
         Ok(())
     }
 
     pub fn members(&self) -> Vec<Member> {
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        let Some(chan) = ws.channels.get(&key) else {
+        let Some(roster) = ws.channel(&self.channel_name).and_then(|c| c.roster()) else {
             return Vec::new();
         };
         let weak = Arc::downgrade(&self.core);
-        let mut out: Vec<Member> = chan
-            .members
+        let mut out: Vec<Member> = roster
             .values()
             .map(|occ| {
                 let nick = occ.track.nick();
@@ -269,9 +215,10 @@ impl Room {
             return None;
         }
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        let chan = ws.channels.get(&key)?;
-        let occ = chan.members.get(&user.track_id())?;
+        let occ = ws
+            .channel(&self.channel_name)?
+            .roster()?
+            .get(&user.track_id())?;
         Some(Member {
             user: User::from_parts(Arc::downgrade(&self.core), Arc::clone(&occ.track)),
             nick: occ.track.nick(),
@@ -281,15 +228,9 @@ impl Room {
         })
     }
 
+    /// Returns the sorted current nicknames of all occupants in this room.
     pub fn nicks(&self) -> Vec<String> {
-        let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        let Some(chan) = ws.channels.get(&key) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = chan.members.values().map(|o| o.track.nick()).collect();
-        out.sort();
-        out
+        self.members().into_iter().map(|m| m.nick).collect()
     }
 
     pub fn has_user(&self, user: &User) -> bool {
@@ -297,33 +238,27 @@ impl Room {
             return false;
         }
         let ws = self.core.state.read().unwrap();
-        let key = ws.casemap.fold(&self.channel_name);
-        ws.channels
-            .get(&key)
-            .is_some_and(|chan| chan.members.contains_key(&user.track_id()))
+        ws.channel(&self.channel_name)
+            .and_then(|c| c.roster())
+            .is_some_and(|roster| roster.contains_key(&user.track_id()))
     }
 
     pub fn has_nick(&self, nick: &str) -> bool {
         let ws = self.core.state.read().unwrap();
-        let chan_key = ws.casemap.fold(&self.channel_name);
-        ws.channels
-            .get(&chan_key)
+        ws.channel(&self.channel_name)
             .is_some_and(|chan| chan.member_by_nick(nick).is_some())
     }
 
     pub fn bot_is_op(&self) -> bool {
         let ws = self.core.state.read().unwrap();
-        let chan_key = ws.casemap.fold(&self.channel_name);
-        let Some(chan) = ws.channels.get(&chan_key) else {
-            return false;
-        };
-        Self::self_occupant(&ws, chan).is_some_and(|occ| ws.occupant_is_op(occ))
+        ws.channel(&self.channel_name)
+            .and_then(|chan| ws.self_occupant(chan))
+            .is_some_and(|occ| ws.occupant_is_op(occ))
     }
 
     pub fn topic(&self) -> Option<String> {
         let ws = self.core.state.read().unwrap();
-        let chan_key = ws.casemap.fold(&self.channel_name);
-        ws.channels.get(&chan_key).and_then(|c| c.topic.clone())
+        ws.channel(&self.channel_name).and_then(|c| c.topic.clone())
     }
 
     pub fn kick(&self, user: &User, reason: Option<&str>) -> Result<()> {

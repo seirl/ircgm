@@ -194,3 +194,28 @@ async fn room_moderation_tracks_renames_and_never_hits_nick_stealer_after_quit()
         ))
     );
 }
+
+#[tokio::test]
+async fn moderation_on_unjoined_room_is_rejected_locally() {
+    let (bot, mut server) = test_harness("gm");
+    let alice = bot.user("alice").unwrap();
+    let nowhere = bot.room("#nowhere").unwrap();
+
+    assert!(matches!(
+        nowhere.kick(&alice, None),
+        Err(Error::BotLeftRoom { ref channel, reason: None }) if channel == "#nowhere"
+    ));
+    assert!(matches!(
+        nowhere.set_mode("+m", &[]),
+        Err(Error::BotLeftRoom { .. })
+    ));
+    tokio::task::yield_now().await;
+    assert!(server.try_recv_sent().is_none());
+
+    // Chat on an untracked room is still allowed (the server decides):
+    nowhere.say("hello?").unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::PRIVMSG("#nowhere".into(), "hello?".into()))
+    );
+}

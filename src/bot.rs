@@ -21,10 +21,18 @@ use crate::outbound::{
     build_chat_commands, validate_param, validate_target, OutboundChatKind, OutboundSink, Priority,
     RawTransport, WriteReceipt,
 };
-use crate::pump::{extract_numeric, run_pump, PumpSource, RegistrationTracker};
+use crate::pump::{run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
-use crate::state::WorldState;
+use crate::state::{JoinOutcome, WorldState};
 use crate::user::{User, UserRegistry, UserTrack};
+
+/// Whether `Bot::join_inner` may reuse a channel the bot already holds (`Bot::join`) or must
+/// claim it fresh (`Bot::breakout_with`, whose `Drop` tears the room down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinMode {
+    Shared,
+    Exclusive,
+}
 
 /// Configuration for [`Bot::connect_with`] and [`crate::testing::test_harness_with`].
 #[derive(Clone, Debug)]
@@ -249,6 +257,23 @@ impl BotCore {
         self.command_prefixes
             .iter()
             .any(|p| !p.is_empty() && trimmed.starts_with(p.as_str()))
+    }
+
+    /// Enqueues `cmds` (ending with our own `PART channel`) and marks `channel` `Parting` under
+    /// the `WorldState` write lock, so a concurrent `Bot::join` either completes before the
+    /// `PART` is queued or sees `Parting` and queues its `JOIN` behind the `PART`.
+    /// `evict_on_leave` is `true` only for ephemeral `Breakout` teardown (see
+    /// `ChannelPhase::Parting`); `Room::part` keeps a `Left` record.
+    pub(crate) fn enqueue_part(
+        &self,
+        channel: &str,
+        priority: Priority,
+        cmds: Vec<Command>,
+        evict_on_leave: bool,
+    ) {
+        let mut ws = self.state.write().unwrap();
+        ws.mark_parting(channel, evict_on_leave);
+        let _ = self.outbound.enqueue_batch(priority, cmds);
     }
 
     /// Enqueues a validated, line-wrapped outbound chat message and returns its [`WriteReceipt`].
@@ -576,14 +601,14 @@ impl Bot {
     }
 
     pub async fn join(&self, channel: &str) -> Result<Room> {
-        self.join_inner(channel, None, self.owner.core.handshake_timeout)
+        self.join_inner(channel, None, self.owner.core.handshake_timeout, JoinMode::Shared)
             .instrument(tracing::info_span!("ircgm::join", channel = channel))
             .await
     }
 
     pub async fn join_with_key(&self, channel: &str, key: &str) -> Result<Room> {
         validate_param(key, "channel key")?;
-        self.join_inner(channel, Some(key), self.owner.core.handshake_timeout)
+        self.join_inner(channel, Some(key), self.owner.core.handshake_timeout, JoinMode::Shared)
             .instrument(tracing::info_span!("ircgm::join", channel = channel))
             .await
     }
@@ -593,110 +618,83 @@ impl Bot {
         channel: &str,
         key: Option<&str>,
         timeout: Duration,
+        mode: JoinMode,
     ) -> Result<Room> {
         validate_target(channel, "channel name")?;
         let core = &self.owner.core;
         core.check_connected()?;
 
-        {
-            let ws = core.state.read().unwrap();
-            let ckey = ws.casemap.fold(channel);
-            if let Some(existing) = ws.channels.get(&ckey) {
-                if existing.names_synced {
-                    return Ok(Room::new(
-                        Arc::clone(core),
-                        existing.name.clone(),
-                        Arc::clone(&core.ask_config),
-                    ));
+        // Register as a join waiter (coalescing onto any in-flight join of the same channel)
+        // under the same lock that checks for an already-synced or claimed channel:
+        let (mut outcome_rx, send_join) = {
+            let mut ws = core.state.write().unwrap();
+            match mode {
+                JoinMode::Shared => {
+                    if let Some(existing) = ws.channel(channel).filter(|c| c.members().is_some()) {
+                        return Ok(Room::new(
+                            Arc::clone(core),
+                            existing.name.clone(),
+                            Arc::clone(&core.ask_config),
+                        ));
+                    }
+                }
+                JoinMode::Exclusive => {
+                    if ws.is_claimed(channel) {
+                        return Err(Error::InvalidInput(
+                            "breakout channel is already joined or being joined",
+                        ));
+                    }
                 }
             }
+            ws.await_join(channel, mode == JoinMode::Exclusive)?
+        };
+
+        if send_join {
+            let _ = core.outbound.enqueue_one(
+                Priority::Interactive,
+                Command::JOIN(channel.to_owned(), key.map(str::to_owned), None),
+            );
         }
 
-        // Subscribe raw channel inbox BEFORE sending JOIN:
-        let mut inbox = core.inboxes.subscribe(
-            Arc::clone(core),
-            Filter::Scoped {
-                rooms: vec![channel.to_owned()],
-                dm_users: Vec::new(),
-            },
-            Location::caller(),
-        );
-
-        core.outbound.enqueue_one(
-            Priority::Interactive,
-            Command::JOIN(channel.to_owned(), key.map(str::to_owned), None),
-        );
-
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
-
-        loop {
-            let raw_res = tokio::select! {
-                biased;
-                r = inbox.next_raw() => r,
-                _ = &mut sleep => {
+        let outcome = tokio::select! {
+            biased;
+            reason = core.wait_disconnected() => return Err(Error::Disconnected(reason)),
+            res = tokio::time::timeout(timeout, outcome_rx.wait_for(Option::is_some)) => match res {
+                Err(_) => {
                     return Err(Error::HandshakeTimeout {
                         operation: "JOIN / NAMES",
                     });
                 }
-            };
-
-            let raw = match raw_res {
-                Ok(m) => m,
-                Err(Error::BotLeftRoom { .. }) => {
-                    // Could happen if a previous `lost_channels` entry existed before our self `JOIN` arrived:
-                    // keep waiting until our new `JOIN` + `366` or timeout!
-                    inbox = core.inboxes.subscribe(
-                        Arc::clone(core),
-                        Filter::Scoped {
-                            rooms: vec![channel.to_owned()],
-                            dm_users: Vec::new(),
-                        },
-                        Location::caller(),
-                    );
-                    continue;
+                // `WorldState::clear` dropped the sender: the session is gone.
+                Ok(Err(_)) => {
+                    return Err(Error::Disconnected(
+                        core.disconnect_reason()
+                            .unwrap_or(DisconnectReason::BotDropped),
+                    ));
                 }
-                Err(e) => return Err(e),
-            };
+                Ok(Ok(outcome)) => outcome.clone(),
+            },
+        };
 
-            // Check if 366 synced the channel or if a join-failure numeric arrived:
-            if let Some((code, args)) = extract_numeric(&raw.command) {
-                let live_cm = core.casemap();
-                match code {
-                    366 => {
-                        let synced_name = {
-                            let ws = core.state.read().unwrap();
-                            ws.channels
-                                .get(&ws.casemap.fold(channel))
-                                .filter(|c| c.names_synced)
-                                .map(|c| c.name.clone())
-                        };
-                        if let Some(canonical_name) = synced_name {
-                            return Ok(Room::new(
-                                Arc::clone(core),
-                                canonical_name,
-                                Arc::clone(&core.ask_config),
-                            ));
-                        }
-                    }
-                    403 | 405 | 471 | 473 | 474 | 475 | 476 | 477 => {
-                        if let Some(target_ch) = args.get(1) {
-                            if live_cm.str_eq(target_ch, channel) {
-                                let message = args
-                                    .last()
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("join failed ({code})"));
-                                return Err(Error::JoinFailed {
-                                    channel: target_ch.clone(),
-                                    code,
-                                    message,
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+        match outcome {
+            Some(JoinOutcome::Joined { name }) => Ok(Room::new(
+                Arc::clone(core),
+                name,
+                Arc::clone(&core.ask_config),
+            )),
+            Some(JoinOutcome::Failed {
+                channel,
+                code,
+                message,
+            }) => Err(Error::JoinFailed {
+                channel,
+                code,
+                message,
+            }),
+            Some(JoinOutcome::Left { channel, reason }) => {
+                Err(Error::BotLeftRoom { channel, reason })
             }
+            None => unreachable!("wait_for(Option::is_some) only resolves on Some"),
         }
     }
 
@@ -714,9 +712,9 @@ impl Bot {
             fn drop(&mut self) {
                 if let Some(ch) = self.channel.take() {
                     if self.core.check_connected().is_ok() {
+                        let part = Command::PART(ch.clone(), None);
                         self.core
-                            .outbound
-                            .enqueue_one(Priority::Background, Command::PART(ch, None));
+                            .enqueue_part(&ch, Priority::Background, vec![part], true);
                     }
                 }
             }
@@ -735,12 +733,20 @@ impl Bot {
             };
 
             let mut room = match self
-                .join_inner(&chan_name, None, opts.setup_timeout)
+                .join_inner(&chan_name, None, opts.setup_timeout, JoinMode::Exclusive)
                 .await
             {
                 Ok(room) => room,
                 Err(e) => {
-                    if matches!(e, Error::JoinFailed { .. } | Error::Disconnected(_)) {
+                    // Nothing to roll back if the room belongs to someone else, the server
+                    // refused us, kicked us mid-join, or the session is gone:
+                    if matches!(
+                        e,
+                        Error::InvalidInput(_)
+                            | Error::JoinFailed { .. }
+                            | Error::BotLeftRoom { .. }
+                            | Error::Disconnected(_)
+                    ) {
                         rollback.channel = None;
                     }
                     return Err(e);

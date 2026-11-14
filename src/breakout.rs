@@ -168,8 +168,7 @@ impl Drop for Breakout {
             let cmds = self.build_teardown_commands();
             self.room
                 .core()
-                .outbound
-                .enqueue_batch(Priority::Background, cmds);
+                .enqueue_part(self.room.name(), Priority::Background, cmds, true);
         }
     }
 }
@@ -188,13 +187,11 @@ impl Breakout {
         let ws = core.state.read().unwrap();
         let cm = ws.casemap;
         let chan_name = self.room.name().to_owned();
-        let chan_key = cm.fold(&chan_name);
 
         let mut cmds = Vec::new();
         if self.opts.kick_on_drop {
-            if let Some(chan) = ws.channels.get(&chan_key) {
-                let mut targets: Vec<String> = chan
-                    .members
+            if let Some(roster) = ws.channel(&chan_name).and_then(|c| c.roster()) {
+                let mut targets: Vec<String> = roster
                     .values()
                     .map(|occ| occ.track.nick())
                     .filter(|nick| !cm.str_eq(nick, &ws.current_nick))
@@ -511,15 +508,17 @@ impl Breakout {
         );
 
         let cmds = self.build_teardown_commands();
-        core.outbound.enqueue_batch(Priority::Interactive, cmds);
+        core.enqueue_part(self.room.name(), Priority::Interactive, cmds, true);
 
         // If the channel wasn't even joined in WorldState anymore, return immediately:
+        if core
+            .state
+            .read()
+            .unwrap()
+            .active_channel(self.room.name())
+            .is_none()
         {
-            let ws = core.state.read().unwrap();
-            let key = ws.casemap.fold(self.room.name());
-            if !ws.channels.contains_key(&key) {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let sleep = tokio::time::sleep(self.opts.setup_timeout);

@@ -299,7 +299,7 @@ fn handle_chat_like(
             nick_prefix.is_some_and(|(nick, _, _)| ws.casemap.str_eq(nick, &ws.current_nick));
         let needs_self_update = is_self && (ws.self_ident.is_none() || ws.self_host.is_none());
         let is_chan = ws.is_channel_name(target);
-        let chan_in_ws = is_chan && ws.channels.contains_key(&ws.casemap.fold(target));
+        let chan_in_ws = is_chan && ws.active_channel(target).is_some();
         drop(ws);
         if needs_self_update {
             core.state
@@ -469,10 +469,11 @@ fn handle_part(
         track.set_account(normalize_account(raw_acct));
     }
 
+    let watched = core.inboxes.has_channel_listener(channel);
     let self_left = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(raw.prefix.as_ref());
-        ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq)
+        ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq, watched)
     };
 
     let kind = if self_left {
@@ -506,10 +507,11 @@ fn handle_kick(
     };
     let track = core.users.get_or_create(target_nick);
 
+    let watched = core.inboxes.has_channel_listener(channel);
     let self_left = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(raw.prefix.as_ref());
-        ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq)
+        ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq, watched)
     };
 
     let kind = if self_left {
@@ -712,10 +714,14 @@ fn handle_numeric(
         405 | 471 | 473 | 474 | 475 | 476 | 477 => {
             // Join-refusal numerics: `<client> <channel> :<reason>`
             let chan_hint = args.get(1).map(String::as_str);
+            fail_pending_join(core, code, args);
             dispatch_raw(core, raw, seq, chan_hint);
         }
         401 | 403 | 404 | 442 | 486 | 492 | 531 | 716 => {
             // Send-refusal / PM-block numerics: `<client> <target> ... :<reason>`
+            if code == 403 {
+                fail_pending_join(core, code, args);
+            }
             let Some(target) = args.get(1).cloned() else {
                 dispatch_raw(core, raw, seq, None);
                 return;
@@ -753,6 +759,21 @@ fn handle_numeric(
             dispatch_raw(core, raw, seq, None);
         }
     }
+}
+
+/// Resolves pending `Bot::join` waiters on a join-refusal numeric (`<client> <channel> :<reason>`).
+fn fail_pending_join(core: &Arc<BotCore>, code: u16, args: &[String]) {
+    let Some(channel) = args.get(1) else {
+        return;
+    };
+    let message = args
+        .last()
+        .cloned()
+        .unwrap_or_else(|| format!("join failed ({code})"));
+    core.state
+        .write()
+        .unwrap()
+        .fail_join(channel, code, message);
 }
 
 fn dispatch_wire(

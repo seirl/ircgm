@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use irc::proto::{Command, Message, Prefix, Response};
+use tokio::sync::watch;
 
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
+use crate::error::Error;
 use crate::user::{UserRegistry, UserTrack};
 
 /// Conservative `user@host` byte reserve (`76` bytes) used before the bot observes its own
@@ -42,45 +44,158 @@ pub(crate) struct Occupant {
     pub(crate) prefixes: Vec<char>,
 }
 
+/// Lifecycle of the bot's presence in a channel.
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelState {
-    pub(crate) name: String,
-    pub(crate) topic: Option<String>,
-    pub(crate) names_synced: bool,
-    pub(crate) members: HashMap<u64, Occupant>,
-    staging_names: Option<HashMap<u64, Occupant>>,
+pub(crate) enum ChannelPhase {
+    /// Self `JOIN` seen: `353` entries and any `JOIN`/`PART`/`MODE` arriving before `366` are
+    /// staged here so none are lost when `366` commits the roster.
+    Joining { staged: HashMap<u64, Occupant> },
+    /// `366` committed `members`; `resync` stages a fresh `NAMES` reply while joined.
+    Joined {
+        members: HashMap<u64, Occupant>,
+        resync: Option<HashMap<u64, Occupant>>,
+    },
+    /// The bot enqueued its own `PART` (`Room::part`, `Breakout` teardown) and awaits the echo;
+    /// `Bot::join` must rejoin rather than hand out a `Room` that is about to be left.
+    /// `evict_on_leave` marks ephemeral `Breakout` channels whose entry is dropped (instead of
+    /// recorded as `Left`) once the echo arrives and nobody watches the channel.
+    Parting {
+        members: HashMap<u64, Occupant>,
+        evict_on_leave: bool,
+    },
+    /// The bot itself left (`PART` / `KICK`) at wire sequence `at_seq`.
+    Left {
+        reason: Option<String>,
+        at_seq: u64,
+    },
 }
 
-impl ChannelState {
-    fn new(name: String) -> Self {
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelEntry {
+    /// Canonical channel name as last observed on the wire.
+    pub(crate) name: String,
+    pub(crate) topic: Option<String>,
+    pub(crate) phase: ChannelPhase,
+}
+
+impl ChannelEntry {
+    fn joining(name: String) -> Self {
         Self {
             name,
             topic: None,
-            names_synced: false,
-            members: HashMap::new(),
-            staging_names: None,
+            phase: ChannelPhase::Joining {
+                staged: HashMap::new(),
+            },
+        }
+    }
+
+    /// `true` while the bot is joining, joined, or parting (not `Left`).
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(self.phase, ChannelPhase::Left { .. })
+    }
+
+    /// Committed roster once `366` synced the channel (`None` while `Joining`, `Parting`, or
+    /// after `Left`).
+    pub(crate) fn members(&self) -> Option<&HashMap<u64, Occupant>> {
+        match &self.phase {
+            ChannelPhase::Joined { members, .. } => Some(members),
+            ChannelPhase::Joining { .. } | ChannelPhase::Parting { .. } | ChannelPhase::Left { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Best-known roster: committed members once `Joined` / `Parting`, or the staged roster while
+    /// `Joining`.
+    pub(crate) fn roster(&self) -> Option<&HashMap<u64, Occupant>> {
+        match &self.phase {
+            ChannelPhase::Joining { staged } => Some(staged),
+            ChannelPhase::Joined { members, .. } | ChannelPhase::Parting { members, .. } => Some(members),
+            ChannelPhase::Left { .. } => None,
         }
     }
 
     pub(crate) fn member_by_nick(&self, nick: &str) -> Option<&Occupant> {
-        self.members
+        self.roster()?
             .values()
             .find(|occ| occ.track.casemap().str_eq(&occ.track.nick(), nick))
     }
 
-    fn for_each_map_mut(&mut self, mut f: impl FnMut(&mut HashMap<u64, Occupant>)) {
-        f(&mut self.members);
-        if let Some(staged) = &mut self.staging_names {
-            f(staged);
+    /// Wire sequence at which the bot left this channel, if it has.
+    pub(crate) fn left_at_seq(&self) -> Option<u64> {
+        match &self.phase {
+            ChannelPhase::Left { at_seq, .. } => Some(*at_seq),
+            ChannelPhase::Joining { .. } | ChannelPhase::Joined { .. } | ChannelPhase::Parting { .. } => {
+                None
+            }
+        }
+    }
+
+    /// `Some(Error::BotLeftRoom { .. })` once the bot has left this channel.
+    pub(crate) fn left_error(&self) -> Option<Error> {
+        match &self.phase {
+            ChannelPhase::Left { reason, .. } => Some(Error::BotLeftRoom {
+                channel: self.name.clone(),
+                reason: reason.clone(),
+            }),
+            ChannelPhase::Joining { .. } | ChannelPhase::Joined { .. } | ChannelPhase::Parting { .. } => {
+                None
+            }
+        }
+    }
+
+    fn tracks_member(&self, track_id: u64) -> bool {
+        match &self.phase {
+            ChannelPhase::Joining { staged } => staged.contains_key(&track_id),
+            ChannelPhase::Joined { members, resync } => {
+                members.contains_key(&track_id)
+                    || resync.as_ref().is_some_and(|r| r.contains_key(&track_id))
+            }
+            ChannelPhase::Parting { members, .. } => members.contains_key(&track_id),
+            ChannelPhase::Left { .. } => false,
+        }
+    }
+
+    fn for_each_roster_mut(&mut self, mut f: impl FnMut(&mut HashMap<u64, Occupant>)) {
+        match &mut self.phase {
+            ChannelPhase::Joining { staged } => f(staged),
+            ChannelPhase::Joined { members, resync } => {
+                f(members);
+                if let Some(r) = resync {
+                    f(r);
+                }
+            }
+            ChannelPhase::Parting { members, .. } => f(members),
+            ChannelPhase::Left { .. } => {}
         }
     }
 }
 
+/// What `WorldState::check_bot_in_channel` requires of the bot's presence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BotPresence {
+    /// Chat, invites, asks, and replies: fail only once the bot is known to be out.
+    Tracked,
+    /// Moderation (`KICK`, `MODE`, `TOPIC`): the bot must be in the channel with `+o`.
+    Op,
+}
+
+/// Resolution of an in-flight `Bot::join` shared by every coalesced waiter.
 #[derive(Clone, Debug)]
-pub(crate) struct LostChannel {
-    pub(crate) name: String,
-    pub(crate) reason: Option<String>,
-    pub(crate) at_seq: u64,
+pub(crate) enum JoinOutcome {
+    /// `366` committed the roster under the server's canonical channel `name`.
+    Joined { name: String },
+    /// A join-refusal numeric (`403`, `405`, `471`..`477`) rejected the `JOIN`.
+    Failed {
+        channel: String,
+        code: u16,
+        message: String,
+    },
+    /// The bot was kicked (or parted) after its self `JOIN` but before `366`.
+    Left {
+        channel: String,
+        reason: Option<String>,
+    },
 }
 
 pub(crate) struct WorldState {
@@ -96,8 +211,18 @@ pub(crate) struct WorldState {
     pub(crate) self_track_id: Option<u64>,
     pub(crate) self_ident: Option<String>,
     pub(crate) self_host: Option<String>,
-    pub(crate) channels: HashMap<FoldedStr, ChannelState>,
-    pub(crate) lost_channels: HashMap<FoldedStr, LostChannel>,
+    channels: HashMap<FoldedStr, ChannelEntry>,
+    /// One outcome channel per channel with `Bot::join` waiters, resolved on `366` or refusal.
+    pending_joins: HashMap<FoldedStr, PendingJoin>,
+}
+
+/// In-flight `Bot::join` shared by coalesced waiters (keeps the requested `name` so `005
+/// CASEMAPPING` changes can re-key it). `exclusive` marks a `Bot::breakout_with` claim that
+/// plain `Bot::join` callers must not coalesce onto.
+struct PendingJoin {
+    name: String,
+    tx: watch::Sender<Option<JoinOutcome>>,
+    exclusive: bool,
 }
 
 impl WorldState {
@@ -115,13 +240,147 @@ impl WorldState {
             self_ident: None,
             self_host: None,
             channels: HashMap::new(),
-            lost_channels: HashMap::new(),
+            pending_joins: HashMap::new(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.channels.clear();
-        self.lost_channels.clear();
+        self.pending_joins.clear();
+    }
+
+    /// `true` if `channel` is `Joining`/`Joined` or has live `Bot::join` waiters (used to stop a
+    /// `Breakout` from claiming a room someone else already holds).
+    pub(crate) fn is_claimed(&self, channel: &str) -> bool {
+        let in_use = self.channel(channel).is_some_and(|c| {
+            matches!(c.phase, ChannelPhase::Joining { .. } | ChannelPhase::Joined { .. })
+        });
+        in_use
+            || self
+                .pending_joins
+                .get(&self.casemap.fold(channel))
+                .is_some_and(|p| p.tx.receiver_count() > 0)
+    }
+
+    /// Registers a `Bot::join` waiter for `channel`, coalescing onto any in-flight join.
+    ///
+    /// Returns the outcome receiver and whether the caller must send `JOIN` (`false` when another
+    /// live waiter already sent it, or when the self `JOIN` already arrived and only `366` is
+    /// pending). Fails with `Error::InvalidInput` instead of coalescing onto a live `exclusive`
+    /// (`Breakout`) claim, whose room will be torn down when the `Breakout` drops.
+    pub(crate) fn await_join(
+        &mut self,
+        channel: &str,
+        exclusive: bool,
+    ) -> Result<(watch::Receiver<Option<JoinOutcome>>, bool), Error> {
+        let key = self.casemap.fold(channel);
+        if let Some(pending) = self
+            .pending_joins
+            .get(&key)
+            .filter(|p| p.tx.receiver_count() > 0)
+        {
+            if pending.exclusive {
+                return Err(Error::InvalidInput(
+                    "channel is being claimed by a Breakout",
+                ));
+            }
+            return Ok((pending.tx.subscribe(), false));
+        }
+        let send_join = !matches!(
+            self.channel(channel).map(|c| &c.phase),
+            Some(ChannelPhase::Joining { .. })
+        );
+        let (tx, rx) = watch::channel(None);
+        self.pending_joins.insert(
+            key,
+            PendingJoin {
+                name: channel.to_owned(),
+                tx,
+                exclusive,
+            },
+        );
+        Ok((rx, send_join))
+    }
+
+    /// Resolves pending `Bot::join` waiters for `channel` with a join-refusal numeric.
+    pub(crate) fn fail_join(&mut self, channel: &str, code: u16, message: String) {
+        if let Some(pending) = self.pending_joins.remove(&self.casemap.fold(channel)) {
+            pending.tx.send_replace(Some(JoinOutcome::Failed {
+                channel: channel.to_owned(),
+                code,
+                message,
+            }));
+        }
+    }
+
+    /// Marks `channel` `Parting` once the bot enqueues its own `PART`, so a concurrent
+    /// `Bot::join` rejoins instead of returning a `Room` that is about to be left.
+    pub(crate) fn mark_parting(&mut self, channel: &str, evict_on_leave: bool) {
+        let Some(chan) = self.channels.get_mut(&self.casemap.fold(channel)) else {
+            return;
+        };
+        let members = match &mut chan.phase {
+            ChannelPhase::Joining { staged } => std::mem::take(staged),
+            ChannelPhase::Joined { members, .. } => std::mem::take(members),
+            ChannelPhase::Parting { .. } | ChannelPhase::Left { .. } => return,
+        };
+        chan.phase = ChannelPhase::Parting {
+            members,
+            evict_on_leave,
+        };
+    }
+
+    /// Looks up `channel` (case-folded under the active [`CaseMap`]) in any phase.
+    pub(crate) fn channel(&self, channel: &str) -> Option<&ChannelEntry> {
+        self.channels.get(&self.casemap.fold(channel))
+    }
+
+    /// Looks up `channel` only while the bot is joining or joined (not `Left`).
+    pub(crate) fn active_channel(&self, channel: &str) -> Option<&ChannelEntry> {
+        self.channel(channel).filter(|c| c.is_active())
+    }
+
+    fn active_channel_mut(&mut self, channel: &str) -> Option<&mut ChannelEntry> {
+        let key = self.casemap.fold(channel);
+        self.channels.get_mut(&key).filter(|c| c.is_active())
+    }
+
+    /// The bot's own [`Occupant`] in `chan`'s best-known roster.
+    pub(crate) fn self_occupant<'a>(&'a self, chan: &'a ChannelEntry) -> Option<&'a Occupant> {
+        match self.self_track_id {
+            Some(self_id) => chan.roster()?.get(&self_id),
+            None => chan.member_by_nick(&self.current_nick),
+        }
+    }
+
+    /// Single source of truth for whether the bot may act in `channel`:
+    /// - any `need`: `Left`, or a synced roster without the bot, -> `Error::BotLeftRoom`;
+    /// - `BotPresence::Op` additionally rejects untracked (never joined) channels with
+    ///   `Error::BotLeftRoom` and a synced roster where the bot lacks `+o` with
+    ///   `Error::NotChannelOp`.
+    pub(crate) fn check_bot_in_channel(&self, channel: &str, need: BotPresence) -> Result<(), Error> {
+        let not_in_channel = || Error::BotLeftRoom {
+            channel: channel.to_owned(),
+            reason: None,
+        };
+        let Some(chan) = self.channel(channel) else {
+            return match need {
+                BotPresence::Tracked => Ok(()),
+                BotPresence::Op => Err(not_in_channel()),
+            };
+        };
+        if let Some(err) = chan.left_error() {
+            return Err(err);
+        }
+        if chan.members().is_some() {
+            let self_occ = self.self_occupant(chan).ok_or_else(not_in_channel)?;
+            if need == BotPresence::Op && !self.occupant_is_op(self_occ) {
+                return Err(Error::NotChannelOp {
+                    channel: channel.to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` if `target` starts with one of the server's `005 CHANTYPES` prefixes.
@@ -327,23 +586,21 @@ impl WorldState {
         changed_casemap
     }
 
-    /// Rebuilds all `channels` and `lost_channels` `FoldedStr` keys under `new_map`
-    /// (`ChannelState::members` is keyed by immutable `UserTrack::id`, so no member re-keying is needed).
+    /// Rebuilds all `channels` `FoldedStr` keys under `new_map` (rosters are keyed by immutable
+    /// `UserTrack::id`, so no member re-keying is needed).
     pub(crate) fn rekey_casemap(&mut self, new_map: CaseMap) {
         self.casemap = new_map;
         self.shared_casemap.store(new_map);
         let old_channels = std::mem::take(&mut self.channels);
-        let mut new_channels = HashMap::with_capacity(old_channels.len());
-        for (_, chan) in old_channels {
-            new_channels.insert(new_map.fold(&chan.name), chan);
-        }
-        self.channels = new_channels;
-        let old_lost = std::mem::take(&mut self.lost_channels);
-        let mut new_lost = HashMap::with_capacity(old_lost.len());
-        for (_, lost) in old_lost {
-            new_lost.insert(new_map.fold(&lost.name), lost);
-        }
-        self.lost_channels = new_lost;
+        self.channels = old_channels
+            .into_values()
+            .map(|chan| (new_map.fold(&chan.name), chan))
+            .collect();
+        let old_pending = std::mem::take(&mut self.pending_joins);
+        self.pending_joins = old_pending
+            .into_values()
+            .map(|pending| (new_map.fold(&pending.name), pending))
+            .collect();
     }
 
     pub(crate) fn is_status_symbol(&self, sym: char) -> bool {
@@ -398,20 +655,22 @@ impl WorldState {
 
         if is_self {
             self.self_track_id = Some(track.id);
-            self.lost_channels.remove(&chan_key);
             let chan = self
                 .channels
                 .entry(chan_key)
-                .or_insert_with(|| ChannelState::new(channel.to_owned()));
+                .or_insert_with(|| ChannelEntry::joining(channel.to_owned()));
             chan.name = channel.to_owned();
-            chan.for_each_map_mut(|map| {
+            if !chan.is_active() {
+                *chan = ChannelEntry::joining(channel.to_owned());
+            }
+            chan.for_each_roster_mut(|map| {
                 map.entry(track.id).or_insert_with(|| Occupant {
                     track: Arc::clone(&track),
                     prefixes: Vec::new(),
                 });
             });
-        } else if let Some(chan) = self.channels.get_mut(&chan_key) {
-            chan.for_each_map_mut(|map| {
+        } else if let Some(chan) = self.active_channel_mut(channel) {
+            chan.for_each_roster_mut(|map| {
                 map.insert(
                     track.id,
                     Occupant {
@@ -423,7 +682,10 @@ impl WorldState {
         }
     }
 
-    /// Removes `track_id` from `channel` (or removes the entire `ChannelState` if `nick` is the bot).
+    /// Removes `track_id` from `channel` (or marks the channel `Left` if `nick` is the bot).
+    /// When the bot completes a `Breakout` teardown `PART` (`Parting { evict_on_leave: true }`)
+    /// and `watched` is `false` (no channel-scoped `Inbox` needs the `Left` state), the entry is
+    /// evicted instead so ephemeral `Breakout` channels do not accumulate forever.
     /// Returns `true` if the bot itself left the channel.
     pub(crate) fn handle_part_or_kick(
         &mut self,
@@ -432,26 +694,47 @@ impl WorldState {
         track_id: u64,
         reason: Option<String>,
         at_seq: u64,
+        watched: bool,
     ) -> bool {
-        let chan_key = self.casemap.fold(channel);
         if self.casemap.str_eq(nick, &self.current_nick) {
-            let canonical = self
+            let chan_key = self.casemap.fold(channel);
+            let chan = self
                 .channels
-                .remove(&chan_key)
-                .map(|c| c.name)
-                .unwrap_or_else(|| channel.to_owned());
-            self.lost_channels.insert(
-                chan_key,
-                LostChannel {
-                    name: canonical,
-                    reason,
-                    at_seq,
-                },
-            );
+                .entry(chan_key.clone())
+                .or_insert_with(|| ChannelEntry::joining(channel.to_owned()));
+            let was_joining = matches!(chan.phase, ChannelPhase::Joining { .. });
+            if !watched
+                && matches!(
+                    chan.phase,
+                    ChannelPhase::Parting {
+                        evict_on_leave: true,
+                        ..
+                    }
+                )
+            {
+                self.channels.remove(&chan_key);
+                return true;
+            }
+            chan.topic = None;
+            chan.phase = ChannelPhase::Left {
+                reason: reason.clone(),
+                at_seq,
+            };
+            let name = chan.name.clone();
+            // Kicked between our self `JOIN` and `366`: resolve `Bot::join` waiters now instead
+            // of letting them run out `handshake_timeout`.
+            if was_joining {
+                if let Some(pending) = self.pending_joins.remove(&chan_key) {
+                    pending.tx.send_replace(Some(JoinOutcome::Left {
+                        channel: name,
+                        reason,
+                    }));
+                }
+            }
             true
         } else {
-            if let Some(chan) = self.channels.get_mut(&chan_key) {
-                chan.for_each_map_mut(|map| {
+            if let Some(chan) = self.active_channel_mut(channel) {
+                chan.for_each_roster_mut(|map| {
                     map.remove(&track_id);
                 });
             }
@@ -464,7 +747,7 @@ impl WorldState {
         let mut occupied = Vec::new();
         for chan in self.channels.values_mut() {
             let mut removed = false;
-            chan.for_each_map_mut(|map| {
+            chan.for_each_roster_mut(|map| {
                 removed |= map.remove(&track_id).is_some();
             });
             if removed {
@@ -490,24 +773,18 @@ impl WorldState {
             self.current_nick = new_nick.to_owned();
             self.self_track_id = Some(track_id);
         }
-        let mut occupied = Vec::new();
-        for chan in self.channels.values() {
-            if chan.members.contains_key(&track_id)
-                || chan
-                    .staging_names
-                    .as_ref()
-                    .is_some_and(|s| s.contains_key(&track_id))
-            {
-                occupied.push(chan.name.clone());
-            }
-        }
+        let mut occupied: Vec<String> = self
+            .channels
+            .values()
+            .filter(|chan| chan.tracks_member(track_id))
+            .map(|chan| chan.name.clone())
+            .collect();
         occupied.sort();
         occupied
     }
 
     pub(crate) fn handle_topic(&mut self, channel: &str, topic: Option<String>) {
-        let chan_key = self.casemap.fold(channel);
-        if let Some(chan) = self.channels.get_mut(&chan_key) {
+        if let Some(chan) = self.active_channel_mut(channel) {
             chan.topic = topic.filter(|t| !t.is_empty());
         }
     }
@@ -522,8 +799,7 @@ impl WorldState {
             return;
         };
 
-        let chan_key = self.casemap.fold(channel);
-        if !self.channels.contains_key(&chan_key) {
+        if self.active_channel(channel).is_none() {
             return;
         }
 
@@ -567,30 +843,50 @@ impl WorldState {
             parsed.push(Occupant { track, prefixes });
         }
 
-        if let Some(chan) = self.channels.get_mut(&chan_key) {
-            let staged = chan.staging_names.get_or_insert_with(HashMap::new);
+        if let Some(chan) = self.active_channel_mut(channel) {
+            let staged = match &mut chan.phase {
+                ChannelPhase::Joining { staged } => staged,
+                ChannelPhase::Joined { resync, .. } => resync.get_or_insert_with(HashMap::new),
+                ChannelPhase::Parting { .. } | ChannelPhase::Left { .. } => return,
+            };
             for occ in parsed {
                 staged.insert(occ.track.id, occ);
             }
         }
     }
 
-    /// Commits staged `353` entries atomically on `366 RPL_ENDOFNAMES` and returns the canonical
-    /// channel name if tracked.
+    /// Commits staged `353` entries atomically on `366 RPL_ENDOFNAMES` (`Joining` -> `Joined`, or
+    /// swapping in a `Joined` resync) and returns the canonical channel name if active.
     pub(crate) fn handle_endofnames(&mut self, args: &[String]) -> Option<String> {
         let channel = if args.len() >= 2 {
             &args[1]
         } else {
             args.first()?
         };
-        let chan_key = self.casemap.fold(channel);
-        let chan = self.channels.get_mut(&chan_key)?;
-
-        if let Some(staged) = chan.staging_names.take() {
-            chan.members = staged;
+        let key = self.casemap.fold(channel);
+        let chan = self.channels.get_mut(&key).filter(|c| c.is_active())?;
+        match &mut chan.phase {
+            ChannelPhase::Joining { staged } => {
+                let members = std::mem::take(staged);
+                chan.phase = ChannelPhase::Joined {
+                    members,
+                    resync: None,
+                };
+            }
+            ChannelPhase::Joined { members, resync } => {
+                if let Some(fresh) = resync.take() {
+                    *members = fresh;
+                }
+            }
+            ChannelPhase::Parting { .. } | ChannelPhase::Left { .. } => {}
         }
-        chan.names_synced = true;
-        Some(chan.name.clone())
+        let name = chan.name.clone();
+        if matches!(chan.phase, ChannelPhase::Joined { .. }) {
+            if let Some(pending) = self.pending_joins.remove(&key) {
+                pending.tx.send_replace(Some(JoinOutcome::Joined { name: name.clone() }));
+            }
+        }
+        Some(name)
     }
 
     /// Applies a parameterized channel `MODE` sequence (`["+klo", "secret", "50", "Alice", "-v", "Bob"]`)
@@ -601,8 +897,7 @@ impl WorldState {
         tokens: &[S],
         users: &UserRegistry,
     ) {
-        let chan_key = self.casemap.fold(channel);
-        if !self.channels.contains_key(&chan_key) {
+        if self.active_channel(channel).is_none() {
             return;
         }
 
@@ -647,9 +942,9 @@ impl WorldState {
         }
 
         let order: Vec<char> = self.status_prefixes.iter().map(|&(_, s)| s).collect();
-        if let Some(chan) = self.channels.get_mut(&chan_key) {
+        if let Some(chan) = self.active_channel_mut(channel) {
             for (target_id, adding, sym) in updates {
-                chan.for_each_map_mut(|map| {
+                chan.for_each_roster_mut(|map| {
                     if let Some(occ) = map.get_mut(&target_id) {
                         if adding {
                             if !occ.prefixes.contains(&sym) {

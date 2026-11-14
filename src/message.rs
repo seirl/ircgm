@@ -4,9 +4,10 @@ use irc::proto::Message;
 use irc_colors::Text;
 use tokio::time::Instant;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::outbound::OutboundChatKind;
 use crate::room::Room;
+use crate::state::BotPresence;
 use crate::user::User;
 
 /// Destination of an inbound or outbound chat message.
@@ -131,16 +132,10 @@ impl ChatMessage {
         match &self.target {
             Target::Channel(ch) => {
                 let core = self.sender.upgrade_core()?;
-                {
-                    let ws = core.state.read().unwrap();
-                    let key = ws.casemap.fold(ch);
-                    if let Some(lost) = ws.lost_channels.get(&key) {
-                        return Err(Error::BotLeftRoom {
-                            channel: lost.name.clone(),
-                            reason: lost.reason.clone(),
-                        });
-                    }
-                }
+                core.state
+                    .read()
+                    .unwrap()
+                    .check_bot_in_channel(ch, BotPresence::Tracked)?;
                 core.send_chat(out_kind, ch, text.into())?;
             }
             Target::Dm => {
