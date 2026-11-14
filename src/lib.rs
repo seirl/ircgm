@@ -74,6 +74,7 @@ pub mod future;
 mod huddle;
 mod inbox;
 mod message;
+mod moderation;
 mod outbound;
 mod pump;
 mod room;
@@ -109,7 +110,8 @@ pub use crate::{
     huddle::Huddle,
     inbox::Inbox,
     message::{ChatMessage, Event, MessageKind, Target},
-    room::{Member, ModerationGuard, Room},
+    moderation::ModerationGuard,
+    room::{Member, Room},
     user::{User, UserId},
 };
 
