@@ -67,7 +67,6 @@ impl BotConfig {
                 "account-notify".into(),
                 "extended-join".into(),
                 "multi-prefix".into(),
-                "server-time".into(),
                 "userhost-in-names".into(),
             ],
             command_prefixes: vec!["!".into()],

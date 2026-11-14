@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use ircgm::prelude::*;
 use ircgm::testing::test_harness;
@@ -54,7 +54,7 @@ async fn single_batch_privmsg_rename_steal_quit_preserves_stamped_identity() {
 }
 
 #[tokio::test]
-async fn event_fields_server_time_ident_and_channels() {
+async fn event_fields_received_at_ident_and_channels() {
     let (bot, server) = test_harness("GM");
     server.complete_join("#arena", &["@GM"]);
     server.settle().await;
@@ -95,9 +95,6 @@ async fn event_fields_server_time_ident_and_channels() {
             assert_eq!(msg.ident.as_deref(), Some("~cara"));
             assert_eq!(msg.host.as_deref(), Some("cloak.example"));
             assert!(msg.received_at >= before);
-            let ts = msg.server_time.expect("parsed @time");
-            let dur = ts.duration_since(UNIX_EPOCH).unwrap();
-            assert_eq!(dur.subsec_millis(), 250);
         }
         other => panic!("expected Chat, got {other:?}"),
     }
@@ -220,7 +217,7 @@ async fn user_id_keys_and_consuming_inbox_combinators() {
 }
 
 #[tokio::test]
-async fn dynamic_casemapping_rekey_rfc1459_netsplit_and_accounts() {
+async fn dynamic_casemapping_rekey_rfc1459_quit_and_accounts() {
     let (bot, server) = test_harness("GM");
     server.complete_join("#[Lobby]", &["[Alice]"]);
     server.settle().await;
@@ -282,8 +279,12 @@ async fn dynamic_casemapping_rekey_rfc1459_netsplit_and_accounts() {
 
     let ev1 = all_events.next_event().await.unwrap();
     let ev2 = all_events.next_event().await.unwrap();
-    assert!(matches!(ev1, Event::Quit { netsplit: true, ref nick, .. } if nick == "Bob"));
-    assert!(matches!(ev2, Event::Quit { netsplit: false, ref nick, .. } if nick == "[Alice]"));
+    assert!(
+        matches!(ev1, Event::Quit { ref nick, ref reason, .. } if nick == "Bob" && reason.as_deref() == Some("hub.irc.org leaf.irc.org"))
+    );
+    assert!(
+        matches!(ev2, Event::Quit { ref nick, ref reason, .. } if nick == "[Alice]" && reason.as_deref() == Some("Client Quit"))
+    );
 
     server.send_line(":Bob!~b@h JOIN #[lobby] * :Bob\r\n");
     server.settle().await;

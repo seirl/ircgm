@@ -10,7 +10,6 @@ license = "MIT"
 description = "Direct-style async/await IRC game master and interactive bot library"
 
 [dependencies]
-chrono = "0.4"
 fastrand = "2"
 futures-util = "0.3"
 irc = "1"

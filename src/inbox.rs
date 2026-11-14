@@ -120,11 +120,18 @@ impl Filter {
         match self {
             Filter::All => true,
             Filter::AllDms => match &ev.kind {
-                WireKind::Chat(m) => m.target.is_dm(),
-                WireKind::Notice { target, .. } => target.is_dm(),
-                WireKind::SendError { .. } => !is_channel_target,
+                WireKind::Event(Event::Chat(m)) => m.target.is_dm(),
+                WireKind::Event(Event::Notice { target, .. }) => target.is_dm(),
+                WireKind::Event(Event::DeliveryFailed { .. }) => !is_channel_target,
                 WireKind::RawOnly => !is_channel_target,
-                _ => false,
+                WireKind::Event(
+                    Event::Joined { .. }
+                    | Event::Parted { .. }
+                    | Event::Kicked { .. }
+                    | Event::Quit { .. }
+                    | Event::NickChanged { .. },
+                )
+                | WireKind::BotLeftRoom { .. } => false,
             },
             Filter::UsersInRoom {
                 tracks,
@@ -132,59 +139,58 @@ impl Filter {
             } => {
                 let has_user = |uid: u64| tracks.iter().any(|t| t.id == uid);
                 match &ev.kind {
-                    WireKind::Chat(m) => {
+                    WireKind::Event(Event::Chat(m)) => {
                         has_user(m.sender.track_id())
                             && matches!(&m.target, Target::Channel(ch) if cm.str_eq(ch, channel_name))
                     }
-                    WireKind::Notice {
-                        sender: Some(u),
-                        target: Target::Channel(ch),
-                        ..
-                    } => has_user(u.track_id()) && cm.str_eq(ch, channel_name),
-                    WireKind::Joined { channel, user, .. }
-                    | WireKind::Parted { channel, user, .. }
-                    | WireKind::Kicked { channel, user, .. } => {
-                        has_user(user.track_id()) && cm.str_eq(channel, channel_name)
-                    }
-                    WireKind::Quit { user, .. } | WireKind::NickChanged { user, .. } => {
+                    WireKind::Event(Event::Notice { sender, target, .. }) => match (sender, target)
+                    {
+                        (Some(u), Target::Channel(ch)) => {
+                            has_user(u.track_id()) && cm.str_eq(ch, channel_name)
+                        }
+                        _ => false,
+                    },
+                    WireKind::Event(
+                        Event::Joined { channel, user, .. }
+                        | Event::Parted { channel, user, .. }
+                        | Event::Kicked { channel, user, .. },
+                    ) => has_user(user.track_id()) && cm.str_eq(channel, channel_name),
+                    WireKind::Event(Event::Quit { user, .. } | Event::NickChanged { user, .. }) => {
                         has_user(user.track_id())
                     }
-                    WireKind::SendError { target, .. } => {
+                    WireKind::Event(Event::DeliveryFailed { target, .. }) => {
                         is_channel_target && cm.str_eq(target, channel_name)
                     }
                     WireKind::BotLeftRoom { channel, .. } => cm.str_eq(channel, channel_name),
                     WireKind::RawOnly => is_channel_target,
-                    _ => false,
                 }
             }
             Filter::Scoped { rooms, dm_users } => {
                 let has_room = |ch: &str| rooms.iter().any(|r| cm.str_eq(r, ch));
                 let has_user = |uid: u64| dm_users.iter().any(|t| t.id == uid);
                 match &ev.kind {
-                    WireKind::Chat(m) => match &m.target {
+                    WireKind::Event(Event::Chat(m)) => match &m.target {
                         Target::Channel(ch) => has_room(ch),
                         Target::Dm => has_user(m.sender.track_id()),
                     },
-                    WireKind::Notice { sender, target, .. } => match target {
+                    WireKind::Event(Event::Notice { sender, target, .. }) => match target {
                         Target::Channel(ch) => has_room(ch),
                         Target::Dm => sender.as_ref().is_some_and(|u| has_user(u.track_id())),
                     },
-                    WireKind::Joined { channel, .. }
-                    | WireKind::Parted { channel, .. }
-                    | WireKind::Kicked { channel, .. } => has_room(channel),
-                    WireKind::Quit { user, channels, .. }
-                    | WireKind::NickChanged { user, channels, .. } => {
-                        has_user(user.track_id()) || channels.iter().any(|c| has_room(c))
-                    }
-                    WireKind::SendError {
-                        target,
-                        target_user_id,
-                        ..
-                    } => {
+                    WireKind::Event(
+                        Event::Joined { channel, .. }
+                        | Event::Parted { channel, .. }
+                        | Event::Kicked { channel, .. },
+                    ) => has_room(channel),
+                    WireKind::Event(
+                        Event::Quit { user, channels, .. }
+                        | Event::NickChanged { user, channels, .. },
+                    ) => has_user(user.track_id()) || channels.iter().any(|c| has_room(c)),
+                    WireKind::Event(Event::DeliveryFailed { target, .. }) => {
                         if is_channel_target {
                             has_room(target)
                         } else {
-                            target_user_id.is_some_and(has_user)
+                            ev.bounce_user_id().is_some_and(has_user)
                         }
                     }
                     WireKind::BotLeftRoom { channel, .. } => has_room(channel),
@@ -421,7 +427,7 @@ impl InboxRegistry {
         candidates.extend_from_slice(&inner.all_ids);
 
         match &event.kind {
-            WireKind::Chat(msg) => match &msg.target {
+            WireKind::Event(Event::Chat(msg)) => match &msg.target {
                 Target::Channel(ch) => {
                     if let Some(ids) = inner.by_channel.get(&casemap.fold(ch)) {
                         candidates.extend_from_slice(ids);
@@ -434,7 +440,7 @@ impl InboxRegistry {
                     }
                 }
             },
-            WireKind::Notice { sender, target, .. } => match target {
+            WireKind::Event(Event::Notice { sender, target, .. }) => match target {
                 Target::Channel(ch) => {
                     if let Some(ids) = inner.by_channel.get(&casemap.fold(ch)) {
                         candidates.extend_from_slice(ids);
@@ -449,9 +455,11 @@ impl InboxRegistry {
                     }
                 }
             },
-            WireKind::Joined { channel, user, .. }
-            | WireKind::Parted { channel, user, .. }
-            | WireKind::Kicked { channel, user, .. } => {
+            WireKind::Event(
+                Event::Joined { channel, user, .. }
+                | Event::Parted { channel, user, .. }
+                | Event::Kicked { channel, user, .. },
+            ) => {
                 if let Some(ids) = inner.by_channel.get(&casemap.fold(channel)) {
                     candidates.extend_from_slice(ids);
                 }
@@ -459,8 +467,9 @@ impl InboxRegistry {
                     candidates.extend_from_slice(ids);
                 }
             }
-            WireKind::Quit { user, channels, .. }
-            | WireKind::NickChanged { user, channels, .. } => {
+            WireKind::Event(
+                Event::Quit { user, channels, .. } | Event::NickChanged { user, channels, .. },
+            ) => {
                 if let Some(ids) = inner.by_user.get(&user.track_id()) {
                     candidates.extend_from_slice(ids);
                 }
@@ -470,19 +479,15 @@ impl InboxRegistry {
                     }
                 }
             }
-            WireKind::SendError {
-                target,
-                target_user_id,
-                ..
-            } => {
+            WireKind::Event(Event::DeliveryFailed { target, .. }) => {
                 if channel_hint.is_some() {
                     if let Some(ids) = inner.by_channel.get(&casemap.fold(target)) {
                         candidates.extend_from_slice(ids);
                     }
                 } else {
                     candidates.extend_from_slice(&inner.dm_ids);
-                    if let Some(uid) = target_user_id {
-                        if let Some(ids) = inner.by_user.get(uid) {
+                    if let Some(uid) = event.bounce_user_id() {
+                        if let Some(ids) = inner.by_user.get(&uid) {
                             candidates.extend_from_slice(ids);
                         }
                     }
@@ -720,17 +725,17 @@ impl Inbox {
         loop {
             let wire = self.next_wire_until(deadline).await?;
             match &wire.kind {
-                WireKind::SendError {
+                WireKind::Event(Event::DeliveryFailed {
                     target,
-                    target_user_id,
                     code,
                     message,
-                } => {
-                    if let Some(err) = check_bounce(target, *target_user_id, *code, message) {
+                    ..
+                }) => {
+                    if let Some(err) = check_bounce(target, wire.bounce_user_id(), *code, message) {
                         return Err(err);
                     }
                 }
-                WireKind::Chat(msg) => {
+                WireKind::Event(Event::Chat(msg)) => {
                     if ignore_commands
                         && self
                             .core
@@ -743,20 +748,19 @@ impl Inbox {
                         return Ok(val);
                     }
                 }
-                WireKind::Notice {
-                    human_chat: Some(msg),
-                    ..
-                } if accept_notices => {
-                    if ignore_commands
-                        && self
-                            .core
-                            .as_ref()
-                            .is_some_and(|c| c.is_command_text(&msg.text))
-                    {
-                        continue;
-                    }
-                    if let Some(val) = f(msg) {
-                        return Ok(val);
+                WireKind::Event(Event::Notice { .. }) if accept_notices => {
+                    if let Some(msg) = wire.human_notice() {
+                        if ignore_commands
+                            && self
+                                .core
+                                .as_ref()
+                                .is_some_and(|c| c.is_command_text(&msg.text))
+                        {
+                            continue;
+                        }
+                        if let Some(val) = f(msg) {
+                            return Ok(val);
+                        }
                     }
                 }
                 _ => {}
@@ -959,24 +963,26 @@ impl Inbox {
                             reason: reason.clone(),
                         });
                     }
-                    WireKind::Joined { channel, user, .. }
+                    WireKind::Event(Event::Joined { channel, user, .. })
                         if has_user(user.track_id()) && cm.str_eq(channel, channel_name) =>
                     {
                         self.departed_users.remove(&user.track_id());
                     }
-                    WireKind::Parted {
-                        channel,
-                        user,
-                        nick,
-                        reason,
-                    }
-                    | WireKind::Kicked {
-                        channel,
-                        user,
-                        nick,
-                        reason,
-                        ..
-                    } if has_user(user.track_id()) && cm.str_eq(channel, channel_name) => {
+                    WireKind::Event(
+                        Event::Parted {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                        }
+                        | Event::Kicked {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                            ..
+                        },
+                    ) if has_user(user.track_id()) && cm.str_eq(channel, channel_name) => {
                         self.departed_users.insert(user.track_id());
                         self.last_user_departure = Some((nick.clone(), reason.clone()));
                         let any_live = tracks.iter().any(|t| {
@@ -993,9 +999,9 @@ impl Inbox {
                             });
                         }
                     }
-                    WireKind::Quit {
+                    WireKind::Event(Event::Quit {
                         user, nick, reason, ..
-                    } if has_user(user.track_id()) => {
+                    }) if has_user(user.track_id()) => {
                         self.departed_users.insert(user.track_id());
                         self.last_user_departure = Some((nick.clone(), reason.clone()));
                         let any_live = tracks.iter().any(|t| {
@@ -1046,9 +1052,9 @@ impl Inbox {
                             });
                         }
                     }
-                    WireKind::Quit {
+                    WireKind::Event(Event::Quit {
                         user, nick, reason, ..
-                    } if dm_users.iter().any(|t| t.id == user.track_id()) => {
+                    }) if dm_users.iter().any(|t| t.id == user.track_id()) => {
                         let any_live_room = {
                             let ws = core.state.read().unwrap();
                             rooms.iter().any(|r| {

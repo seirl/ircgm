@@ -1,23 +1,8 @@
-use std::time::UNIX_EPOCH;
-
 use irc_colors::Colorize;
 
 use super::*;
 use crate::state::parse_irc_message;
 use crate::testing::test_harness;
-
-#[test]
-fn parse_server_time_handles_rfc3339_and_rejects_garbage() {
-    let ts = parse_server_time("2026-04-06T12:34:56.789Z").expect("valid server-time");
-    let millis = ts.duration_since(UNIX_EPOCH).unwrap().as_millis();
-    assert_eq!(millis, 1_775_478_896_789);
-
-    let ts_no_frac = parse_server_time("1970-01-01T00:00:05Z").expect("valid integer seconds");
-    assert_eq!(ts_no_frac.duration_since(UNIX_EPOCH).unwrap().as_secs(), 5);
-
-    assert!(parse_server_time("not-a-timestamp").is_none());
-    assert!(parse_server_time("").is_none());
-}
 
 #[test]
 fn parse_privmsg_body_unwraps_ctcp_action_only() {
@@ -104,33 +89,31 @@ async fn wire_event_to_public_event_filters_internal_variants() {
     let alice = bot.user("alice").unwrap();
     let raw = Arc::new(parse_irc_message(":srv 401 gm alice :No such nick\r\n").unwrap());
 
-    let internal_bot_left = WireEvent {
-        seq: 1,
-        raw: Arc::clone(&raw),
-        kind: WireKind::BotLeftRoom {
+    let internal_bot_left = WireEvent::new(
+        1,
+        Arc::clone(&raw),
+        WireKind::BotLeftRoom {
             channel: "#lobby".into(),
             reason: None,
         },
-    };
+    );
     assert!(internal_bot_left.to_public_event().is_none());
 
-    let internal_raw = WireEvent {
-        seq: 2,
-        raw: Arc::clone(&raw),
-        kind: WireKind::RawOnly,
-    };
+    let internal_raw = WireEvent::new(2, Arc::clone(&raw), WireKind::RawOnly);
     assert!(internal_raw.to_public_event().is_none());
 
     let send_err = WireEvent {
         seq: 3,
         raw: Arc::clone(&raw),
-        kind: WireKind::SendError {
+        kind: WireKind::Event(Event::DeliveryFailed {
             target: "alice".into(),
-            target_user_id: Some(alice.id().as_u64()),
             code: 401,
             message: "No such nick".into(),
-        },
+            raw: Arc::clone(&raw),
+        }),
+        meta: WireMeta::BounceUser(alice.id().as_u64()),
     };
+    assert_eq!(send_err.bounce_user_id(), Some(alice.id().as_u64()));
     match send_err.to_public_event() {
         Some(Event::DeliveryFailed {
             target,
@@ -145,27 +128,26 @@ async fn wire_event_to_public_event_filters_internal_variants() {
         other => panic!("expected Event::DeliveryFailed, got {other:?}"),
     }
 
-    let quit = WireEvent {
-        seq: 4,
+    let quit = WireEvent::new(
+        4,
         raw,
-        kind: WireKind::Quit {
+        WireKind::Event(Event::Quit {
             user: alice,
             nick: "alice".into(),
             channels: vec!["#lobby".into()],
             reason: Some("a.irc b.irc".into()),
-            netsplit: true,
-        },
-    };
+        }),
+    );
     match quit.to_public_event() {
         Some(Event::Quit {
             nick,
             channels,
-            netsplit,
+            reason,
             ..
         }) => {
             assert_eq!(nick, "alice");
             assert_eq!(channels, vec!["#lobby"]);
-            assert!(netsplit);
+            assert_eq!(reason.as_deref(), Some("a.irc b.irc"));
         }
         other => panic!("expected Event::Quit, got {other:?}"),
     }

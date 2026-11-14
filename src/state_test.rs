@@ -67,8 +67,8 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
     assert!(!ws.occupant_is_op(carol));
 
-    let mode_msg = parse_msg(":Bot!~bot@initial.host MODE #c +klo secret 50 Carol -v Bob\r\n");
-    ws.apply_mode_message(&mode_msg, &users);
+    // Direct interleaved multi-word mode-block parsing in `apply_channel_mode_tokens`:
+    ws.apply_channel_mode_tokens("#c", &["+klo", "secret", "50", "Carol", "-v", "Bob"], &users);
 
     let chan = &ws.channels[&ws.casemap.fold("#c")];
     let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
@@ -79,22 +79,29 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(!ws.occupant_is_voiced(bob));
     assert!(bob.prefixes.is_empty());
 
+    // Live/test `Command::ChannelMODE` parsing handles combined `+`/`-` flags (`MODE #c -o+v Carol Bob`):
+    let mode_msg = parse_msg(":Bot!~bot@initial.host MODE #c -o+v Carol Bob\r\n");
+    assert!(matches!(mode_msg.command, Command::ChannelMODE(..)));
+    ws.apply_mode_message(&mode_msg, &users);
+    let chan = &ws.channels[&ws.casemap.fold("#c")];
+    assert!(!ws.occupant_is_op(chan.member_by_nick("Carol", ws.casemap).unwrap()));
+    assert!(ws.occupant_is_voiced(chan.member_by_nick("Bob", ws.casemap).unwrap()));
+
     let m_iso = parse_msg(":srv 005 Bot CHANMODES=eIbq,k,flj,imnpst :are supported\r\n");
     if let Command::Response(Response::RPL_ISUPPORT, args) = &m_iso.command {
         ws.apply_isupport(args);
     }
-    let custom_mode = parse_msg(":Bot!~bot@initial.host MODE #c +fo 5:2 Bob\r\n");
-    ws.apply_mode_message(&custom_mode, &users);
+    let custom_mode_324 = parse_msg(":srv 324 Bot #c +fo 5:2 Bob\r\n");
+    ws.apply_mode_message(&custom_mode_324, &users);
     let bob = ws.channels[&ws.casemap.fold("#c")]
         .member_by_nick("Bob", ws.casemap)
         .unwrap();
     assert!(ws.occupant_is_op(bob));
 
-    // Live-socket `Command::ChannelMODE` normalization fixes `irc-proto`'s `-l` arg consumption (`MODE #c -lo Bob`):
-    let live_parsed: Message = ":Bot!~bot@initial.host MODE #c -lo Bob\r\n".parse().unwrap();
+    // `Command::ChannelMODE` re-tokenization fixes `irc-proto`'s `-l` arg consumption (`MODE #c -lo Bob`):
+    let live_parsed: Message = parse_msg(":Bot!~bot@initial.host MODE #c -lo Bob\r\n");
     assert!(matches!(live_parsed.command, Command::ChannelMODE(..)));
-    let normalized = normalize_inbound_message(live_parsed);
-    ws.apply_mode_message(&normalized, &users);
+    ws.apply_mode_message(&live_parsed, &users);
     let bob = ws.channels[&ws.casemap.fold("#c")]
         .member_by_nick("Bob", ws.casemap)
         .unwrap();

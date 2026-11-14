@@ -25,7 +25,7 @@ async fn packet_burst_and_wire_fair_inbox_dms_from_race() {
     let m2 = inbox.wait_cmd("!join").await.unwrap();
     assert_eq!(m1.nick, "Alice");
     assert_eq!(m2.nick, "Bob");
-    assert!(m1.seq < m2.seq);
+    assert!(m1.received_at <= m2.received_at);
 
     // `[alice, bob]` in vector order, but Bob's DM arrives FIRST on wire:
     let alice = bot.user("Alice").unwrap();

@@ -758,7 +758,6 @@ where
             AskMatchInner::Accept(val, ack) => {
                 tracing::debug!(
                     sender = %msg.nick,
-                    seq = msg.seq,
                     has_ack = ack.is_some(),
                     "ask reply accepted"
                 );

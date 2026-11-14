@@ -25,11 +25,10 @@ fn rfc1459_identity_rename_and_quit_rejoin() {
     assert_eq!(reg.get_or_create("alice2").id, t1.id);
 
     // QUIT + rejoin allocates a fresh UserTrack::id / UserId:
-    let (quit_track, netsplit) = reg
-        .mark_quit("Alice2", 42, Some("hub.eu.net leaf.us.net".into()), true)
+    let quit_track = reg
+        .mark_quit("Alice2", 42, Some("hub.eu.net leaf.us.net".into()))
         .unwrap();
     assert_eq!(quit_track.id, t1.id);
-    assert!(netsplit);
     assert!(!u1.is_online());
     assert_eq!(
         t1.status(),
@@ -37,7 +36,6 @@ fn rfc1459_identity_rename_and_quit_rejoin() {
             at_seq: 42,
             nick: "Alice2".into(),
             reason: Some("hub.eu.net leaf.us.net".into()),
-            netsplit: true,
         }
     );
 
@@ -57,14 +55,7 @@ fn rfc1459_identity_rename_and_quit_rejoin() {
 }
 
 #[test]
-fn netsplit_detection_and_account_transitions() {
-    assert!(is_netsplit_reason("hub.eu.net leaf.us.net"));
-    assert!(is_netsplit_reason("*.net *.split"));
-    assert!(!is_netsplit_reason("Quit: Leaving"));
-    assert!(!is_netsplit_reason("Ping timeout: 240 seconds"));
-    assert!(!is_netsplit_reason("single.server.net"));
-    assert!(!is_netsplit_reason("1.2 3.4"));
-
+fn account_transitions() {
     let reg = UserRegistry::default();
     let u = reg.get_or_create("Alice");
     assert_eq!(u.account(), None);

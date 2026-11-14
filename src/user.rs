@@ -29,32 +29,7 @@ pub(crate) enum UserStatus {
         at_seq: u64,
         nick: String,
         reason: Option<String>,
-        netsplit: bool,
     },
-}
-
-/// Heuristic detector for IRC server-to-server netsplit quit reasons (`"server1.tld server2.tld"`
-/// or wildcard masked `"*.net *.split"`).
-pub(crate) fn is_netsplit_reason(reason: &str) -> bool {
-    let mut parts = reason.split_whitespace();
-    let (Some(left), Some(right), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    is_server_mask(left) && is_server_mask(right)
-}
-
-fn is_server_mask(tok: &str) -> bool {
-    if tok.len() < 3 || tok.starts_with('.') || tok.ends_with('.') {
-        return false;
-    }
-    let Some((_, tld)) = tok.rsplit_once('.') else {
-        return false;
-    };
-    if tld.is_empty() || !tld.chars().any(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    tok.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*'))
 }
 
 /// Normalizes IRCv3 account strings (`"*"`, `"0"`, or `""` mean unauthenticated -> `None`).
@@ -262,15 +237,14 @@ impl UserRegistry {
         Some(track)
     }
 
-    /// Marks `nick` offline (`Quit { at_seq, nick, reason, netsplit }`) and removes it from the
+    /// Marks `nick` offline (`Quit { at_seq, nick, reason }`) and removes it from the
     /// active nick table so a future rejoin allocates a fresh `UserTrack`.
     pub(crate) fn mark_quit(
         &self,
         nick: &str,
         at_seq: u64,
         reason: Option<String>,
-        check_netsplit: bool,
-    ) -> Option<(Arc<UserTrack>, bool)> {
+    ) -> Option<Arc<UserTrack>> {
         let cm = self.casemap();
         let folded = cm.fold(nick);
         let track = {
@@ -279,19 +253,13 @@ impl UserRegistry {
             state.tracks.remove(&folded).and_then(|w| w.upgrade())
         }?;
 
-        let netsplit = check_netsplit
-            && reason
-                .as_deref()
-                .map(is_netsplit_reason)
-                .unwrap_or(false);
         let live_nick = track.nick();
         let _ = track.status_tx.send_replace(UserStatus::Quit {
             at_seq,
             nick: live_nick,
             reason,
-            netsplit,
         });
-        Some((track, netsplit))
+        Some(track)
     }
 
     /// Resolves a non-channel send-refusal / PM-block target (`401`, `486`, `716`, etc.) to
@@ -331,7 +299,6 @@ impl UserRegistry {
                     at_seq,
                     nick: live_nick,
                     reason: Some(message.to_owned()),
-                    netsplit: false,
                 });
                 (Some(track.id), Some(track.id))
             } else {

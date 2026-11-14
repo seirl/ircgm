@@ -664,10 +664,25 @@ impl WorldState {
         }
     }
 
-    /// Extracts channel `MODE` tokens from a normalized `irc::proto::Message` (`Raw("MODE")` or `324`)
-    /// and applies them via `apply_channel_mode_tokens`.
+    /// Extracts channel `MODE` tokens from an inbound `irc::proto::Message` (`ChannelMODE`,
+    /// `Raw("MODE")`, or `324 RPL_CHANNELMODEIS`) and applies them via `apply_channel_mode_tokens`.
     pub(crate) fn apply_mode_message(&mut self, msg: &Message, users: &UserRegistry) {
         match &msg.command {
+            Command::ChannelMODE(chan, modes) => {
+                if self.is_channel_name(chan) && !modes.is_empty() {
+                    let mut flags = String::new();
+                    let mut tokens = Vec::with_capacity(1 + modes.len());
+                    tokens.push(String::new());
+                    for m in modes {
+                        flags.push_str(&m.flag());
+                        if let Some(arg) = m.arg() {
+                            tokens.push(arg.to_owned());
+                        }
+                    }
+                    tokens[0] = flags;
+                    self.apply_channel_mode_tokens(chan, &tokens, users);
+                }
+            }
             Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("MODE") && args.len() >= 2 => {
                 let chan = &args[0];
                 if self.is_channel_name(chan) {
@@ -686,80 +701,12 @@ impl WorldState {
     }
 }
 
-/// Normalizes an already-decoded [`Message`] from `irc::client::ClientStream` so channel `MODE`
-/// frames share the single `Command::Raw("MODE", ...)` representation used by [`parse_irc_message`].
-pub(crate) fn normalize_inbound_message(mut msg: Message) -> Message {
-    if let Command::ChannelMODE(chan, modes) = msg.command {
-        let mut flags = String::new();
-        let mut args = Vec::with_capacity(2 + modes.len());
-        args.push(chan);
-        args.push(String::new());
-        for m in modes {
-            flags.push_str(&m.flag());
-            if let Some(arg) = m.arg() {
-                args.push(arg.to_owned());
-            }
-        }
-        args[1] = flags;
-        msg.command = Command::Raw("MODE".into(), args);
-    }
-    msg
-}
-
-/// Parses an inbound IRC wire line into [`Message`], preserving all raw arguments on channel
-/// `MODE` frames (`irc-proto`'s static `Mode::as_channel_modes` otherwise drops interleaved
-/// mode blocks like `+klo k 50 Alice -v Bob` and mis-assigns custom `005 CHANMODES` parameters).
+/// Parses an inbound IRC wire line into [`Message`] using the same `irc-proto` parser as live
+/// `ClientStream` frames.
 pub(crate) fn parse_irc_message(
     raw_line: &str,
 ) -> std::result::Result<Message, irc::proto::error::ProtocolError> {
-    let mut msg = raw_line.parse::<Message>()?;
-    if matches!(msg.command, Command::ChannelMODE(..)) {
-        if let Some(raw_args) = extract_raw_command_args(raw_line, "MODE") {
-            if raw_args.len() >= 2 {
-                msg.command = Command::Raw("MODE".into(), raw_args);
-            }
-        }
-    }
-    Ok(msg)
-}
-
-fn extract_raw_command_args(raw_line: &str, expected_cmd: &str) -> Option<Vec<String>> {
-    let mut s = raw_line.trim_end_matches(['\r', '\n']);
-    if s.starts_with('@') {
-        s = s.split_once(' ')?.1.trim_start_matches(' ');
-    }
-    if s.starts_with(':') {
-        s = s.split_once(' ')?.1.trim_start_matches(' ');
-    }
-    let (cmd, mut rest) = match s.split_once(' ') {
-        Some((c, r)) => (c, r),
-        None => (s, ""),
-    };
-    if !cmd.eq_ignore_ascii_case(expected_cmd) {
-        return None;
-    }
-    let mut args = Vec::new();
-    while !rest.is_empty() {
-        rest = rest.trim_start_matches(' ');
-        if rest.is_empty() {
-            break;
-        }
-        if let Some(trailing) = rest.strip_prefix(':') {
-            args.push(trailing.to_owned());
-            break;
-        }
-        match rest.split_once(' ') {
-            Some((tok, tail)) => {
-                args.push(tok.to_owned());
-                rest = tail;
-            }
-            None => {
-                args.push(rest.to_owned());
-                break;
-            }
-        }
-    }
-    Some(args)
+    raw_line.parse()
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@
 //! ## Library Mechanics Showcased
 //! - **Unified channel + DM [`InboxScope`] ([`Bot::inbox_scope`]):** Subscribes `InboxScope::new().room(room).dms_from(players)`
 //!   so public `#lobby` `!bid`s and secret DM `!proxy` / `!appraise` whispers arrive in **one**
-//!   strictly monotonic `ChatMessage::seq` stream — eliminating race conditions between simultaneous
+//!   strictly monotonic wire-ordered stream — eliminating race conditions between simultaneous
 //!   channel and DM plays.
 //! - **Source discrimination on a merged [`Inbox`]:** Branches cleanly on [`ChatMessage::is_dm`] vs
 //!   [`ChatMessage::is_in`] while tracking bidders by rename-proof [`UserId`].

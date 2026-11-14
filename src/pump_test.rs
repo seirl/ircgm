@@ -32,19 +32,17 @@ fn extract_numeric_handles_response_and_three_digit_raw() {
 }
 
 #[test]
-fn extract_tags_parses_server_time_account_and_bot_flags() {
+fn extract_tags_parses_account_and_bot_flags() {
     let msg = parse_irc_message(
         "@time=2026-04-06T00:00:01.000Z;account=AliceAcct;draft/bot :a!b@c PRIVMSG #x :hi\r\n",
     )
     .unwrap();
     let tags = extract_tags(&msg);
-    assert!(tags.server_time.is_some());
     assert_eq!(tags.raw_account.as_deref(), Some("AliceAcct"));
     assert!(tags.is_bot);
 
     let human_msg = parse_irc_message(":a!b@c PRIVMSG #x :hi\r\n").unwrap();
     let human_tags = extract_tags(&human_msg);
-    assert!(human_tags.server_time.is_none());
     assert!(human_tags.raw_account.is_none());
     assert!(!human_tags.is_bot);
 }
@@ -86,4 +84,32 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
     process_message(&core, nomotd, 3, &mut reg);
     assert!(reg.motd_done);
     assert!(core.registered_flag.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn self_echo_notice_updates_tracked_account_without_emitting_chat_event() {
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let cfg = BotConfig {
+        outbound_burst: usize::MAX,
+        ..BotConfig::default()
+    };
+    let (outbound, _task) =
+        OutboundSink::new(RawTransport::Test(out_tx), usize::MAX, cfg.outbound_window);
+    let core = BotCore::new("gm".into(), outbound, true, &cfg);
+    let self_track = core.users.get_or_create("gm");
+    assert_eq!(self_track.account(), None);
+
+    let mut reg = RegistrationTracker {
+        cap_pending: false,
+        motd_done: true,
+    };
+    let notice =
+        parse_irc_message("@account=GmAcct :gm!~gm@cloak NOTICE #lobby :status\r\n").unwrap();
+    process_message(&core, notice, 1, &mut reg);
+
+    assert_eq!(self_track.account().as_deref(), Some("GmAcct"));
+    assert_eq!(
+        core.state.read().unwrap().self_user_host().as_deref(),
+        Some("~gm@cloak")
+    );
 }

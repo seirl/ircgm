@@ -13,7 +13,7 @@ use irc_colors::Text;
 use crate::ask::AskConfig;
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
-use crate::message::WireKind;
+use crate::message::{Event, WireKind};
 use crate::outbound::{sanitize_reason, sanitize_text, Priority};
 use crate::room::Room;
 use crate::user::{User, UserStatus};
@@ -368,7 +368,7 @@ impl Breakout {
                 Ok(wire) => {
                     let live_cm = core.casemap();
                     match &wire.kind {
-                        WireKind::Joined { channel, user, .. }
+                        WireKind::Event(Event::Joined { channel, user, .. })
                             if live_cm.str_eq(channel, self.room.name()) =>
                         {
                             if seen_ids.contains(&user.track_id()) && user.is_online() {
@@ -376,19 +376,21 @@ impl Breakout {
                                 joined_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Parted {
-                            channel,
-                            user,
-                            nick,
-                            reason,
-                        }
-                        | WireKind::Kicked {
-                            channel,
-                            user,
-                            nick,
-                            reason,
-                            ..
-                        } if live_cm.str_eq(channel, self.room.name()) => {
+                        WireKind::Event(
+                            Event::Parted {
+                                channel,
+                                user,
+                                nick,
+                                reason,
+                            }
+                            | Event::Kicked {
+                                channel,
+                                user,
+                                nick,
+                                reason,
+                                ..
+                            },
+                        ) if live_cm.str_eq(channel, self.room.name()) => {
                             if seen_ids.contains(&user.track_id()) {
                                 joined_ids.remove(&user.track_id());
                                 if strict {
@@ -400,9 +402,9 @@ impl Breakout {
                                 gone_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Quit {
+                        WireKind::Event(Event::Quit {
                             user, nick, reason, ..
-                        } => {
+                        }) => {
                             if seen_ids.contains(&user.track_id()) {
                                 joined_ids.remove(&user.track_id());
                                 if strict {
@@ -414,30 +416,36 @@ impl Breakout {
                                 gone_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::SendError {
+                        WireKind::Event(Event::DeliveryFailed {
                             target,
-                            target_user_id: Some(uid),
                             code: 401,
                             message,
-                        } => {
-                            if let Some(u) = tracked_users.iter().find(|u| u.track_id() == *uid) {
-                                if !joined_ids.contains(uid) {
-                                    let cnt = retries.entry(*uid).or_insert(0);
-                                    if let Some(new_nick) =
-                                        u.track_arc().next_rename_retry_nick(target, cnt)
-                                    {
-                                        let _ = core.outbound.enqueue_one(
-                                            Priority::Interactive,
-                                            Command::INVITE(new_nick, self.room.name().to_owned()),
-                                            live_cm,
-                                        );
-                                    } else if strict {
-                                        return Err(Error::UserLeft {
-                                            nick: target.clone(),
-                                            reason: Some(message.clone()),
-                                        });
-                                    } else {
-                                        gone_ids.insert(*uid);
+                            ..
+                        }) => {
+                            if let Some(uid) = wire.bounce_user_id() {
+                                if let Some(u) = tracked_users.iter().find(|u| u.track_id() == uid)
+                                {
+                                    if !joined_ids.contains(&uid) {
+                                        let cnt = retries.entry(uid).or_insert(0);
+                                        if let Some(new_nick) =
+                                            u.track_arc().next_rename_retry_nick(target, cnt)
+                                        {
+                                            let _ = core.outbound.enqueue_one(
+                                                Priority::Interactive,
+                                                Command::INVITE(
+                                                    new_nick,
+                                                    self.room.name().to_owned(),
+                                                ),
+                                                live_cm,
+                                            );
+                                        } else if strict {
+                                            return Err(Error::UserLeft {
+                                                nick: target.clone(),
+                                                reason: Some(message.clone()),
+                                            });
+                                        } else {
+                                            gone_ids.insert(uid);
+                                        }
                                     }
                                 }
                             }

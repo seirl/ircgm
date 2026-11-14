@@ -14,7 +14,7 @@
 //!    preventing authors from voting for their own quip).
 //! 4. **Lightning Tiebreaker (`20s`):** Whenever two or more quips tie for first place, the tied
 //!    authors enter a sudden-death DM math buzz-in (`What is 17 * 6?`) where the first correct
-//!    answer on the wire (`ChatMessage::seq`) breaks the tie!
+//!    answer on the wire breaks the tie!
 //!
 //! ## Library Mechanics Showcased
 //! - **Concurrent per-player DM [`ircgm::Ask`]s (`FuturesUnordered`):** Inline [`AskMatch::reject`]
