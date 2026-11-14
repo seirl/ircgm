@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use futures::FutureExt as _;
 use ircgm::irc::client::data::Config as IrcConfig;
 use ircgm::prelude::*;
-use minigames::{play_by_name, PlayOutcome, GAMES};
+use minigames::{find_game, play_by_name, PlayOutcome, GAMES};
 
 const DEFAULT_SERVER: &str = "127.0.0.1:6667";
 const DEFAULT_LOBBY: &str = "#ircgm-minigames";
@@ -49,8 +49,8 @@ pub(crate) enum ParseOutcome {
 
 fn usage_text(bin: &str) -> String {
     let mut games_lines = String::new();
-    for (slug, desc) in GAMES {
-        games_lines.push_str(&format!("  {slug:<12} {desc}\n"));
+    for game in GAMES {
+        games_lines.push_str(&format!("  {:<12} {}\n", game.slug, game.summary));
     }
     format!(
         "\
@@ -289,25 +289,6 @@ fn random_suffix_4() -> String {
     out
 }
 
-/// Resolves a user-supplied game name or alias to a canonical slug in [`GAMES`].
-pub(crate) fn resolve_game_slug(raw: &str) -> Option<&'static str> {
-    let token = raw.split_whitespace().next()?;
-    let norm = token
-        .trim_start_matches('!')
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    match norm.as_str() {
-        "bj" => Some("blackjack"),
-        "coldwar" => Some("cold_war"),
-        "werewolf" | "wolves" => Some("mafia"),
-        "simon" | "simonsays" => Some("simon_says"),
-        other => GAMES
-            .iter()
-            .find(|(slug, _)| *slug == other)
-            .map(|(slug, _)| *slug),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LobbyAction {
     ListGames,
@@ -334,8 +315,8 @@ pub(crate) fn classify_lobby_command(msg: &ChatMessage) -> Option<LobbyAction> {
         if first.eq_ignore_ascii_case("random") {
             return Some(LobbyAction::StartRandom);
         }
-        return match resolve_game_slug(first) {
-            Some(slug) => Some(LobbyAction::StartGame(slug)),
+        return match find_game(first) {
+            Some(game) => Some(LobbyAction::StartGame(game.slug)),
             None => Some(LobbyAction::UnknownGame(first.to_owned())),
         };
     }
@@ -345,9 +326,9 @@ pub(crate) fn classify_lobby_command(msg: &ChatMessage) -> Option<LobbyAction> {
     if let Some(after_bang) = trimmed.strip_prefix('!') {
         let cmd_word = after_bang.split_whitespace().next().unwrap_or("");
         if !cmd_word.is_empty() {
-            if let Some(slug) = resolve_game_slug(cmd_word) {
+            if let Some(game) = find_game(cmd_word) {
                 if msg.is_cmd(&format!("!{cmd_word}")) {
-                    return Some(LobbyAction::StartGame(slug));
+                    return Some(LobbyAction::StartGame(game.slug));
                 }
             }
         }
@@ -359,7 +340,7 @@ pub(crate) fn classify_lobby_command(msg: &ChatMessage) -> Option<LobbyAction> {
 fn send_games_catalog(lobby: &Room) -> Result<()> {
     let entries: Vec<String> = GAMES
         .iter()
-        .map(|(slug, desc)| format!("{slug} ({desc})"))
+        .map(|game| format!("{} ({})", game.slug, game.summary))
         .collect();
     let mid = entries.len().div_ceil(2);
     lobby.say(irc_format!(
@@ -378,7 +359,7 @@ fn send_games_catalog(lobby: &Room) -> Result<()> {
 fn game_slug_list() -> String {
     GAMES
         .iter()
-        .map(|(slug, _)| *slug)
+        .map(|game| game.slug)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -474,7 +455,7 @@ pub(crate) async fn run_lobby_bot(bot: &Bot, lobby: &Room, admins: &[String]) ->
                 continue;
             }
             Some(LobbyAction::StartRandom) => {
-                let (picked, _) = GAMES[fastrand::usize(..GAMES.len())];
+                let picked = GAMES[fastrand::usize(..GAMES.len())].slug;
                 lobby.say(irc_format!(
                     "{} {} rolled {}!",
                     "🎲".bold(),
@@ -706,7 +687,7 @@ mod test {
     use irc::proto::Command;
     use ircgm::testing::test_harness;
 
-    use super::{parse_cli, resolve_game_slug, run_lobby_bot, ParseOutcome};
+    use super::{parse_cli, run_lobby_bot, ParseOutcome};
 
     #[test]
     fn parse_cli_handles_libera_server_and_lobby_flags() {
@@ -780,16 +761,6 @@ mod test {
         assert!(parse_cli(["game_bot", "--unknown"]).is_err());
     }
 
-    #[test]
-    fn resolve_game_slug_normalizes_hyphens_case_and_aliases() {
-        assert_eq!(resolve_game_slug("Blackjack"), Some("blackjack"));
-        assert_eq!(resolve_game_slug("bj"), Some("blackjack"));
-        assert_eq!(resolve_game_slug("cold-war"), Some("cold_war"));
-        assert_eq!(resolve_game_slug("coldwar"), Some("cold_war"));
-        assert_eq!(resolve_game_slug("!simon-says"), Some("simon_says"));
-        assert_eq!(resolve_game_slug("werewolf"), Some("mafia"));
-        assert_eq!(resolve_game_slug("nonexistent"), None);
-    }
 
     #[tokio::test(start_paused = true)]
     async fn single_lobby_allows_anyone_to_list_play_abort_and_chain_games() {

@@ -65,7 +65,7 @@ pub struct CoupTurnOutcome {
     pub steal: Option<StealResolution>,
 }
 
-/// Lobby entrypoint: recruits 2 players and runs an Ambassador Exchange + concurrent Steal round.
+/// Recruits 2 players in `lobby` and runs a Coup round.
 pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
         crate::recruit_players(lobby, "Coup: Bluff & Steal", 2..=2, Duration::from_secs(30))
@@ -73,7 +73,6 @@ pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     else {
         return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-
     let _ = run_coup_round(lobby, &players[0], &players[1]).await?;
     Ok(crate::PlayOutcome::Completed)
 }

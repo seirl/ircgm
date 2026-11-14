@@ -8,6 +8,26 @@ use ircgm::testing::test_harness;
 use crate::heist::{run_heist, Wire};
 use crate::recruit_players;
 
+#[test]
+fn game_catalog_lookup_normalizes_names_and_summaries_show_player_counts() {
+    let slug = |name: &str| find_game(name).map(|g| g.slug);
+    assert_eq!(slug("Blackjack"), Some("blackjack"));
+    assert_eq!(slug("bj"), Some("blackjack"));
+    assert_eq!(slug("cold-war"), Some("cold_war"));
+    assert_eq!(slug("coldwar"), Some("cold_war"));
+    assert_eq!(slug("!simon-says now"), Some("simon_says"));
+    assert_eq!(slug("werewolf"), Some("mafia"));
+    assert_eq!(slug("nonexistent"), None);
+    assert_eq!(slug(""), None);
+
+    assert_eq!(GAMES.len(), 8);
+    for (i, game) in GAMES.iter().enumerate() {
+        assert!(GAMES[..i].iter().all(|other| other.slug != game.slug));
+        assert_eq!(slug(game.slug), Some(game.slug));
+        assert!(game.aliases.iter().all(|alias| slug(alias) == Some(game.slug)));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_short() {
     let (bot, srv) = test_harness("GM");
@@ -53,6 +73,49 @@ async fn recruit_players_deduplicates_across_nick_change_and_times_out_when_shor
     srv.flush().await;
     tokio::time::advance(Duration::from_secs(10)).await;
     assert!(short_task.await.unwrap().unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn recruit_players_drops_recruits_who_part_get_kicked_or_quit() {
+    let (bot, srv) = test_harness("GM");
+    srv.complete_join("#lobby", &["Alice", "Bob", "Carol", "Dave"]);
+    srv.settle().await;
+    let lobby = bot.room("#lobby").unwrap();
+
+    let task = tokio::spawn({
+        let lobby = lobby.clone();
+        async move { recruit_players(&lobby, "TestGame", 2..=4, Duration::from_secs(10)).await }
+    });
+    srv.flush().await;
+
+    for nick in ["Alice", "Bob", "Carol"] {
+        srv.chat(nick, "#lobby", "!join");
+    }
+    srv.part_user("Alice", "#lobby", None);
+    srv.send_line(":GM!~GM@test.host KICK #lobby Bob :no idling");
+    srv.chat("Dave", "#lobby", "!join");
+    srv.quit_user("Carol", Some("bye"));
+    srv.settle().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    // Only Dave is still seated, so the 2-player minimum is not met:
+    assert!(task.await.unwrap().unwrap().is_none());
+
+    // A recruit who left and came back counts again, once:
+    let task = tokio::spawn({
+        let lobby = lobby.clone();
+        async move { recruit_players(&lobby, "TestGame", 2..=2, Duration::from_secs(10)).await }
+    });
+    srv.flush().await;
+    srv.chat("Dave", "#lobby", "!join");
+    srv.part_user("Dave", "#lobby", None);
+    srv.join_user("Dave", "#lobby");
+    srv.chat("Dave", "#lobby", "!join");
+    srv.join_user("Eve", "#lobby");
+    srv.chat("Eve", "#lobby", "!join");
+    let players = task.await.unwrap().unwrap().expect("2 players");
+    let nicks: Vec<String> = players.iter().map(User::nick).collect();
+    assert_eq!(nicks, ["Dave", "Eve"]);
 }
 
 #[tokio::test(start_paused = true)]

@@ -46,7 +46,6 @@ pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     else {
         return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-
     let assignments: Vec<(User, &str)> = players
         .into_iter()
         .enumerate()

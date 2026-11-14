@@ -127,7 +127,7 @@ pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
     Ok(())
 }
 
-/// Lobby entrypoint: recruits 2 thieves (`Hacker` + `Safecracker`) and runs Co-op Vault Heist.
+/// Recruits 2 players in `lobby` and runs a Co-op Vault Heist with a random safe wire.
 pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(players) =
         crate::recruit_players(lobby, "Co-op Vault Heist", 2..=2, Duration::from_secs(30)).await?

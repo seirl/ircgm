@@ -59,7 +59,6 @@ pub async fn play(_bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     else {
         return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
-
     run_round(lobby, &players).await?;
     Ok(crate::PlayOutcome::Completed)
 }

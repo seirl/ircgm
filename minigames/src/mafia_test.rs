@@ -17,7 +17,7 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
     let v1 = bot.user("Villager1").unwrap();
     let v2 = bot.user("Villager2").unwrap();
 
-    // Zero bodyguards (`&[]`) exercises `race_all` empty-iterator Pending safety!
+    // Zero bodyguards (`&[]`): dawn must not wait on a bodyguard window.
     let game = tokio::spawn({
         let bot = bot.clone();
         let room = room.clone();
@@ -70,9 +70,7 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
         .iter()
         .any(|m| m.contains("Wolf2 locked in Villager1!")));
 
-    // 5s bodyguard window (`0` guards) + 3s AFK `#graveyard` `invite_available` window:
-    tokio::time::advance(Duration::from_secs(5)).await;
-    server.flush().await;
+    // 3s AFK `#graveyard` `invite_available` window:
     tokio::time::advance(Duration::from_secs(3)).await;
     server.flush().await;
 
@@ -217,4 +215,73 @@ async fn offline_bodyguard_skipped_by_available_and_online_bodyguard_saves_wolf_
         .take_messages_to("#town")
         .iter()
         .any(|m| m.contains("Bodyguard thwarted the Werewolves' attack")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn dawn_follows_the_kill_at_once_when_no_bodyguard_is_online() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join("#town", &["Wolf1", "Guard1", "Villager1", "Villager2"]);
+    server.settle().await;
+
+    let room = bot.room("#town").unwrap();
+    let wolves = vec![bot.user("Wolf1").unwrap()];
+    let guards = vec![bot.user("Guard1").unwrap()];
+    let villagers = vec![bot.user("Villager1").unwrap(), bot.user("Villager2").unwrap()];
+    server.quit_user("Guard1", Some("AFK"));
+    server.settle().await;
+
+    let _game = tokio::spawn({
+        let bot = bot.clone();
+        let room = room.clone();
+        async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
+    });
+    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+
+    server.dm("Wolf1", "!kill Villager1");
+    server.settle().await;
+    let killed_at = Instant::now();
+    loop {
+        if server.recv_message_to("#town").await.contains("Dawn breaks") {
+            break;
+        }
+    }
+    // Previously an empty `race_all` sat out the whole 5s bodyguard window first:
+    assert!(killed_at.elapsed() < Duration::from_secs(1), "{:?}", killed_at.elapsed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn any_bodyguard_protecting_the_victim_saves_them_even_after_another_guard_answered() {
+    let (bot, mut server) = test_harness("GM");
+    server.complete_join(
+        "#town",
+        &["Wolf1", "Guard1", "Guard2", "Villager1", "Villager2"],
+    );
+    server.settle().await;
+
+    let room = bot.room("#town").unwrap();
+    let wolves = vec![bot.user("Wolf1").unwrap()];
+    let guards = vec![bot.user("Guard1").unwrap(), bot.user("Guard2").unwrap()];
+    let villagers = vec![bot.user("Villager1").unwrap(), bot.user("Villager2").unwrap()];
+    let _game = tokio::spawn({
+        let bot = bot.clone();
+        let room = room.clone();
+        async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
+    });
+    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+
+    server.dm("Wolf1", "!kill Villager1");
+    server.settle().await;
+    // Guard1 answers first but guards the wrong villager; Guard2 then guards the victim:
+    server.dm("Guard1", "!protect Villager2");
+    server.settle().await;
+    server.dm("Guard2", "!protect Villager1");
+    server.settle().await;
+
+    let dawn = loop {
+        let msg = server.recv_message_to("#town").await;
+        if msg.contains("Dawn breaks") {
+            break msg;
+        }
+    };
+    assert!(dawn.contains("Bodyguard thwarted"), "{dawn}");
 }

@@ -10,8 +10,8 @@
 //!      relay, command suppression, [`AskMatch::reject`] target validation, and
 //!      [`AskMatch::accept_say`] pack-wide lock-in confirmation (`!kill <nick>`).
 //!    - Once the pack locks in a target, all `0..=N` online Bodyguards get a `5s` midnight reflex
-//!      prompt ([`ircgm::race_all`] over [`User::ask`]) to DM `!protect <nick>` — saving the victim
-//!      if they match!
+//!      prompt (concurrent [`User::ask`]s) to DM `!protect <nick>` — saving the victim if any of
+//!      them picks it!
 //! 3. **Dawn, `#graveyard` & Secret Day Vote (`45s`):**
 //!    - Any unguarded victim is eliminated (`-v` devoiced) and non-blockingly invited to a dead-chat
 //!      `#graveyard-xxxxxx` [`Breakout`] via [`Breakout::invite_available`].
@@ -25,8 +25,8 @@
 //! - **Drop-out resilient party primitives:** [`Bot::huddle_available`] (`with_relay`),
 //!   [`Bot::exclusive_available`], and [`Breakout::invite_available`] skip offline/AFK players
 //!   cleanly without stalling or aborting the session.
-//! - **Dynamic `0..=N` interrupt racing ([`ircgm::race_all`]):** Races bodyguard `!protect` DMs and
-//!   stays safely `Pending` (never panicking!) when `0` guards are online.
+//! - **Concurrent `0..=N` DM prompts:** Joins every online bodyguard's `!protect` prompt, so dawn
+//!   comes as soon as each has answered or timed out (immediately when `0` guards are online).
 //! - **Shared-deadline DM ballots:** Combines concurrent [`User::ask`] prompts with
 //!   [`ircgm::Ask::reply_deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
 
@@ -35,10 +35,8 @@ use std::time::Duration;
 
 use futures::future::try_join_all;
 use ircgm::prelude::*;
-use ircgm::race_all;
 use tokio::time::Instant;
 
-use crate::PlayOutcome;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MafiaWinner {
@@ -89,7 +87,7 @@ impl Drop for MafiaRoomGuard<'_> {
 }
 
 /// Lobby entrypoint: recruits 4–5 players (`1–2 Werewolves`, `1 Bodyguard`, `2 Villagers`) and runs a round.
-pub async fn play(bot: &Bot, lobby: &Room) -> Result<PlayOutcome> {
+pub async fn play(bot: &Bot, lobby: &Room) -> Result<crate::PlayOutcome> {
     let Some(mut players) = crate::recruit_players(
         lobby,
         "One-Night Werewolf & Bodyguard",
@@ -98,7 +96,7 @@ pub async fn play(bot: &Bot, lobby: &Room) -> Result<PlayOutcome> {
     )
     .await?
     else {
-        return Ok(PlayOutcome::NotEnoughPlayers);
+        return Ok(crate::PlayOutcome::NotEnoughPlayers);
     };
     fastrand::shuffle(&mut players);
     let wolf_count = if players.len() >= 5 { 2 } else { 1 };
@@ -116,8 +114,8 @@ pub async fn play(bot: &Bot, lobby: &Room) -> Result<PlayOutcome> {
         let _ = v.say("🏡 You are a VILLAGER!".green().bold());
     }
 
-    let _ = run_mafia_round(bot, lobby, &wolves, &guards, &villagers).await?;
-    Ok(PlayOutcome::Completed)
+    run_mafia_round(bot, lobby, &wolves, &guards, &villagers).await?;
+    Ok(crate::PlayOutcome::Completed)
 }
 
 /// Sets channel topic, `+m`, devoices `dead`, and voices `alive` at nightfall.
@@ -224,7 +222,7 @@ pub async fn collect_secret_votes(
     .await
 }
 
-/// Orchestrates Night (`+m`, wolf huddle, bodyguard `race_all`), `#graveyard`, and secret Day Vote.
+/// Orchestrates Night (`+m`, wolf huddle, bodyguard prompts), `#graveyard`, and secret Day Vote.
 pub async fn run_mafia_round(
     bot: &Bot,
     room: &Room,
@@ -247,9 +245,9 @@ pub async fn run_mafia_round(
     }
 
     if let Some(victim) = werewolf_pack_kill(bot, wolves, &townsfolk).await? {
-        // 5s midnight reflex window across `0..=N` online Bodyguards (`race_all` stays Pending if 0):
-        let protectors = guards.iter().filter(|g| g.is_online()).map(|g| {
-            let guard = g.clone();
+        // Every online Bodyguard gets the same 5s reflex window, and the night ends once each has
+        // answered or timed out (at once if none is online). Any of them can save the victim:
+        let picks = try_join_all(guards.iter().filter(|g| g.is_online()).map(|guard| {
             let townsfolk = townsfolk.clone();
             async move {
                 let pick = guard
@@ -278,23 +276,11 @@ pub async fn run_mafia_round(
                     .no_timeout_message()
                     .await?
                     .ok();
-                match pick {
-                    Some(saved) => Ok::<(User, User), Error>((guard, saved)),
-                    None => std::future::pending().await,
-                }
+                Ok::<_, Error>(pick)
             }
-        });
-
-        let saved_victim = match Answer::from_result(
-            race_all(protectors)
-                .with_timeout(Duration::from_secs(5))
-                .await,
-        )?
-        .ok()
-        {
-            Some((_hero, protected)) => protected == victim,
-            None => false,
-        };
+        }))
+        .await?;
+        let saved_victim = picks.iter().flatten().any(|protected| *protected == victim);
 
         if saved_victim {
             room.say("☀️ Dawn breaks! 🛡️ A Bodyguard thwarted the Werewolves' attack!".cyan().bold())?;
