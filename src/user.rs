@@ -13,7 +13,7 @@ use crate::ask::{Ask, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
-use crate::exclusive_dm::{acquire_single_dm_guard, ExclusiveDm};
+use crate::exclusive_dm::{acquire_dm_lease, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
@@ -507,9 +507,10 @@ impl User {
             user_id = self.track.id,
             nick = %self.nick()
         );
-        acquire_single_dm_guard(core, self.clone(), caller)
+        let lease = acquire_dm_lease(&core, self.clone(), caller)
             .instrument(span)
-            .await
+            .await?;
+        Ok(ExclusiveDm::from_lease(core, lease, caller))
     }
 
     /// Acquires `exclusive()`, sends `prompt` in DM, starts the reply deadline *after*

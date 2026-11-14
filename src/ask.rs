@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
-use crate::exclusive_dm::ExclusiveDm;
+use crate::exclusive_dm::{wait_any_track_quit, ExclusiveDm};
 use crate::huddle::{Huddle, HuddleSender};
 use crate::inbox::Inbox;
 use crate::message::{ChatMessage, Target};
@@ -381,6 +381,10 @@ pub(crate) enum AskSource<'a> {
     BorrowedHuddle {
         huddle: &'a mut Huddle,
     },
+    HuddleMember {
+        huddle: &'a mut Huddle,
+        user: User,
+    },
     ImmediateErr(Error),
 }
 
@@ -701,6 +705,12 @@ fn make_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
             user = Option::<&str>::None,
             timeout_ms = timeout_ms
         ),
+        AskSource::HuddleMember { user, .. } => tracing::debug_span!(
+            "ircgm::ask",
+            target = "Huddle",
+            user = %user.nick(),
+            timeout_ms = timeout_ms
+        ),
         AskSource::ImmediateErr(_) => tracing::debug_span!("ircgm::ask", timeout_ms = timeout_ms),
     }
 }
@@ -897,7 +907,9 @@ where
                 }
             };
             dm.inbox().clear();
-            let receipt = dm.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
+            let receipt = dm
+                .user()
+                .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,
@@ -919,7 +931,9 @@ where
                 return Err(err);
             }
             dm.inbox().clear();
-            let receipt = dm.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
+            let receipt = dm
+                .user()
+                .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,
@@ -952,6 +966,47 @@ where
                 receipt,
             )
             .await
+        }
+        AskSource::HuddleMember { huddle, user } => {
+            huddle.check_connected()?;
+            if let Some(err) = user.quit_error() {
+                return Err(err);
+            }
+            huddle.inbox().clear();
+            let receipt = user.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
+            let (members, inbox) = huddle.split_for_ask();
+            // Only `user` answers, over the huddle's single inbox; teammates' banter meanwhile is
+            // relayed (if enabled) rather than matched:
+            let mut member_matcher = |msg: &ChatMessage| {
+                if msg.sender == user {
+                    matcher(msg).into_ask_match()
+                } else {
+                    if members.has_relay() {
+                        let _ = members.relay_to_others(msg);
+                    }
+                    AskMatch::ignore()
+                }
+            };
+            let reply = await_ask_loop(
+                &cfg,
+                &mut member_matcher,
+                EndpointSender::Dm {
+                    core: members.core(),
+                    user: &user,
+                    prompt,
+                    rename_retries: Mutex::new(0),
+                },
+                inbox,
+                receipt,
+            );
+            // The huddle inbox only ends once every member is gone, so watch `user` directly.
+            // `biased` drains replies that precede the `QUIT` on the wire first:
+            let tracks = [user.track_arc()];
+            tokio::select! {
+                biased;
+                res = reply => res,
+                err = wait_any_track_quit(&tracks) => Err(err),
+            }
         }
     }
 }

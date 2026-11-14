@@ -78,7 +78,7 @@ async fn huddle_sender_tracks_bounced_and_offline_members() {
 }
 
 #[tokio::test]
-async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock() {
+async fn empty_vs_all_offline_huddle_and_member_ask_user_without_deadlock() {
     let (bot, mut server) = test_harness("gm");
 
     // 1. Truly 0-argument huddle fails with `InvalidInput` (no fabricated `nick: ""`!):
@@ -98,16 +98,13 @@ async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock
         Ok(crate::Answer::Left { ref nick, ref reason }) if nick == "ghostwolf" && reason.as_deref() == Some("away")
     ));
 
-    // 3. `has_user`, `dm_mut`, and `ask_user` borrow the already-locked guard without self-deadlock:
+    // 3. `has_user` and `ask_user` reuse the already-held member lock without self-deadlock:
     let w1 = bot.user("wolf1").unwrap();
     let w2 = bot.user("wolf2").unwrap();
     let outsider = bot.user("villager").unwrap();
     let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
     assert!(pack.has_user(&w1));
     assert!(!pack.has_user(&outsider));
-    assert!(pack.dm_mut(&outsider).is_none());
-    pack.dm_mut(&w1).unwrap().say("Alpha instructions").unwrap();
-    assert_eq!(server.recv_message_to("wolf1").await, "Alpha instructions");
 
     let ask_member = pack.ask_user(&w2, "Confirm bite?", |m| Some(m.text.clone()));
     let drive = async {
@@ -121,5 +118,63 @@ async fn empty_vs_all_offline_huddle_and_member_dm_mut_ask_user_without_deadlock
     assert!(matches!(
         pack.ask_user(&outsider, "Hello?", |m| Some(m.text.clone())).await,
         Err(Error::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn huddle_ask_user_reads_the_shared_inbox_once_and_never_relays_the_answer() {
+    let (bot, mut server) = test_harness("gm");
+    let w1 = bot.user("wolf1").unwrap();
+    let w2 = bot.user("wolf2").unwrap();
+    let w3 = bot.user("wolf3").unwrap();
+    let mut pack = bot
+        .huddle([&w1, &w2, &w3])
+        .await
+        .unwrap()
+        .with_relay("[Pack] ");
+
+    let ask = pack.ask_user(&w2, "Confirm bite?", |m| {
+        (m.text == "yes").then(|| m.text.clone())
+    });
+    let drive = async {
+        assert_eq!(server.recv_message_to("wolf2").await, "Confirm bite?");
+        server.dm("wolf1", "bite alice");
+        server.dm("wolf2", "maybe");
+        server.dm("wolf2", "yes");
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(ask, drive);
+    assert_eq!(ans.unwrap().unwrap(), "yes");
+
+    // The prompt went to wolf2 alone; teammate banter was relayed, wolf2's replies were not:
+    assert!(server.take_messages_to("wolf1").is_empty());
+    assert_eq!(
+        server.take_messages_to("wolf2"),
+        vec!["[Pack] <wolf1> bite alice"]
+    );
+    assert_eq!(
+        server.take_messages_to("wolf3"),
+        vec!["[Pack] <wolf1> bite alice"]
+    );
+
+    // No stale copy of the exchange is left behind in the huddle inbox:
+    server.dm("wolf3", "after");
+    server.settle().await;
+    assert_eq!(pack.inbox().next_chat().await.unwrap().text, "after");
+
+    // A target quitting mid-prompt ends it right away, although teammates remain:
+    let ask = pack.ask_user(&w3, "Still there?", |m| Some(m.text.clone()));
+    let drive = async {
+        assert_eq!(server.recv_message_to("wolf3").await, "Still there?");
+        server.quit_user("wolf3", Some("bye"));
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), ask),
+        drive
+    );
+    assert!(matches!(
+        ans.expect("ask_user must not wait out its timeout").unwrap(),
+        crate::Answer::Left { ref nick, ref reason } if nick == "wolf3" && reason.as_deref() == Some("bye")
     ));
 }

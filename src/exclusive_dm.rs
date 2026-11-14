@@ -12,57 +12,91 @@ use crate::bot::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
 use crate::message::ChatMessage;
-use crate::outbound::{OutboundChatKind, WriteReceipt};
 use crate::user::{User, UserStatus, UserTrack};
 
-/// RAII guard holding exclusive access to a [`User`]'s interactive DM prompt slot
-/// plus a pre-subscribed [`Inbox`] and local [`AskConfig`].
-pub struct ExclusiveDm {
-    core: Arc<BotCore>,
+/// Held lock on a [`User`]'s interactive DM prompt slot (`UserTrack::dm_mutex`).
+///
+/// Records the holder's call site for contention warnings and clears it on `Drop`. Carries no
+/// [`Inbox`]: [`ExclusiveDm`] pairs one lease with its own inbox, while [`crate::Huddle`] pairs
+/// several leases with one shared inbox.
+pub(crate) struct DmLease {
     user: User,
-    inbox: Inbox,
-    ask_config: AskConfig,
     _guard: OwnedMutexGuard<()>,
 }
 
-impl fmt::Debug for ExclusiveDm {
+impl fmt::Debug for DmLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExclusiveDm")
+        f.debug_struct("DmLease")
             .field("user", &self.user)
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for ExclusiveDm {
+impl Drop for DmLease {
     fn drop(&mut self) {
         *self.user.track().lock_holder.lock().unwrap() = None;
     }
 }
 
+impl DmLease {
+    pub(crate) fn user(&self) -> &User {
+        &self.user
+    }
+}
+
+/// RAII guard holding exclusive access to a [`User`]'s interactive DM prompt slot
+/// plus a pre-subscribed [`Inbox`] and local [`AskConfig`].
+pub struct ExclusiveDm {
+    core: Arc<BotCore>,
+    lease: DmLease,
+    inbox: Inbox,
+    ask_config: AskConfig,
+}
+
+impl fmt::Debug for ExclusiveDm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExclusiveDm")
+            .field("user", self.user())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExclusiveDm {
+    /// Wraps `lease` with a fresh DM [`Inbox`] for its user, configured from
+    /// `BotConfig::ask_config`.
+    pub(crate) fn from_lease(
+        core: Arc<BotCore>,
+        lease: DmLease,
+        caller: &'static Location<'static>,
+    ) -> Self {
+        let mut inbox = core.inboxes.subscribe(
+            Arc::clone(&core),
+            Filter::Scoped {
+                rooms: Vec::new(),
+                dm_users: vec![lease.user().track_arc()],
+            },
+            caller,
+        );
+        let ask_config = (*core.ask_config).clone();
+        ask_config.apply_to_locked_inbox(&mut inbox);
+        Self {
+            core,
+            lease,
+            inbox,
+            ask_config,
+        }
+    }
+
     pub(crate) fn core(&self) -> &Arc<BotCore> {
         &self.core
     }
 
     pub(crate) fn split_for_ask(&mut self) -> (&Arc<BotCore>, &User, &mut Inbox) {
-        (&self.core, &self.user, &mut self.inbox)
-    }
-
-    fn live_nick(&self) -> Result<String> {
-        self.core.check_connected()?;
-        if let Some(err) = self.user.quit_error() {
-            return Err(err);
-        }
-        Ok(self.user.nick())
-    }
-
-    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
-        let nick = self.live_nick()?;
-        self.core.send_chat(kind, &nick, text)
+        (&self.core, &self.lease.user, &mut self.inbox)
     }
 
     pub fn user(&self) -> &User {
-        &self.user
+        self.lease.user()
     }
 
     pub fn with_ask_config(mut self, cfg: &AskConfig) -> Self {
@@ -87,19 +121,18 @@ impl ExclusiveDm {
         self
     }
 
+    /// Same as [`User::say`]: holding the lock changes who may prompt the user, not how
+    /// lines are sent.
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        self.send_chat(OutboundChatKind::Privmsg, text.into())
-            .map(|_| ())
+        self.user().say(text)
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        self.send_chat(OutboundChatKind::Notice, text.into())
-            .map(|_| ())
+        self.user().notice(text)
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        self.send_chat(OutboundChatKind::Action, text.into())
-            .map(|_| ())
+        self.user().action(text)
     }
 
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
@@ -122,11 +155,11 @@ impl ExclusiveDm {
     }
 }
 
-pub(crate) async fn acquire_single_dm_guard(
-    core: Arc<BotCore>,
+pub(crate) async fn acquire_dm_lease(
+    core: &Arc<BotCore>,
     user: User,
     caller: &'static Location<'static>,
-) -> Result<ExclusiveDm> {
+) -> Result<DmLease> {
     core.check_connected()?;
     if let Some(err) = user.quit_error() {
         return Err(err);
@@ -178,145 +211,97 @@ pub(crate) async fn acquire_single_dm_guard(
 
     *user.track().lock_holder.lock().unwrap() = Some(caller);
 
-    let mut inbox = core.inboxes.subscribe(
-        Arc::clone(&core),
-        Filter::Scoped {
-            rooms: Vec::new(),
-            dm_users: vec![user.track_arc()],
-        },
-        caller,
-    );
-    let ask_config = (*core.ask_config).clone();
-    ask_config.apply_to_locked_inbox(&mut inbox);
-
-    Ok(ExclusiveDm {
-        core,
+    Ok(DmLease {
         user,
-        inbox,
-        ask_config,
         _guard: guard,
     })
 }
 
-pub(crate) async fn acquire_many_dm_guards(
+/// Locks the DM prompt slots of `users` in canonical `UserTrack::id` order, so concurrent
+/// multi-user acquisitions never deadlock, and returns the leases in the caller's order.
+///
+/// With `strict`, a member who is offline, or quits before every lock is held, fails the whole
+/// call with `UserLeft` (releasing the leases already taken). Otherwise such members are
+/// skipped and the last one skipped is returned alongside the leases as `(nick, reason)`.
+pub(crate) async fn acquire_dm_leases(
     core: &Arc<BotCore>,
     users: Vec<User>,
+    strict: bool,
     caller: &'static Location<'static>,
-) -> Result<Vec<ExclusiveDm>> {
+) -> Result<(Vec<DmLease>, Option<(String, Option<String>)>)> {
     core.check_connected()?;
 
     let mut seen = HashSet::with_capacity(users.len());
+    for u in &users {
+        if !u.belongs_to(core) {
+            return Err(Error::InvalidInput(
+                "User handle belongs to a different Bot session",
+            ));
+        }
+        if !seen.insert(u.track_id()) {
+            return Err(Error::InvalidInput("duplicate User in multi-user DM lock"));
+        }
+    }
+
+    let mut skipped = None;
     let mut indexed: Vec<(usize, User)> = Vec::with_capacity(users.len());
     for (idx, u) in users.into_iter().enumerate() {
-        if !u.belongs_to(core) {
-            return Err(Error::InvalidInput(
-                "User handle belongs to a different Bot session",
-            ));
-        }
-        if !seen.insert(u.track_id()) {
-            return Err(Error::InvalidInput("duplicate User in exclusive_many"));
-        }
-        indexed.push((idx, u));
-    }
-
-    if indexed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    for (_, u) in &indexed {
-        if let Some(err) = u.quit_error() {
-            return Err(err);
+        match u.quit_error() {
+            Some(err) => skip_departed(err, strict, &mut skipped)?,
+            None => indexed.push((idx, u)),
         }
     }
 
-    // Canonical lock acquisition order (`UserTrack::id` ascending):
     indexed.sort_by_key(|(_, u)| u.track_id());
-
     let all_tracks: Vec<Arc<UserTrack>> = indexed.iter().map(|(_, u)| u.track_arc()).collect();
-    let mut acquired: Vec<(usize, ExclusiveDm)> = Vec::with_capacity(indexed.len());
-
+    let mut acquired: Vec<(usize, DmLease)> = Vec::with_capacity(indexed.len());
     for (orig_idx, u) in indexed {
-        // Watch ALL remaining/acquired members so any member quitting aborts immediately
-        // even while waiting on an earlier member's contested mutex!
-        let acquire_fut = acquire_single_dm_guard(Arc::clone(core), u, caller);
-        let other_quit_fut = wait_any_track_quit(&all_tracks);
-
-        let guard = tokio::select! {
-            biased;
-            err = other_quit_fut => return Err(err),
-            res = acquire_fut => res?,
+        let res = if strict {
+            // Any member quitting aborts at once, even while waiting on an earlier member's
+            // contested lock:
+            tokio::select! {
+                biased;
+                err = wait_any_track_quit(&all_tracks) => Err(err),
+                res = acquire_dm_lease(core, u, caller) => res,
+            }
+        } else {
+            acquire_dm_lease(core, u, caller).await
         };
-        acquired.push((orig_idx, guard));
-
-        for (_, g) in &acquired {
-            if let Some(err) = g.user().quit_error() {
-                return Err(err);
-            }
+        match res {
+            Ok(lease) => acquired.push((orig_idx, lease)),
+            Err(err) => skip_departed(err, strict, &mut skipped)?,
         }
     }
 
-    // Restore caller iteration order:
+    // Restore caller order, dropping members who quit while later locks were being acquired:
     acquired.sort_by_key(|(orig_idx, _)| *orig_idx);
-    Ok(acquired.into_iter().map(|(_, g)| g).collect())
+    let mut leases = Vec::with_capacity(acquired.len());
+    for (_, lease) in acquired {
+        match lease.user().quit_error() {
+            Some(err) => skip_departed(err, strict, &mut skipped)?,
+            None => leases.push(lease),
+        }
+    }
+    Ok((leases, skipped))
 }
 
-pub(crate) async fn acquire_available_dm_guards(
-    core: &Arc<BotCore>,
-    users: Vec<User>,
-    caller: &'static Location<'static>,
-) -> Result<(Vec<ExclusiveDm>, Option<(String, Option<String>)>)> {
-    core.check_connected()?;
-
-    let mut seen = HashSet::with_capacity(users.len());
-    let mut indexed: Vec<(usize, User)> = Vec::new();
-    let mut last_offline: Option<(String, Option<String>)> = None;
-    for (idx, u) in users.into_iter().enumerate() {
-        if !u.belongs_to(core) {
-            return Err(Error::InvalidInput(
-                "User handle belongs to a different Bot session",
-            ));
+/// Records a departed member in `skipped`, or fails with `err` if `strict` (or if `err` is not a
+/// departure).
+fn skip_departed(
+    err: Error,
+    strict: bool,
+    skipped: &mut Option<(String, Option<String>)>,
+) -> Result<()> {
+    match err {
+        Error::UserLeft { nick, reason } if !strict => {
+            *skipped = Some((nick, reason));
+            Ok(())
         }
-        if !seen.insert(u.track_id()) {
-            return Err(Error::InvalidInput("duplicate User in exclusive_available"));
-        }
-        if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
-            last_offline = Some((nick, reason));
-        } else {
-            indexed.push((idx, u));
-        }
+        err => Err(err),
     }
-
-    if indexed.is_empty() {
-        return Ok((Vec::new(), last_offline));
-    }
-
-    indexed.sort_by_key(|(_, u)| u.track_id());
-
-    let mut acquired: Vec<(usize, ExclusiveDm)> = Vec::with_capacity(indexed.len());
-    for (orig_idx, u) in indexed {
-        match acquire_single_dm_guard(Arc::clone(core), u, caller).await {
-            Ok(guard) => acquired.push((orig_idx, guard)),
-            Err(Error::UserLeft { nick, reason }) => {
-                last_offline = Some((nick, reason));
-            }
-            Err(fatal) => return Err(fatal),
-        }
-    }
-
-    // Drop any guard whose user disconnected while later guards were being acquired:
-    acquired.retain(|(_, g)| {
-        if let Some(Error::UserLeft { nick, reason }) = g.user().quit_error() {
-            last_offline = Some((nick, reason));
-            false
-        } else {
-            true
-        }
-    });
-    acquired.sort_by_key(|(orig_idx, _)| *orig_idx);
-    Ok((acquired.into_iter().map(|(_, g)| g).collect(), last_offline))
 }
 
-async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
+pub(crate) async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
     let waiters = tracks.iter().map(|t| {
         let mut rx = t.status_tx.subscribe();
         async move {

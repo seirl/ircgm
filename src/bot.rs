@@ -14,7 +14,7 @@ use crate::ask::AskConfig;
 use crate::breakout::{Breakout, BreakoutOptions};
 use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::error::{DisconnectReason, Error, Result};
-use crate::exclusive_dm::{acquire_available_dm_guards, acquire_many_dm_guards, ExclusiveDm};
+use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDm};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox, InboxRegistry, InboxScope};
 use crate::outbound::{
@@ -515,7 +515,10 @@ impl Bot {
     {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
-        acquire_many_dm_guards(&self.owner.core, collected, caller)
+        async move {
+            let (leases, _) = acquire_dm_leases(&self.owner.core, collected, true, caller).await?;
+            Ok(self.wrap_exclusive(leases, caller))
+        }
     }
 
     /// Partial/team-resilient multi-user DM lock: skips any `User` who is offline or quits
@@ -532,10 +535,21 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let (guards, _) =
-                acquire_available_dm_guards(&self.owner.core, collected, caller).await?;
-            Ok(guards)
+            let (leases, _) = acquire_dm_leases(&self.owner.core, collected, false, caller).await?;
+            Ok(self.wrap_exclusive(leases, caller))
         }
+    }
+
+    fn wrap_exclusive(
+        &self,
+        leases: Vec<DmLease>,
+        caller: &'static Location<'static>,
+    ) -> Vec<ExclusiveDm> {
+        let core = &self.owner.core;
+        leases
+            .into_iter()
+            .map(|lease| ExclusiveDm::from_lease(Arc::clone(core), lease, caller))
+            .collect()
     }
 
     /// Strict channel-free group DM deliberation guard.
@@ -551,8 +565,8 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let guards = acquire_many_dm_guards(&self.owner.core, collected, caller).await?;
-            Ok(self.build_huddle(guards, None, caller))
+            let (leases, _) = acquire_dm_leases(&self.owner.core, collected, true, caller).await?;
+            Ok(self.build_huddle(leases, None, caller))
         }
     }
 
@@ -569,20 +583,20 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let (guards, initial_offline) =
-                acquire_available_dm_guards(&self.owner.core, collected, caller).await?;
-            Ok(self.build_huddle(guards, initial_offline, caller))
+            let (leases, initial_offline) =
+                acquire_dm_leases(&self.owner.core, collected, false, caller).await?;
+            Ok(self.build_huddle(leases, initial_offline, caller))
         }
     }
 
     fn build_huddle(
         &self,
-        guards: Vec<ExclusiveDm>,
+        leases: Vec<DmLease>,
         initial_offline: Option<(String, Option<String>)>,
         caller: &'static Location<'static>,
     ) -> Huddle {
         let core = &self.owner.core;
-        let dm_users: Vec<Arc<UserTrack>> = guards.iter().map(|g| g.user().track_arc()).collect();
+        let dm_users: Vec<Arc<UserTrack>> = leases.iter().map(|l| l.user().track_arc()).collect();
         let inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
@@ -593,7 +607,7 @@ impl Bot {
         );
         Huddle::new(
             Arc::clone(core),
-            guards,
+            leases,
             initial_offline,
             inbox,
             (*core.ask_config).clone(),

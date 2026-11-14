@@ -64,12 +64,13 @@ async fn acquire_many_and_available_reject_foreign_and_duplicate_users() {
         bot1.exclusive_available([&alice1, &foreign]).await,
         Err(Error::InvalidInput(_))
     ));
-    assert!(matches!(
-        bot1.exclusive_many([&alice1, &alice1]).await,
-        Err(Error::InvalidInput(_))
-    ));
-    assert!(matches!(
-        bot1.exclusive_available([&alice1, &alice1]).await,
-        Err(Error::InvalidInput(_))
-    ));
+
+    // All four multi-user entry points share one acquisition path and one error:
+    let dup = |res: Result<()>| {
+        matches!(res, Err(Error::InvalidInput(msg)) if msg == "duplicate User in multi-user DM lock")
+    };
+    assert!(dup(bot1.exclusive_many([&alice1, &alice1]).await.map(drop)));
+    assert!(dup(bot1.exclusive_available([&alice1, &alice1]).await.map(drop)));
+    assert!(dup(bot1.huddle([&alice1, &alice1]).await.map(drop)));
+    assert!(dup(bot1.huddle_available([&alice1, &alice1]).await.map(drop)));
 }
