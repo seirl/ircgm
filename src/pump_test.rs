@@ -55,12 +55,12 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
     };
     let casemap = AtomicCaseMap::default();
     let (outbound, _task) = OutboundSink::new(
-        RawTransport::Test(out_tx),
+        RawTransport::test_only(out_tx),
         usize::MAX,
         cfg.outbound_window,
         casemap.clone(),
     );
-    let core = BotCore::new("gm".into(), casemap, outbound, true, &cfg);
+    let core = BotCore::new("gm".into(), casemap, outbound, &cfg);
 
     let mut reg = RegistrationTracker {
         cap_pending: true,
@@ -100,12 +100,12 @@ async fn self_echo_notice_updates_tracked_account_without_emitting_chat_event() 
     };
     let casemap = AtomicCaseMap::default();
     let (outbound, _task) = OutboundSink::new(
-        RawTransport::Test(out_tx),
+        RawTransport::test_only(out_tx),
         usize::MAX,
         cfg.outbound_window,
         casemap.clone(),
     );
-    let core = BotCore::new("gm".into(), casemap, outbound, true, &cfg);
+    let core = BotCore::new("gm".into(), casemap, outbound, &cfg);
     let self_track = core.users.get_or_create("gm");
     assert_eq!(self_track.account(), None);
 

@@ -99,7 +99,7 @@ async fn simon_says_runs_hud_notice_action_notice_rename_fakeout_and_bunker_rush
     tokio::time::advance(Duration::from_secs(5)).await;
 
     // Round 5 (`BunkerRush`, 3 survivors -> 2 seats!):
-    let bunker = srv.accept_breakout("#lobby-bunker", &[]).await;
+    let bunker = srv.accept_empty_breakout("#lobby-bunker").await;
 
     // `spy_bob` joins (1/2) then foolishly PARTs (0/2); `spy_alice` and `spy_cara` claim the 2 seats!
     srv.join_user("spy_bob", &bunker);

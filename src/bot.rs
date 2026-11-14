@@ -111,7 +111,6 @@ pub(crate) struct BotCore {
     pub(crate) users: UserRegistry,
     pub(crate) inboxes: InboxRegistry,
     pub(crate) outbound: Arc<OutboundSink>,
-    pub(crate) is_test_transport: bool,
     pub(crate) lifecycle_tx: watch::Sender<ConnLifecycle>,
     pub(crate) shutdown_tx: watch::Sender<bool>,
     pub(crate) inbox_capacity: usize,
@@ -134,7 +133,6 @@ impl BotCore {
         initial_nick: String,
         casemap: AtomicCaseMap,
         outbound: Arc<OutboundSink>,
-        is_test_transport: bool,
         config: &BotConfig,
     ) -> Arc<Self> {
         let (lifecycle_tx, _) = watch::channel(ConnLifecycle::Registering { welcomed: false });
@@ -145,7 +143,6 @@ impl BotCore {
             inboxes: InboxRegistry::new(casemap.clone()),
             casemap,
             outbound,
-            is_test_transport,
             lifecycle_tx,
             shutdown_tx,
             inbox_capacity: config.inbox_capacity.max(1),
@@ -330,6 +327,7 @@ pub struct Bot {
 }
 
 impl Bot {
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn from_owner(owner: Arc<BotOwner>) -> Self {
         Self { owner }
     }
@@ -367,7 +365,7 @@ impl Bot {
             config.outbound_window,
             casemap.clone(),
         );
-        let core = BotCore::new(nick.clone(), casemap, outbound, false, &config);
+        let core = BotCore::new(nick.clone(), casemap, outbound, &config);
 
         let has_caps = !config.request_caps.is_empty();
         let reg = RegistrationTracker {
@@ -894,22 +892,20 @@ impl Bot {
         // 2. Drain both Interactive and Background queues followed by QUIT:
         let quit_receipt = core.outbound.enqueue_quit(reason);
 
-        let timeout = core.handshake_timeout;
-        if core.is_test_transport {
-            tokio::time::timeout(timeout, quit_receipt.wait())
-                .await
-                .map_err(|_| Error::HandshakeTimeout {
-                    operation: "quit outbound drain",
-                })?;
+        let deadline = crate::future::deadline_after(core.handshake_timeout);
+        if tokio::time::timeout_at(deadline, quit_receipt.wait())
+            .await
+            .is_err()
+        {
             core.finalize_quit();
-            return Ok(());
+            return Err(Error::HandshakeTimeout {
+                operation: "quit outbound drain",
+            });
         }
 
-        let drain_and_close = async {
-            quit_receipt.wait().await;
-            let _ = core.wait_disconnected().await;
-        };
-        let _ = tokio::time::timeout(timeout, drain_and_close).await;
+        // Best-effort wait (within the remaining `handshake_timeout` budget) for the peer to close
+        // the connection after receiving `QUIT` so live TCP sockets flush `QUIT` cleanly:
+        let _ = tokio::time::timeout_at(deadline, core.wait_disconnected()).await;
         core.finalize_quit();
         Ok(())
     }

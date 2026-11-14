@@ -17,8 +17,8 @@ async fn packet_burst_and_wire_fair_inbox_dms_from_race() {
     let room = bot.room("#q").unwrap();
     let mut inbox = room.inbox();
 
-    server.send_line(":Alice!u@h PRIVMSG #q :!join\r\n");
-    server.send_line(":Bob!u@h PRIVMSG #q :!join\r\n");
+    server.chat("Alice", "#q", "!join");
+    server.chat("Bob", "#q", "!join");
     server.settle().await;
 
     let m1 = inbox.wait_cmd("!join").await.unwrap();
@@ -32,8 +32,8 @@ async fn packet_burst_and_wire_fair_inbox_dms_from_race() {
     let bob = bot.user("Bob").unwrap();
     let mut race = bot.inbox_dms_from([&alice, &bob]);
 
-    server.send_line(":Bob!u@h PRIVMSG GM :102\r\n");
-    server.send_line(":Alice!u@h PRIVMSG GM :102\r\n");
+    server.dm("Bob", "102");
+    server.dm("Alice", "102");
     server.settle().await;
 
     let winner = race
@@ -175,7 +175,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     server.send_line(":NickServ!s@services NOTICE GM :!heist\r\n");
     server.send_line(":irc.example.org NOTICE GM :!heist\r\n");
     server.send_line("@bot :OtherBot!b@h NOTICE #lobby :!heist\r\n");
-    server.send_line(":Alice!u@h NOTICE GM :!vote Bob\r\n");
+    server.dm_notice("Alice", "!vote Bob");
     server.chat("Alice", "#lobby", "sentinel");
     server.settle().await;
 
@@ -227,7 +227,7 @@ async fn notice_isolation_accept_notices_and_reply_mirroring() {
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("#lobby");
 
-    server.send_line(":Alice!u@h NOTICE #lobby :via_notice\r\n");
+    server.notice("Alice", "#lobby", "via_notice");
     server.settle().await;
 
     assert_eq!(
@@ -246,9 +246,7 @@ async fn unwatched_channel_zero_alloc_and_multichannel_dedup() {
     let baseline_tracks = server.tracked_user_count();
 
     for i in 0..50 {
-        server.send_line(&format!(
-            ":Stranger{i}!u@h PRIVMSG #unwatched :noisy spam {i}\r\n"
-        ));
+        server.chat(&format!("Stranger{i}"), "#unwatched", &format!("noisy spam {i}"));
     }
     server.settle().await;
     assert_eq!(server.tracked_user_count(), baseline_tracks);
@@ -261,7 +259,7 @@ async fn unwatched_channel_zero_alloc_and_multichannel_dedup() {
     let r2 = bot.room("#r2").unwrap();
     let mut multi = bot.inbox_rooms([&r1, &r2]);
 
-    server.send_line(":Alice!~Alice@test.host NICK :AliceRenamed\r\n");
+    server.rename_user("Alice", "AliceRenamed");
     server.quit_user("AliceRenamed", Some("done"));
     server.chat("Observer", "#r1", "sentinel");
     server.settle().await;

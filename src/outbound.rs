@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use irc::proto::Command;
 use irc_colors::{Span, Text};
-use tokio::sync::{mpsc, oneshot, Notify};
+#[cfg(any(test, feature = "testing"))]
+use tokio::sync::mpsc;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -150,14 +152,41 @@ impl WriteReceipt {
 
 pub(crate) enum RawTransport {
     Irc(irc::client::Sender),
-    Test(mpsc::UnboundedSender<Command>),
+    #[cfg(any(test, feature = "testing"))]
+    Test {
+        outbound_tx: mpsc::UnboundedSender<Command>,
+        /// Notified (`PumpInput::Eof`) once `QUIT` hits the wire, modeling an RFC 2812 server
+        /// closing the connection after receiving `QUIT`.
+        quit_eof_tx: Option<mpsc::UnboundedSender<crate::pump::PumpInput>>,
+    },
 }
 
 impl RawTransport {
+    #[cfg(test)]
+    pub(crate) fn test_only(outbound_tx: mpsc::UnboundedSender<Command>) -> Self {
+        Self::Test {
+            outbound_tx,
+            quit_eof_tx: None,
+        }
+    }
+
     fn send(&self, cmd: Command) -> bool {
         match self {
             RawTransport::Irc(sender) => sender.send(cmd).is_ok(),
-            RawTransport::Test(tx) => tx.send(cmd).is_ok(),
+            #[cfg(any(test, feature = "testing"))]
+            RawTransport::Test {
+                outbound_tx,
+                quit_eof_tx,
+            } => {
+                let is_quit = matches!(cmd, Command::QUIT(_));
+                let ok = outbound_tx.send(cmd).is_ok();
+                if is_quit {
+                    if let Some(eof_tx) = quit_eof_tx {
+                        let _ = eof_tx.send(crate::pump::PumpInput::Eof);
+                    }
+                }
+                ok
+            }
         }
     }
 }
@@ -308,6 +337,7 @@ impl OutboundSink {
         (sink, task)
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn enqueue_seq(&self) -> u64 {
         self.enqueue_seq.load(Ordering::Acquire)
     }
@@ -409,7 +439,7 @@ impl OutboundSink {
                     last.receipt_tx = Some(tx);
                     WriteReceipt::from_rx(rx)
                 }
-                _ => WriteReceipt::immediate(),
+                None => WriteReceipt::immediate(),
             };
             (needs_wake, receipt)
         };
@@ -420,7 +450,6 @@ impl OutboundSink {
         receipt
     }
 
-    /// Enqueues a single command under `priority` and returns its [`WriteReceipt`].
     pub(crate) fn enqueue_one(&self, priority: Priority, cmd: Command) -> WriteReceipt {
         self.enqueue_batch(priority, vec![cmd])
     }

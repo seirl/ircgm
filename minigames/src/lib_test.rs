@@ -6,7 +6,7 @@ use ircgm::prelude::*;
 use ircgm::testing::test_harness;
 
 use crate::heist::{run_heist, Wire};
-use crate::recruit_players;
+use crate::{find_game, recruit_players, GAMES};
 
 #[test]
 fn game_catalog_lookup_normalizes_names_and_summaries_show_player_counts() {
@@ -26,6 +26,9 @@ fn game_catalog_lookup_normalizes_names_and_summaries_show_player_counts() {
         assert_eq!(slug(game.slug), Some(game.slug));
         assert!(game.aliases.iter().all(|alias| slug(alias) == Some(game.slug)));
     }
+    let summary = |name: &str| find_game(name).unwrap().summary;
+    assert_eq!(summary("blackjack"), "1-4p turn-based channel Blackjack");
+    assert_eq!(summary("heist"), "2p co-op vault breach + live-scaled laser alarm");
 }
 
 #[tokio::test(start_paused = true)]
@@ -92,11 +95,10 @@ async fn recruit_players_drops_recruits_who_part_get_kicked_or_quit() {
         srv.chat(nick, "#lobby", "!join");
     }
     srv.part_user("Alice", "#lobby", None);
-    srv.send_line(":GM!~GM@test.host KICK #lobby Bob :no idling");
+    srv.kick_user("GM", "#lobby", "Bob", Some("no idling"));
     srv.chat("Dave", "#lobby", "!join");
     srv.quit_user("Carol", Some("bye"));
-    srv.settle().await;
-    tokio::time::advance(Duration::from_secs(10)).await;
+    srv.advance(Duration::from_secs(10)).await;
 
     // Only Dave is still seated, so the 2-player minimum is not met:
     assert!(task.await.unwrap().unwrap().is_none());
@@ -161,14 +163,14 @@ async fn external_supervisor_cancels_running_minigame_and_tears_down_breakout_on
     });
 
     // Wait for `run_heist` to open `#lobby-vault-xxxxxx` and invite Alice & Bob inside:
-    let vault = srv.accept_breakout("#lobby-vault", &[]).await;
+    let vault = srv
+        .accept_breakout_invite("#lobby-vault", &["Alice", "Bob"])
+        .await;
     assert!(vault.starts_with("#lobby-vault-"));
-    srv.join_user("Alice", &vault);
-    srv.join_user("Bob", &vault);
-    srv.settle().await;
 
     // Mid-heist, an authenticated staff member DMs `!stop` to the bot:
-    srv.send_line("@account=staff :Mod!~Mod@test.host PRIVMSG GM :!stop\r\n");
+    srv.set_account("Mod", Some("staff"));
+    srv.dm("Mod", "!stop");
     let outcome = supervised.await.unwrap();
     assert!(matches!(outcome, Outcome::Stopped(ExternalStop::AdminStop)));
 

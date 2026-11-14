@@ -40,7 +40,7 @@ async fn exclusive_dm_records_and_clears_lock_holder_and_syncs_inbox_flags() {
     );
 
     server.dm("alice", "!cmd_skipped");
-    server.send_line(":alice!~a@h NOTICE gm :notice_accepted\r\n");
+    server.dm_notice("alice", "notice_accepted");
     server.settle().await;
     assert_eq!(dm.inbox().next_chat().await.unwrap().text, "notice_accepted");
 

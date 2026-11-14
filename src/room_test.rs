@@ -46,7 +46,7 @@ async fn room_invite_and_inbox_user_enforce_session_and_presence() {
 #[tokio::test]
 async fn room_queries_and_moderation_batching_respect_world_state() {
     let (bot, mut server) = test_harness("gm");
-    server.send_line(":srv 005 gm MODES=2 :are supported\r\n");
+    server.isupport("MODES=2");
 
     let join_task = tokio::spawn({
         let bot = bot.clone();
@@ -54,12 +54,14 @@ async fn room_queries_and_moderation_batching_respect_world_state() {
     });
     assert!(matches!(server.recv_sent().await, Some(Command::JOIN(ch, _, _)) if ch == "#arena"));
     server.complete_join("#arena", &["+alice", "bob", "carol"]);
-    server.send_line(":srv 332 gm #arena :Championship Round\r\n");
+    server.initial_topic("#arena", "Championship Round");
     server.settle().await;
 
     let room = join_task.await.unwrap().unwrap();
     assert!(room.bot_is_op());
     assert_eq!(room.topic().as_deref(), Some("Championship Round"));
+    let nicks: Vec<String> = room.members().into_iter().map(|m| m.nick).collect();
+    assert_eq!(nicks, vec!["alice", "bob", "carol", "gm"]);
     assert_eq!(room.nicks(), vec!["alice", "bob", "carol", "gm"]);
     assert!(room.has_nick("ALICE"));
 
@@ -88,7 +90,7 @@ async fn room_queries_and_moderation_batching_respect_world_state() {
     );
 
     // De-op the bot -> moderation fails locally with NotChannelOp:
-    server.send_line(":oper!~o@h MODE #arena -o gm\r\n");
+    server.mode("oper", "#arena", "-o gm");
     server.settle().await;
     assert!(!room.bot_is_op());
     assert!(matches!(
@@ -235,7 +237,7 @@ async fn bounce_401_wakes_parked_inbox_user_with_user_left() {
     assert!(!parked.is_finished());
 
     // A `401` for alice (e.g. bouncing an unrelated DM) must wake the parked read immediately:
-    server.send_line(":srv 401 gm alice :No such nick/channel\r\n");
+    server.bounce(401, "alice", "No such nick/channel");
     let res = tokio::time::timeout(std::time::Duration::from_secs(1), parked)
         .await
         .expect("401 bounce must wake a parked UsersInRoom inbox")

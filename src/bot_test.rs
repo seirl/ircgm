@@ -32,7 +32,7 @@ async fn chat_message_reply_mirrors_kind_and_checks_bot_left_room() {
     );
 
     // 2. DM ACTION -> DM PRIVMSG:
-    server.send_line(":alice!~a@h PRIVMSG gm :\x01ACTION waves\x01\r\n");
+    server.dm_action("alice", "waves");
     let act_msg = all.next_chat().await.unwrap();
     assert!(act_msg.is_action());
     act_msg.reply("waves back").unwrap();
@@ -42,7 +42,7 @@ async fn chat_message_reply_mirrors_kind_and_checks_bot_left_room() {
     );
 
     // 3. Human NOTICE -> NOTICE:
-    server.send_line(":alice!~a@h NOTICE gm :psst\r\n");
+    server.dm_notice("alice", "psst");
     let not_msg = all.next_chat().await.unwrap();
     assert!(not_msg.is_notice());
     not_msg.reply("quiet reply").unwrap();
@@ -52,7 +52,7 @@ async fn chat_message_reply_mirrors_kind_and_checks_bot_left_room() {
     );
 
     // 4. After bot is kicked from `#lobby`, `ch_msg.reply(...)` fails locally with `BotLeftRoom`:
-    server.send_line(":oper!~o@h KICK #lobby gm :out\r\n");
+    server.kick_bot("oper", "#lobby", Some("out"));
     server.settle().await;
     assert!(matches!(
         ch_msg.reply("too late"),
@@ -200,7 +200,7 @@ async fn rejoin_after_kick_awaits_366_and_coalesces_concurrent_joins_onto_one_jo
     let (bot, mut server) = test_harness("gm");
     server.complete_join("#lobby", &["alice"]);
     server.settle().await;
-    server.send_line(":oper!~o@h KICK #lobby gm :out\r\n");
+    server.kick_bot("oper", "#lobby", Some("out"));
     server.settle().await;
 
     // Two concurrent rejoins of a `Left` channel (differently cased) send exactly one `JOIN`:
@@ -243,7 +243,7 @@ async fn rejoin_after_kick_awaits_366_and_coalesces_concurrent_joins_onto_one_jo
         server.recv_sent().await,
         Some(Command::JOIN("#vip".into(), None, None))
     );
-    server.send_line(":srv 473 gm #vip :Cannot join channel (+i)\r\n");
+    server.bounce(473, "#vip", "Cannot join channel (+i)");
     assert!(matches!(
         j3.await.unwrap(),
         Err(Error::JoinFailed { ref channel, code: 473, .. }) if channel == "#vip"
@@ -285,7 +285,7 @@ async fn join_during_parting_breakout_rejoins_instead_of_returning_dying_room() 
     }
     assert!(!rejoin.is_finished());
 
-    server.send_line(":gm!~gm@test.host PART #vault\r\n");
+    server.echo_bot_part("#vault", None);
     server.complete_join("#vault", &["alice"]);
     let room = tokio::time::timeout(Duration::from_secs(1), rejoin)
         .await
@@ -306,8 +306,8 @@ async fn kick_between_self_join_and_366_resolves_join_with_bot_left_room() {
         server.recv_sent().await,
         Some(Command::JOIN("#c".into(), None, None))
     );
-    server.send_line(":gm!~gm@test.host JOIN #c\r\n");
-    server.send_line(":oper!~o@h KICK #c gm :not welcome\r\n");
+    server.echo_bot_join("#c");
+    server.kick_bot("oper", "#c", Some("not welcome"));
     let res = tokio::time::timeout(Duration::from_secs(1), join)
         .await
         .expect("mid-join KICK must resolve Bot::join promptly")
@@ -383,7 +383,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     server.complete_join("#tmp", &[]);
     drop(setup.await.unwrap().unwrap());
     assert!(matches!(server.recv_sent().await, Some(Command::PART(ch, _)) if ch == "#tmp"));
-    server.send_line(":gm!~gm@test.host PART #tmp\r\n");
+    server.echo_bot_part("#tmp", None);
     server.settle().await;
     assert_eq!(left_at("#tmp"), None);
 
@@ -401,7 +401,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     let mut watched_inbox = watched.inbox();
     drop(watched);
     assert!(matches!(server.recv_sent().await, Some(Command::PART(ch, _)) if ch == "#watched"));
-    server.send_line(":gm!~gm@test.host PART #watched\r\n");
+    server.echo_bot_part("#watched", None);
     server.settle().await;
     assert_eq!(left_at("#watched"), Some(true));
     assert!(matches!(
@@ -416,7 +416,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     let room = bot.room("#parted").unwrap();
     room.part(None).unwrap();
     assert!(matches!(server.recv_sent().await, Some(Command::PART(ch, _)) if ch == "#parted"));
-    server.send_line(":gm!~gm@test.host PART #parted\r\n");
+    server.echo_bot_part("#parted", None);
     server.settle().await;
     assert_eq!(left_at("#parted"), Some(true));
     assert!(matches!(room.say("hi"), Err(Error::BotLeftRoom { .. })));
@@ -429,7 +429,7 @@ async fn completed_breakout_part_evicts_unwatched_channel_but_room_part_and_kick
     // 4. An involuntary `KICK` keeps `Left` even when unwatched, so `Room` handles fail locally:
     server.complete_join("#kicked", &[]);
     server.settle().await;
-    server.send_line(":oper!~o@h KICK #kicked gm :bye\r\n");
+    server.kick_bot("oper", "#kicked", Some("bye"));
     server.settle().await;
     assert_eq!(left_at("#kicked"), Some(true));
     assert!(matches!(

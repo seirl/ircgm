@@ -12,15 +12,15 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     let (logs, _guard) = common::capture_warns();
     let (bot, mut server) = test_harness("GM");
 
-    server.send_line(
-        ":irc.srv 005 GM PREFIX=(qaohv)~&@%+ MODES=4 TARGMAX=PRIVMSG:4,KICK:1 CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz CASEMAPPING=rfc1459 :are supported\r\n",
+    server.isupport(
+        "PREFIX=(qaohv)~&@%+ MODES=4 TARGMAX=PRIVMSG:4,KICK:1 CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz CASEMAPPING=rfc1459",
     );
-    server.send_line(":GM!~GM@test.host JOIN #c\r\n");
-    server.send_line(":irc.srv 332 GM #c :Initial Mafia Topic\r\n");
+    server.echo_bot_join("#c");
+    server.initial_topic("#c", "Initial Mafia Topic");
     server.send_line(":irc.srv 353 GM = #c :@GM +U1 U2 U3 U4 U5\r\n");
     server.send_line(":irc.srv 353 GM = #c :U6 U7 U8 U9 U10\r\n");
     server.send_line(":irc.srv 366 GM #c :End of /NAMES list.\r\n");
-    server.send_line(":GM!~GM@test.host MODE #c +klo secret 50 U2\r\n");
+    server.mode("GM", "#c", "+klo secret 50 U2");
     server.settle().await;
 
     let room = bot.room("#c").unwrap();
@@ -35,14 +35,14 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     assert!(!room.member(&u1).unwrap().is_op);
     assert!(room.member(&u2).unwrap().is_op);
 
-    server.send_line(":U2!~U2@test.host NICK :U2_renamed\r\n");
+    server.rename_user("U2", "U2_renamed");
     server.settle().await;
     assert!(room.has_user(&u2));
     assert_eq!(room.member(&u2).unwrap().nick, "U2_renamed");
     assert!(room.member(&u2).unwrap().is_op);
 
-    server.send_line(":U2_renamed!~U2@test.host NICK :U2\r\n");
-    server.send_line(":GM!~GM@test.host TOPIC #c :Night 1\r\n");
+    server.rename_user("U2_renamed", "U2");
+    server.topic("GM", "#c", "Night 1");
     server.settle().await;
     assert_eq!(room.topic().as_deref(), Some("Night 1"));
 
@@ -125,7 +125,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
         Command::PART("#b1".into(), None)
     );
 
-    server.send_line(":irc.srv 005 GM TARGMAX=KICK:3 :are supported\r\n");
+    server.isupport("TARGMAX=KICK:3");
     server.settle().await;
     let b2_task = tokio::spawn({
         let bot = bot.clone();
@@ -154,7 +154,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
         Command::PART("#b2".into(), None)
     );
 
-    server.send_line(":ChanServ!s@services MODE #c -o GM\r\n");
+    server.mode("ChanServ", "#c", "-o GM");
     server.settle().await;
     assert!(!room.bot_is_op());
     for res in [
@@ -177,7 +177,7 @@ async fn worldstate_isupport_batched_moderation_targmax_kick_and_not_op() {
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("#c");
 
-    server.send_line(":irc.srv 482 GM #c :You're not a channel operator\r\n");
+    server.bounce(482, "#c", "You're not a channel operator");
     server.chat("U1", "#c", "yep");
     server.settle().await;
 
@@ -251,7 +251,7 @@ async fn breakout_invite_and_wait_vs_invite_available_and_room_invite() {
             server.recv_sent().await.unwrap(),
             Command::INVITE("U3".into(), "#vault".into())
         );
-        server.send_line(":U1!~U1@test.host JOIN #vault\r\n");
+        server.join_user("U1", "#vault");
         server.quit_user("U2", Some("nah"));
         server.settle().await;
     };
@@ -275,7 +275,7 @@ async fn breakout_invite_and_wait_vs_invite_available_and_room_invite() {
             server.recv_sent().await.unwrap(),
             Command::PART("#vault".into(), None)
         );
-        server.send_line(":GM!~GM@test.host PART #vault\r\n");
+        server.echo_bot_part("#vault", None);
         server.settle().await;
     };
     let (close_res, ()) = tokio::join!(close_fut, ack_part);
@@ -352,7 +352,7 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
             server.recv_sent().await.unwrap(),
             Command::INVITE("GhostUser".into(), "#vault".into())
         );
-        server.send_line(":irc.srv 401 GM GhostUser :No such nick/channel\r\n");
+        server.bounce(401, "GhostUser", "No such nick/channel");
         server.settle().await;
     };
     let (res_401, ()) = tokio::join!(wait_401, drive_401);
@@ -370,7 +370,7 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
             Command::INVITE("Dan".into(), "#vault".into())
         );
         server.rename_user("Dan", "Danny");
-        server.send_line(":irc.srv 401 GM Dan :No such nick/channel\r\n");
+        server.bounce(401, "Dan", "No such nick/channel");
         assert_eq!(
             server.recv_sent().await.unwrap(),
             Command::INVITE("Danny".into(), "#vault".into())
@@ -392,7 +392,7 @@ async fn breakout_invite_tracks_nick_renames_quits_and_inflight_401_reinvites() 
             Command::INVITE("Eve".into(), "#vault".into())
         );
         server.rename_user("Eve", "Evelyn");
-        server.send_line(":irc.srv 401 GM Eve :No such nick/channel\r\n");
+        server.bounce(401, "Eve", "No such nick/channel");
         assert_eq!(
             server.recv_sent().await.unwrap(),
             Command::INVITE("Evelyn".into(), "#vault".into())
@@ -479,7 +479,7 @@ async fn breakout_cancelled_mid_join_parts_without_spurious_part_on_join_failed(
         server.recv_sent().await.unwrap(),
         Command::JOIN("#locked".into(), None, None)
     );
-    server.send_line(":irc.srv 473 GM #locked :Cannot join channel (+i)\r\n");
+    server.bounce(473, "#locked", "Cannot join channel (+i)");
     server.settle().await;
     let err = rejected_task.await.unwrap().unwrap_err();
     assert!(matches!(err, Error::JoinFailed { code: 473, .. }));

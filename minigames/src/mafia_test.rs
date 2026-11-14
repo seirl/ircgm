@@ -26,7 +26,7 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
         async move { run_mafia_round(&bot, &room, &wolves, &[], &villagers).await }
     });
 
-    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    let _graveyard = server.accept_empty_breakout("#town-graveyard").await;
 
     // Nightfall moderation commands:
     let mut saw_topic = false;
@@ -108,7 +108,7 @@ async fn full_mafia_round_runs_night_moderation_wolf_huddle_graveyard_and_day_vo
 async fn external_cancel_mid_night_restores_room_modes_voices_and_topic_via_raii_drop() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#town", &["Wolf1", "Villager1"]);
-    server.send_line(":irc.srv 332 GM #town :Welcome to #town!\r\n");
+    server.initial_topic("#town", "Welcome to #town!");
     server.settle().await;
 
     let room = bot.room("#town").unwrap();
@@ -125,7 +125,7 @@ async fn external_cancel_mid_night_restores_room_modes_voices_and_topic_via_raii
         }
     });
 
-    let graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    let graveyard = server.accept_empty_breakout("#town-graveyard").await;
     server.flush().await;
     while server.try_recv_sent().is_some() {}
 
@@ -190,7 +190,7 @@ async fn offline_bodyguard_skipped_by_available_and_online_bodyguard_saves_wolf_
         async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
     });
 
-    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    let _graveyard = server.accept_empty_breakout("#town-graveyard").await;
 
     // Wolf1 bites Villager1, and online Guard2 DMs `!protect Villager1` within 5s!
     server.dm("Wolf1", "!kill Villager1");
@@ -235,7 +235,7 @@ async fn dawn_follows_the_kill_at_once_when_no_bodyguard_is_online() {
         let room = room.clone();
         async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
     });
-    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    let _graveyard = server.accept_empty_breakout("#town-graveyard").await;
 
     server.dm("Wolf1", "!kill Villager1");
     server.settle().await;
@@ -267,7 +267,7 @@ async fn any_bodyguard_protecting_the_victim_saves_them_even_after_another_guard
         let room = room.clone();
         async move { run_mafia_round(&bot, &room, &wolves, &guards, &villagers).await }
     });
-    let _graveyard = server.accept_breakout("#town-graveyard", &[]).await;
+    let _graveyard = server.accept_empty_breakout("#town-graveyard").await;
 
     server.dm("Wolf1", "!kill Villager1");
     server.settle().await;

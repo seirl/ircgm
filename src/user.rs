@@ -357,6 +357,7 @@ impl UserRegistry {
         state.last_former_count = 0;
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn tracked_map_len(&self) -> usize {
         self.state.lock().unwrap().tracks.len()
     }

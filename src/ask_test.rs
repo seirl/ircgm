@@ -177,7 +177,7 @@ async fn huddle_ask_ends_when_the_last_reachable_member_quits_after_others_bounc
     let drive = async {
         assert_eq!(server.recv_message_to("w1").await, "Target?");
         assert_eq!(server.recv_message_to("w2").await, "Target?");
-        server.send_line(":srv 716 gm w1 :is in +g mode\r\n");
+        server.bounce(716, "w1", "is in +g mode");
         server.settle().await;
         for _ in 0..3 {
             tokio::task::yield_now().await;
@@ -200,7 +200,7 @@ async fn huddle_ask_ends_when_the_last_reachable_member_quits_after_others_bounc
     let drive = async {
         assert_eq!(server.recv_message_to("w3").await, "Target?");
         assert_eq!(server.recv_message_to("w4").await, "Target?");
-        server.send_line(":srv 716 gm w3 :is in +g mode\r\n");
+        server.bounce(716, "w3", "is in +g mode");
         server.quit_user("w4", Some("gone"));
         server.settle().await;
     };

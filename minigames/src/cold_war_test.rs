@@ -18,11 +18,12 @@ async fn cold_war_relays_hotline_banter_and_resolves_betrayal_in_breakout_rooms(
         async move { run_cold_war(&bot, &lobby, &kennedy, &khrushchev).await }
     });
 
-    let usa_chan = server.accept_breakout("#lobby-usa", &[]).await;
-    let ussr_chan = server.accept_breakout("#lobby-ussr", &[]).await;
-    server.join_user("Kennedy", &usa_chan);
-    server.join_user("Khrushchev", &ussr_chan);
-    server.settle().await;
+    let usa_chan = server
+        .accept_breakout_invite("#lobby-usa", &["Kennedy"])
+        .await;
+    let ussr_chan = server
+        .accept_breakout_invite("#lobby-ussr", &["Khrushchev"])
+        .await;
     let _ = server.take_messages_to(&usa_chan);
     let _ = server.take_messages_to(&ussr_chan);
 

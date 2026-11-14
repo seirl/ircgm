@@ -38,7 +38,7 @@ async fn quiplash_handles_validation_reject_pm_block_716_warning_timeout_and_vot
     let _ = server.take_messages_to("Dan");
 
     // Bob has `+g` callerid enabled (`716`):
-    server.send_line(":irc.srv 716 GM Bob :is in +g mode\r\n");
+    server.bounce(716, "Bob", "is in +g mode");
 
     // Alice sends >80 chars (rejected!), then a valid quip; Dan submits a valid quip:
     server.dm("Alice", &"x".repeat(85));

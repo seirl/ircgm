@@ -1,13 +1,20 @@
+//! In-memory [`Bot`] / [`TestServer`] harness for deterministic tests without sockets or an IRCd.
+//!
+//! Available in this crate's own unit tests, and to other crates (integration tests, downstream
+//! game test suites) through the `testing` Cargo feature, typically enabled from
+//! `[dev-dependencies]`: `ircgm = { version = "..", features = ["testing"] }`.
+
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use irc::proto::Command;
 use irc_colors::Text;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bot::{Bot, BotConfig, BotCore, BotOwner};
-use crate::casemap::{AtomicCaseMap, CaseMap};
+use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::pump::{run_pump, PumpInput, PumpSource, RegistrationTracker};
 use crate::state::parse_irc_message;
@@ -31,12 +38,15 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
 
     let casemap = AtomicCaseMap::default();
     let (outbound, outbound_task) = OutboundSink::new(
-        RawTransport::Test(outbound_tx),
+        RawTransport::Test {
+            outbound_tx,
+            quit_eof_tx: Some(inbound_tx.clone()),
+        },
         config.outbound_burst,
         config.outbound_window,
         casemap.clone(),
     );
-    let core = BotCore::new(initial_nick.clone(), casemap, outbound, true, &config);
+    let core = BotCore::new(initial_nick.clone(), casemap, outbound, &config);
     core.mark_registered();
     let reg = RegistrationTracker {
         cap_pending: false,
@@ -61,29 +71,97 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
         inbound_tx,
         outbound_rx,
         pending_cmds: VecDeque::new(),
+        peers: Mutex::new(PeerTable::default()),
         core: weak_core,
         fallback_nick: initial_nick,
     };
     (bot, server)
 }
 
+#[derive(Clone, Debug)]
+struct PeerIdentity {
+    user_host: String,
+    account: Option<String>,
+}
+
+#[derive(Default)]
+struct PeerTable {
+    casemap: CaseMap,
+    by_nick: HashMap<FoldedStr, PeerIdentity>,
+}
+
+impl PeerTable {
+    fn sync_casemap(&mut self, cm: CaseMap) {
+        if self.casemap != cm {
+            self.casemap = cm;
+            let old = std::mem::take(&mut self.by_nick);
+            self.by_nick = old
+                .into_iter()
+                .map(|(k, v)| (cm.fold(k.as_str()), v))
+                .collect();
+        }
+    }
+
+    fn get_or_insert(&mut self, nick: &str, cm: CaseMap) -> &mut PeerIdentity {
+        self.sync_casemap(cm);
+        self.by_nick
+            .entry(cm.fold(nick))
+            .or_insert_with(|| PeerIdentity {
+                user_host: format!("~{nick}@test.host"),
+                account: None,
+            })
+    }
+}
+
 /// Deterministic in-memory test harness peer for driving [`Bot`] without sockets or an IRCd.
+///
+/// Tracks per-nick `ident@host` masks and optional IRCv3 `account` identities across [`rename_user`](Self::rename_user)
+/// and [`quit_user`](Self::quit_user) so multi-step presence, moderation, and message tests never
+/// have to hand-craft wire strings unless testing raw parser edge cases via [`send_line`](Self::send_line).
 pub struct TestServer {
     inbound_tx: mpsc::UnboundedSender<PumpInput>,
     outbound_rx: mpsc::UnboundedReceiver<Command>,
     pending_cmds: VecDeque<Command>,
+    peers: Mutex<PeerTable>,
     core: Weak<BotCore>,
     fallback_nick: String,
 }
 
 impl TestServer {
-    fn current_nick_and_casemap(&self) -> (String, CaseMap) {
+    fn bot_identity(&self) -> (String, String, CaseMap) {
         if let Some(core) = self.core.upgrade() {
             let ws = core.state.read().unwrap();
-            (ws.current_nick.clone(), core.casemap())
+            let bn = ws.current_nick.clone();
+            let uh = ws
+                .self_user_host()
+                .unwrap_or_else(|| format!("~{bn}@test.host"));
+            (bn, uh, core.casemap())
         } else {
-            (self.fallback_nick.clone(), CaseMap::default())
+            let bn = self.fallback_nick.clone();
+            let uh = format!("~{bn}@test.host");
+            (bn, uh, CaseMap::default())
         }
+    }
+
+    fn current_nick_and_casemap(&self) -> (String, CaseMap) {
+        let (bn, _, cm) = self.bot_identity();
+        (bn, cm)
+    }
+
+    /// Resolves `(optional_account_tag_prefix, "<nick>!<ident>@<host>")` for `nick` (using the
+    /// bot's own mask when `nick` matches the bot's current nick).
+    fn actor_prefix(&self, nick: &str) -> (String, String) {
+        let (bot_nick, bot_uh, cm) = self.bot_identity();
+        if cm.str_eq(nick, &bot_nick) {
+            return (String::new(), format!("{nick}!{bot_uh}"));
+        }
+        let mut peers = self.peers.lock().unwrap();
+        let peer = peers.get_or_insert(nick, cm);
+        let tag = match &peer.account {
+            Some(acct) => format!("@account={acct} "),
+            None => String::new(),
+        };
+        (tag, format!("{nick}!{}", peer.user_host))
     }
 
     #[doc(hidden)]
@@ -111,79 +189,213 @@ impl TestServer {
         let _ = self.inbound_tx.send(PumpInput::Line(Box::new(msg)));
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host PRIVMSG <channel> :<text>\r\n`.
+    /// Sets the `ident@host` mask used for subsequent lines emitted by `nick` (preserved across
+    /// [`rename_user`](Self::rename_user) until [`quit_user`](Self::quit_user)).
+    pub fn set_user_host(&self, nick: &str, ident: &str, host: &str) {
+        let (_, cm) = self.current_nick_and_casemap();
+        let mut peers = self.peers.lock().unwrap();
+        peers.get_or_insert(nick, cm).user_host = format!("{ident}@{host}");
+    }
+
+    /// Sets (or clears) the IRCv3 `account` attached via `@account=` tags on subsequent messages
+    /// and `extended-join` lines from `nick` without emitting an `ACCOUNT` wire frame.
+    pub fn set_account(&self, nick: &str, account: Option<&str>) {
+        let (_, cm) = self.current_nick_and_casemap();
+        let mut peers = self.peers.lock().unwrap();
+        peers.get_or_insert(nick, cm).account = account.map(str::to_owned);
+    }
+
+    /// Updates `nick`'s tracked account and injects an IRCv3 `account-notify` frame
+    /// (`:<nick>!<ident>@<host> ACCOUNT <account|*>\r\n`).
+    pub fn account_notify(&self, nick: &str, account: Option<&str>) {
+        self.set_account(nick, account);
+        let (_, mask) = self.actor_prefix(nick);
+        let acct_tok = account.unwrap_or("*");
+        self.send_line(&format!(":{mask} ACCOUNT {acct_tok}\r\n"));
+    }
+
+    /// Injects `PRIVMSG <channel> :<text>` from `nick` (with `@account=` if set).
     pub fn chat(&self, nick: &str, channel: &str, text: &str) {
-        self.send_line(&format!(":{nick}!~{nick}@test.host PRIVMSG {channel} :{text}\r\n"));
+        let (tag, mask) = self.actor_prefix(nick);
+        self.send_line(&format!("{tag}:{mask} PRIVMSG {channel} :{text}\r\n"));
     }
 
-    /// Convenience helper: injects a CTCP `/me` action (`\x01ACTION <action_text>\x01`) to `target`.
+    /// Injects a CTCP `/me` action (`\x01ACTION <action_text>\x01`) to `target`.
     pub fn action(&self, nick: &str, target: &str, action_text: &str) {
+        let (tag, mask) = self.actor_prefix(nick);
         self.send_line(&format!(
-            ":{nick}!~{nick}@test.host PRIVMSG {target} :\x01ACTION {action_text}\x01\r\n"
+            "{tag}:{mask} PRIVMSG {target} :\x01ACTION {action_text}\x01\r\n"
         ));
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host NOTICE <target> :<text>\r\n`.
+    /// Injects `NOTICE <target> :<text>` from `nick` (with `@account=` if set).
     pub fn notice(&self, nick: &str, target: &str, text: &str) {
-        self.send_line(&format!(
-            ":{nick}!~{nick}@test.host NOTICE {target} :{text}\r\n"
-        ));
+        let (tag, mask) = self.actor_prefix(nick);
+        self.send_line(&format!("{tag}:{mask} NOTICE {target} :{text}\r\n"));
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host PRIVMSG <bot_nick> :<text>\r\n`.
+    /// Injects a DM `PRIVMSG <bot_nick> :<text>` from `nick` (with `@account=` if set).
     pub fn dm(&self, nick: &str, text: &str) {
         let (bot_nick, _) = self.current_nick_and_casemap();
-        self.send_line(&format!(
-            ":{nick}!~{nick}@test.host PRIVMSG {bot_nick} :{text}\r\n"
-        ));
+        self.chat(nick, &bot_nick, text);
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host NOTICE <bot_nick> :<text>\r\n`.
+    /// Injects a DM `NOTICE <bot_nick> :<text>` from `nick` (with `@account=` if set).
     pub fn dm_notice(&self, nick: &str, text: &str) {
         let (bot_nick, _) = self.current_nick_and_casemap();
-        self.send_line(&format!(
-            ":{nick}!~{nick}@test.host NOTICE {bot_nick} :{text}\r\n"
-        ));
+        self.notice(nick, &bot_nick, text);
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host JOIN <channel>\r\n`.
+    /// Injects a DM CTCP `/me` action to `<bot_nick>` from `nick`.
+    pub fn dm_action(&self, nick: &str, action_text: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.action(nick, &bot_nick, action_text);
+    }
+
+    /// Injects `JOIN <channel>` from `nick` (using `extended-join` syntax automatically if `nick`
+    /// has an active account set via [`set_account`](Self::set_account)).
     pub fn join_user(&self, nick: &str, channel: &str) {
-        self.send_line(&format!(":{nick}!~{nick}@test.host JOIN {channel}\r\n"));
-    }
-
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host PART <channel> [:<reason>]\r\n`.
-    pub fn part_user(&self, nick: &str, channel: &str, reason: Option<&str>) {
-        match reason {
-            Some(r) => self.send_line(&format!(
-                ":{nick}!~{nick}@test.host PART {channel} :{r}\r\n"
-            )),
-            None => self.send_line(&format!(":{nick}!~{nick}@test.host PART {channel}\r\n")),
+        let (_, cm) = self.current_nick_and_casemap();
+        let (mask, acct) = {
+            let mut peers = self.peers.lock().unwrap();
+            let peer = peers.get_or_insert(nick, cm);
+            (format!("{nick}!{}", peer.user_host), peer.account.clone())
+        };
+        match acct {
+            Some(a) => self.send_line(&format!(":{mask} JOIN {channel} {a} :{nick}\r\n")),
+            None => self.send_line(&format!(":{mask} JOIN {channel}\r\n")),
         }
     }
 
-    /// Convenience helper: injects `:<old_nick>!~<old_nick>@test.host NICK <new_nick>\r\n`.
+    /// Updates `nick`'s tracked account and injects an IRCv3 `extended-join` frame
+    /// (`:<nick>!<ident>@<host> JOIN <channel> <account|*> :<nick>\r\n`).
+    pub fn join_user_with_account(&self, nick: &str, channel: &str, account: Option<&str>) {
+        self.set_account(nick, account);
+        let (_, mask) = self.actor_prefix(nick);
+        let acct_tok = account.unwrap_or("*");
+        self.send_line(&format!(":{mask} JOIN {channel} {acct_tok} :{nick}\r\n"));
+    }
+
+    /// Injects `PART <channel> [:<reason>]` from `nick` (preserving `nick`'s `ident@host`).
+    pub fn part_user(&self, nick: &str, channel: &str, reason: Option<&str>) {
+        let (_, mask) = self.actor_prefix(nick);
+        match reason {
+            Some(r) => self.send_line(&format!(":{mask} PART {channel} :{r}\r\n")),
+            None => self.send_line(&format!(":{mask} PART {channel}\r\n")),
+        }
+    }
+
+    /// Injects `NICK <new_nick>` from `old_nick` and transfers `old_nick`'s `ident@host` and
+    /// `account` identity to `new_nick`.
     pub fn rename_user(&self, old_nick: &str, new_nick: &str) {
+        let (_, cm) = self.current_nick_and_casemap();
+        let user_host = {
+            let mut peers = self.peers.lock().unwrap();
+            peers.sync_casemap(cm);
+            let moved = peers
+                .by_nick
+                .remove(&cm.fold(old_nick))
+                .unwrap_or_else(|| PeerIdentity {
+                    user_host: format!("~{old_nick}@test.host"),
+                    account: None,
+                });
+            let uh = moved.user_host.clone();
+            peers.by_nick.insert(cm.fold(new_nick), moved);
+            uh
+        };
+        self.send_line(&format!(":{old_nick}!{user_host} NICK :{new_nick}\r\n"));
+    }
+
+    /// Injects `KICK <channel> <victim> [:<reason>]` by `kicker`.
+    pub fn kick_user(&self, kicker: &str, channel: &str, victim: &str, reason: Option<&str>) {
+        let (_, mask) = self.actor_prefix(kicker);
+        match reason {
+            Some(r) => self.send_line(&format!(":{mask} KICK {channel} {victim} :{r}\r\n")),
+            None => self.send_line(&format!(":{mask} KICK {channel} {victim}\r\n")),
+        }
+    }
+
+    /// Injects `KICK <channel> <bot_nick> [:<reason>]` kicking the bot from `channel`.
+    pub fn kick_bot(&self, kicker: &str, channel: &str, reason: Option<&str>) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.kick_user(kicker, channel, &bot_nick, reason);
+    }
+
+    /// Injects the server echo of the bot's own `JOIN <channel>` without `353`/`366`.
+    pub fn echo_bot_join(&self, channel: &str) {
+        let (bot_nick, user_host, _) = self.bot_identity();
+        self.send_line(&format!(":{bot_nick}!{user_host} JOIN {channel}\r\n"));
+    }
+
+    /// Injects the server echo of the bot's own `PART <channel> [:<reason>]`.
+    pub fn echo_bot_part(&self, channel: &str, reason: Option<&str>) {
+        let (bot_nick, user_host, _) = self.bot_identity();
+        match reason {
+            Some(r) => self.send_line(&format!(":{bot_nick}!{user_host} PART {channel} :{r}\r\n")),
+            None => self.send_line(&format!(":{bot_nick}!{user_host} PART {channel}\r\n")),
+        }
+    }
+
+    /// Injects `MODE <channel> <modes_and_args>` by `actor`.
+    pub fn mode(&self, actor: &str, channel: &str, modes_and_args: &str) {
+        let (_, mask) = self.actor_prefix(actor);
+        self.send_line(&format!(":{mask} MODE {channel} {modes_and_args}\r\n"));
+    }
+
+    /// Injects `TOPIC <channel> :<text>` by `actor`.
+    pub fn topic(&self, actor: &str, channel: &str, text: &str) {
+        let (_, mask) = self.actor_prefix(actor);
+        self.send_line(&format!(":{mask} TOPIC {channel} :{text}\r\n"));
+    }
+
+    /// Injects `332 RPL_TOPIC` (`:test.srv 332 <bot_nick> <channel> :<text>`).
+    pub fn initial_topic(&self, channel: &str, text: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.send_line(&format!(":test.srv 332 {bot_nick} {channel} :{text}\r\n"));
+    }
+
+    /// Injects `001 RPL_WELCOME` (`:test.srv 001 <bot_nick> :<welcome_text>`).
+    pub fn welcome(&self, welcome_text: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.send_line(&format!(":test.srv 001 {bot_nick} :{welcome_text}\r\n"));
+    }
+
+    /// Injects `005 RPL_ISUPPORT` (`:test.srv 005 <bot_nick> <tokens> :are supported by this server`).
+    pub fn isupport(&self, tokens: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
         self.send_line(&format!(
-            ":{old_nick}!~{old_nick}@test.host NICK {new_nick}\r\n"
+            ":test.srv 005 {bot_nick} {tokens} :are supported by this server\r\n"
+        ));
+    }
+
+    /// Injects a server error/bounce numeric (`401`, `404`, `473`, `482`, `486`, `716`, etc.)
+    /// formatted as `:test.srv <code:03> <bot_nick> <target> :<reason>\r\n`.
+    pub fn bounce(&self, code: u16, target: &str, reason: &str) {
+        let (bot_nick, _) = self.current_nick_and_casemap();
+        self.send_line(&format!(
+            ":test.srv {code:03} {bot_nick} {target} :{reason}\r\n"
         ));
     }
 
     /// Convenience helper: injects self `JOIN`, `353 RPL_NAMREPLY` (`@<bot_nick>` + `names`),
-    /// and `366 RPL_ENDOFNAMES`.
+    /// and `366 RPL_ENDOFNAMES`. Any `nick!ident@host` masks in `names` also seed [`TestServer`]'s
+    /// peer hostmask table.
     pub fn complete_join(&self, channel: &str, names: &[&str]) {
-        let (bot_nick, user_host, cm) = if let Some(core) = self.core.upgrade() {
-            let ws = core.state.read().unwrap();
-            let bn = ws.current_nick.clone();
-            let uh = ws
-                .self_user_host()
-                .unwrap_or_else(|| format!("~{bn}@test.host"));
-            (bn, uh, core.casemap())
-        } else {
-            let bn = self.fallback_nick.clone();
-            let uh = format!("~{bn}@test.host");
-            (bn, uh, CaseMap::default())
-        };
+        let (bot_nick, user_host, cm) = self.bot_identity();
         self.send_line(&format!(":{bot_nick}!{user_host} JOIN {channel}\r\n"));
+
+        {
+            let mut peers = self.peers.lock().unwrap();
+            peers.sync_casemap(cm);
+            for entry in names {
+                let stripped = entry.trim_start_matches(['~', '&', '@', '%', '+']);
+                if let Some((bare, uh)) = stripped.split_once('!') {
+                    if !cm.str_eq(bare, &bot_nick) && !uh.is_empty() {
+                        peers.get_or_insert(bare, cm).user_host = uh.to_owned();
+                    }
+                }
+            }
+        }
 
         let bot_already_listed = names.iter().any(|entry| {
             let stripped = entry.trim_start_matches(['~', '&', '@', '%', '+']);
@@ -207,11 +419,22 @@ impl TestServer {
         ));
     }
 
-    /// Convenience helper: injects `:<nick>!~<nick>@test.host QUIT [:<reason>]\r\n`.
+    /// Injects `QUIT [:<reason>]` from `nick` and removes `nick`'s tracked peer identity so a
+    /// subsequent rejoin starts as a fresh user.
     pub fn quit_user(&self, nick: &str, reason: Option<&str>) {
+        let (_, cm) = self.current_nick_and_casemap();
+        let user_host = {
+            let mut peers = self.peers.lock().unwrap();
+            peers.sync_casemap(cm);
+            peers
+                .by_nick
+                .remove(&cm.fold(nick))
+                .map(|p| p.user_host)
+                .unwrap_or_else(|| format!("~{nick}@test.host"))
+        };
         match reason {
-            Some(r) => self.send_line(&format!(":{nick}!~{nick}@test.host QUIT :{r}\r\n")),
-            None => self.send_line(&format!(":{nick}!~{nick}@test.host QUIT\r\n")),
+            Some(r) => self.send_line(&format!(":{nick}!{user_host} QUIT :{r}\r\n")),
+            None => self.send_line(&format!(":{nick}!{user_host} QUIT\r\n")),
         }
     }
 
@@ -251,6 +474,13 @@ impl TestServer {
         }
     }
 
+    /// Advances Tokio's paused virtual clock by `duration` and immediately [`settle`](Self::settle)s
+    /// woken timer tasks, pump events, and outbound writes.
+    pub async fn advance(&self, duration: Duration) {
+        tokio::time::advance(duration).await;
+        self.settle().await;
+    }
+
     /// Waits for an outbound `JOIN` whose channel starts with `prefix` (must explicitly start with
     /// `'#'` or `'&'`, e.g. `"#vault"` or `"##lobby-vault"`), preserves all other outbound commands
     /// in `recv_sent` order, completes `JOIN` + `NAMES` with `names`, settles the pump/outbound
@@ -260,41 +490,40 @@ impl TestServer {
             prefix.starts_with(['#', '&']),
             "TestServer::accept_breakout prefix {prefix:?} must start with '#' or '&'"
         );
-        let expected_prefix = prefix;
-
-        let ch = loop {
-            while let Ok(cmd) = self.outbound_rx.try_recv() {
-                self.pending_cmds.push_back(cmd);
-            }
-            let (_, cm) = self.current_nick_and_casemap();
-            if let Some(idx) = self.pending_cmds.iter().position(|cmd| {
-                matches!(
-                    cmd,
-                    Command::JOIN(chan, _, _)
-                        if chan.len() >= expected_prefix.len()
-                            && chan.is_char_boundary(expected_prefix.len())
-                            && cm.str_eq(&chan[..expected_prefix.len()], expected_prefix)
-                )
-            }) {
-                let Some(Command::JOIN(chan, _, _)) = self.pending_cmds.remove(idx) else {
-                    unreachable!()
-                };
-                break chan;
-            }
-
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound_rx.recv())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("TestServer::accept_breakout timed out waiting for JOIN {expected_prefix}*")
-                })
-                .unwrap_or_else(|| {
-                    panic!("TestServer::accept_breakout saw outbound channel close before JOIN {expected_prefix}*")
-                });
-            self.pending_cmds.push_back(next);
-        };
-
+        let ch = self
+            .recv_matching(&format!("JOIN {prefix}*"), |cmd, cm| match cmd {
+                Command::JOIN(chan, _, _)
+                    if chan.len() >= prefix.len()
+                        && chan.is_char_boundary(prefix.len())
+                        && cm.str_eq(&chan[..prefix.len()], prefix) =>
+                {
+                    Some(chan.clone())
+                }
+                _ => None,
+            })
+            .await;
         self.complete_join(&ch, names);
         self.settle().await;
+        ch
+    }
+
+    /// Accepts an initially empty breakout room matching `prefix` (`353` contains only `@<bot>`),
+    /// settles the pump/outbound tasks, and returns the joined breakout channel name.
+    pub async fn accept_empty_breakout(&mut self, prefix: &str) -> String {
+        self.accept_breakout(prefix, &[]).await
+    }
+
+    /// Accepts an initially empty breakout room matching `prefix` (`353` contains only `@<bot>`),
+    /// settles any immediate `INVITE` burst, joins each `invitees` nick via [`join_user`](Self::join_user),
+    /// settles again, and returns the breakout channel name.
+    pub async fn accept_breakout_invite(&mut self, prefix: &str, invitees: &[&str]) -> String {
+        let ch = self.accept_breakout(prefix, &[]).await;
+        if !invitees.is_empty() {
+            for nick in invitees {
+                self.join_user(nick, &ch);
+            }
+            self.settle().await;
+        }
         ch
     }
 
@@ -321,25 +550,16 @@ impl TestServer {
     /// (case-folded), while preserving commands addressed to other targets or non-message commands
     /// (`MODE`, `KICK`, `PART`) in `recv_sent` order.
     pub fn take_messages_to(&mut self, target: &str) -> Vec<String> {
-        while let Ok(cmd) = self.outbound_rx.try_recv() {
-            self.pending_cmds.push_back(cmd);
-        }
-
+        self.drain_ready();
         let (_, cm) = self.current_nick_and_casemap();
         let mut matched = Vec::new();
         let mut kept = VecDeque::with_capacity(self.pending_cmds.len());
-
         while let Some(cmd) = self.pending_cmds.pop_front() {
-            match &cmd {
-                Command::PRIVMSG(dest, payload) | Command::NOTICE(dest, payload)
-                    if cm.str_eq(dest, target) =>
-                {
-                    matched.push(Text::parse(payload).plain());
-                }
-                _ => kept.push_back(cmd),
+            match message_to(&cmd, cm, target) {
+                Some(text) => matched.push(text),
+                None => kept.push_back(cmd),
             }
         }
-
         self.pending_cmds = kept;
         matched
     }
@@ -348,39 +568,59 @@ impl TestServer {
     /// returning its plain-stripped text while preserving all earlier or non-matching commands in
     /// `recv_sent` order.
     pub async fn recv_message_to(&mut self, target: &str) -> String {
-        loop {
-            while let Ok(cmd) = self.outbound_rx.try_recv() {
-                self.pending_cmds.push_back(cmd);
-            }
-            let (_, cm) = self.current_nick_and_casemap();
-            if let Some(idx) = self.pending_cmds.iter().position(|cmd| {
-                matches!(
-                    cmd,
-                    Command::PRIVMSG(dest, _) | Command::NOTICE(dest, _)
-                        if cm.str_eq(dest, target)
-                )
-            }) {
-                let Some(Command::PRIVMSG(_, payload) | Command::NOTICE(_, payload)) =
-                    self.pending_cmds.remove(idx)
-                else {
-                    unreachable!()
-                };
-                return Text::parse(&payload).plain();
-            }
+        self.recv_matching(&format!("message to {target:?}"), |cmd, cm| {
+            message_to(cmd, cm, target)
+        })
+        .await
+    }
 
+    /// Moves every command the bot has already written into `pending_cmds`.
+    fn drain_ready(&mut self) {
+        while let Ok(cmd) = self.outbound_rx.try_recv() {
+            self.pending_cmds.push_back(cmd);
+        }
+    }
+
+    /// Awaits and removes the first outbound command, in `recv_sent` order, that `pick` maps to
+    /// `Some`, keeping all others queued; panics naming `what` after 5s or if the bot is gone.
+    async fn recv_matching<T>(
+        &mut self,
+        what: &str,
+        mut pick: impl FnMut(&Command, CaseMap) -> Option<T>,
+    ) -> T {
+        loop {
+            self.drain_ready();
+            let (_, cm) = self.current_nick_and_casemap();
+            let found = self
+                .pending_cmds
+                .iter()
+                .enumerate()
+                .find_map(|(idx, cmd)| Some((idx, pick(cmd, cm)?)));
+            if let Some((idx, val)) = found {
+                self.pending_cmds.remove(idx);
+                return val;
+            }
             let next =
                 tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound_rx.recv())
                     .await
-                    .unwrap_or_else(|_| {
-                        panic!("TestServer::recv_message_to timed out waiting for message to {target:?}")
-                    })
+                    .unwrap_or_else(|_| panic!("TestServer timed out waiting for {what}"))
                     .unwrap_or_else(|| {
-                        panic!(
-                            "TestServer::recv_message_to saw outbound channel close before message to {target:?}"
-                        )
+                        panic!("TestServer saw the outbound channel close before {what}")
                     });
             self.pending_cmds.push_back(next);
         }
+    }
+}
+
+/// Plain-stripped text of `cmd` if it is a `PRIVMSG`/`NOTICE` to `target` (case-folded).
+fn message_to(cmd: &Command, cm: CaseMap, target: &str) -> Option<String> {
+    match cmd {
+        Command::PRIVMSG(dest, payload) | Command::NOTICE(dest, payload)
+            if cm.str_eq(dest, target) =>
+        {
+            Some(Text::parse(payload).plain())
+        }
+        _ => None,
     }
 }
 

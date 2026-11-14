@@ -6,12 +6,8 @@ use ircgm::testing::{test_harness, TestServer};
 use super::{run_heist, HeistOutcome, Wire};
 
 async fn accept_vault_and_join_crew(srv: &mut TestServer, crew: &[&str]) -> String {
-    let vault = srv.accept_breakout("#lobby-vault", &[]).await;
+    let vault = srv.accept_breakout_invite("#lobby-vault", crew).await;
     assert!(vault.starts_with("#lobby-vault-"));
-    for nick in crew {
-        srv.join_user(nick, &vault);
-    }
-    srv.settle().await;
     vault
 }
 

@@ -363,7 +363,7 @@ async fn crlf_split_pacing_warn_396_cloak_wrapping_and_inbound_formatting() {
         ..BotConfig::default()
     };
     let (bot, mut server) = test_harness_with("GM", cfg);
-    server.send_line(":irc.srv 001 GM :Welcome to IRC GM!~gamemaster@127.0.0.1\r\n");
+    server.welcome("Welcome to IRC GM!~gamemaster@127.0.0.1");
     server.complete_join("#room", &["Alice"]);
     server.settle().await;
 
@@ -392,7 +392,7 @@ async fn crlf_split_pacing_warn_396_cloak_wrapping_and_inbound_formatting() {
     );
 
     let (bot2, mut server2) = test_harness("GM");
-    server2.send_line(":irc.srv 001 GM :Welcome to IRC GM!~gamemaster@127.0.0.1\r\n");
+    server2.welcome("Welcome to IRC GM!~gamemaster@127.0.0.1");
     let vhost_60 = format!("{}.users.cloak.example.org", "x".repeat(36));
     assert_eq!(vhost_60.len(), 60);
     server2.send_line(&format!(

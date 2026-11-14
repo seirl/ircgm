@@ -76,6 +76,7 @@ mod outbound;
 mod pump;
 mod room;
 mod state;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod user;
 

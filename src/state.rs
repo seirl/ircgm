@@ -392,6 +392,7 @@ impl WorldState {
     }
 
     /// Returns `"user@host"` once both ident and host have been observed on the wire.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn self_user_host(&self) -> Option<String> {
         match (&self.self_ident, &self.self_host) {
             (Some(u), Some(h)) => Some(format!("{u}@{h}")),
@@ -1001,6 +1002,7 @@ impl WorldState {
 
 /// Parses an inbound IRC wire line into [`Message`] using the same `irc-proto` parser as live
 /// `ClientStream` frames.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn parse_irc_message(
     raw_line: &str,
 ) -> std::result::Result<Message, irc::proto::error::ProtocolError> {

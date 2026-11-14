@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use irc::proto::{CapSubCommand, Command, Message, Prefix};
 use irc_colors::Text;
+#[cfg(any(test, feature = "testing"))]
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -14,6 +15,8 @@ use crate::message::{
 use crate::outbound::Priority;
 use crate::user::{normalize_account, User};
 
+/// Inbound feed of the in-memory [`crate::testing::TestServer`] transport.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) enum PumpInput {
     Line(Box<Message>),
     Settle(oneshot::Sender<()>),
@@ -22,6 +25,7 @@ pub(crate) enum PumpInput {
 
 pub(crate) enum PumpSource {
     Irc(Box<irc::client::ClientStream>),
+    #[cfg(any(test, feature = "testing"))]
     Test(mpsc::UnboundedReceiver<PumpInput>),
 }
 
@@ -114,6 +118,7 @@ pub(crate) async fn run_pump(
                     break DisconnectReason::Eof;
                 }
             },
+            #[cfg(any(test, feature = "testing"))]
             PumpSource::Test(rx) => {
                 // Check if more items are already queued without blocking to count burst size:
                 match rx.try_recv() {

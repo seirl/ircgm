@@ -391,11 +391,11 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     assert_eq!(server.take_messages_to("#r"), vec!["Alice: hit or stand?"]);
 
     server.chat("Bob", "#r", "hit");
-    server.send_line(":Alice!~Alice@test.host NICK :Alice2\r\n");
+    server.rename_user("Alice", "Alice2");
     server.settle().await;
     assert!(!turn_task.is_finished());
 
-    tokio::time::advance(Duration::from_secs(30)).await;
+    server.advance(Duration::from_secs(30)).await;
     let outcome = turn_task.await.unwrap().unwrap();
     assert_eq!(outcome, Answer::TimedOut);
     assert_eq!(
@@ -413,7 +413,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("#r");
 
-    server.send_line(":Alice2!~Alice@test.host PART #r :gotta go\r\n");
+    server.part_user("Alice2", "#r", Some("gotta go"));
     server.settle().await;
     let part_out = part_task.await.unwrap().unwrap();
     assert_eq!(
@@ -434,7 +434,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("#r");
 
-    server.send_line(":Op!~op@test.host KICK #r Cara :removed\r\n");
+    server.kick_user("Op", "#r", "Cara", Some("removed"));
     server.settle().await;
     let kick_out = kick_task.await.unwrap().unwrap();
     assert_eq!(
@@ -472,8 +472,8 @@ async fn answer_unreachable_pm_block_ok_required_and_fatal_disconnect_propagatio
     let _ = server.take_messages_to("P3");
 
     server.dm("P1", "my quip");
-    server.send_line(":irc.srv 486 GM P2 :You must log in with services to message this user\r\n");
-    server.send_line(":irc.srv 716 GM P3 :is in +g mode (server-side ignore)\r\n");
+    server.bounce(486, "P2", "You must log in with services to message this user");
+    server.bounce(716, "P3", "is in +g mode (server-side ignore)");
     server.settle().await;
 
     let results = all_turns.await.unwrap().unwrap();
@@ -494,7 +494,7 @@ async fn answer_unreachable_pm_block_ok_required_and_fatal_disconnect_propagatio
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("P2");
-    server.send_line(":irc.srv 486 GM P2 :blocked\r\n");
+    server.bounce(486, "P2", "blocked");
     server.settle().await;
     assert_eq!(opt_unreach.await.unwrap().unwrap().ok(), None);
 
@@ -504,7 +504,7 @@ async fn answer_unreachable_pm_block_ok_required_and_fatal_disconnect_propagatio
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("P3");
-    server.send_line(":irc.srv 716 GM P3 :blocked\r\n");
+    server.bounce(716, "P3", "blocked");
     server.settle().await;
     assert!(matches!(
         req_unreach.await.unwrap().unwrap().required(),
@@ -551,7 +551,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
 
     let mut raw_in = room.inbox();
     let mut cmd_in = room.inbox();
-    server.send_line(":GM!b@h PRIVMSG #room :!join\r\n");
+    server.chat("GM", "#room", "!join");
     server.chat("Alice", "#room", "!join");
     server.settle().await;
 
@@ -571,7 +571,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
     let r_404 = room.clone();
     let ask_404 = tokio::spawn(async move { r_404.ask("Hello?", |_| Some(())).await });
     assert_eq!(server.recv_message_to("#room").await, "Hello?");
-    server.send_line(":irc.srv 404 GM #room :Cannot send to channel (+m)\r\n");
+    server.bounce(404, "#room", "Cannot send to channel (+m)");
     server.settle().await;
     let err_404 = ask_404.await.unwrap().unwrap_err();
     assert!(
@@ -581,7 +581,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
     let mut dms_events = bot.inbox_dms();
     alice.say("Your secret role is Seer!").unwrap();
     let _ = server.take_messages_to("Alice");
-    server.send_line(":irc.srv 716 GM Alice :is in +g mode (callerid)\r\n");
+    server.bounce(716, "Alice", "is in +g mode (callerid)");
     server.settle().await;
 
     let ev = dms_events.next_event().await.unwrap();
@@ -595,7 +595,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         let _ = server.take_messages_to("Alice");
-        server.send_line(&format!(":irc.srv {code} GM Alice :blocked ({code})\r\n"));
+        server.bounce(code, "Alice", &format!("blocked ({code})"));
         server.settle().await;
         let out = t.await.unwrap().unwrap();
         assert!(
@@ -608,7 +608,7 @@ async fn delivery_failed_bot_left_room_absent_ask_user_and_self_echo() {
     let ask_kicked = tokio::spawn(async move { r_kick.ask("Anyone?", |_| Some(())).await });
     tokio::task::yield_now().await;
     let _ = server.take_messages_to("#room");
-    server.send_line(":Op!~op@h KICK #room GM :bots out\r\n");
+    server.kick_bot("Op", "#room", Some("bots out"));
     server.settle().await;
     let err_left = ask_kicked.await.unwrap().unwrap_err();
     assert!(matches!(
@@ -634,7 +634,7 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     assert_eq!(server.recv_message_to("Alice").await, "First prompt?");
 
     server.rename_user("Alice", "Alicia");
-    server.send_line(":irc.srv 401 GM Alice :No such nick/channel\r\n");
+    server.bounce(401, "Alice", "No such nick/channel");
     assert_eq!(server.recv_message_to("Alicia").await, "First prompt?");
     server.dm("Alicia", "renamed and replied!");
     server.settle().await;
@@ -653,7 +653,7 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
     let ask2 = tokio::spawn(async move { a2.ask("Second prompt?", |m| Some(m.text.clone())).await });
     assert_eq!(server.recv_message_to("Alicia").await, "Second prompt?");
 
-    server.send_line(":irc.srv 716 GM Alice :callerid\r\n");
+    server.bounce(716, "Alice", "callerid");
     server.dm("Alicia", "got it!");
     server.settle().await;
     assert_eq!(ask2.await.unwrap().unwrap(), Answer::Ok("got it!".into()));
@@ -666,10 +666,10 @@ async fn dm_and_huddle_ask_retry_inflight_rename_bounces_and_evict_claimed_forme
         assert_eq!(server.recv_message_to("Wolf1").await, "Target?");
         assert_eq!(server.recv_message_to("Wolf2").await, "Target?");
         server.rename_user("Wolf1", "AlphaWolf");
-        server.send_line(":irc.srv 401 GM Wolf1 :No such nick/channel\r\n");
-        server.send_line(":irc.srv 716 GM Wolf2 :callerid\r\n");
+        server.bounce(401, "Wolf1", "No such nick/channel");
+        server.bounce(716, "Wolf2", "callerid");
         assert_eq!(server.recv_message_to("AlphaWolf").await, "Target?");
-        server.send_line(":irc.srv 716 GM AlphaWolf :callerid\r\n");
+        server.bounce(716, "AlphaWolf", "callerid");
         server.settle().await;
     };
     let (huddle_res, ()) = tokio::join!(huddle_fut, drive_huddle);

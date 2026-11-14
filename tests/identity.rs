@@ -32,10 +32,10 @@ async fn single_batch_privmsg_rename_steal_quit_preserves_stamped_identity() {
     assert_eq!(server.take_messages_to("#r"), vec!["Your move?"]);
 
     // Single batch: Alice answers "hit", renames to Alice2, Mallory steals "Alice", Alice2 quits!
-    server.send_line(":Alice!u@h PRIVMSG #r :hit\r\n");
-    server.send_line(":Alice!u@h NICK :Alice2\r\n");
-    server.send_line(":Mallory!m@h NICK :Alice\r\n");
-    server.send_line(":Alice2!u@h QUIT :bye\r\n");
+    server.chat("Alice", "#r", "hit");
+    server.rename_user("Alice", "Alice2");
+    server.rename_user("Mallory", "Alice");
+    server.quit_user("Alice2", Some("bye"));
     server.settle().await;
 
     let hit_msg = ask_task.await.unwrap().unwrap().unwrap();
@@ -62,14 +62,14 @@ async fn event_fields_received_at_ident_and_channels() {
     let mut inbox = bot.inbox();
     let before = tokio::time::Instant::now();
 
-    server.send_line(":Cara!~cara@cloak.example JOIN #arena * :Cara\r\n");
-    server.send_line(
-        "@time=2026-05-01T12:30:00.250Z :Cara!~cara@cloak.example PRIVMSG #arena :hello\r\n",
-    );
-    server.send_line(":Cara!~cara@cloak.example NICK :Cara_afk\r\n");
-    server.send_line(":GM!~GM@test.host KICK #arena Cara_afk :idle\r\n");
-    server.send_line(":Dan!~dan@host.example JOIN #arena\r\n");
-    server.send_line(":Dan!~dan@host.example PART #arena :brb\r\n");
+    server.set_user_host("Cara", "~cara", "cloak.example");
+    server.join_user_with_account("Cara", "#arena", None);
+    server.chat("Cara", "#arena", "hello");
+    server.rename_user("Cara", "Cara_afk");
+    server.kick_user("GM", "#arena", "Cara_afk", Some("idle"));
+    server.set_user_host("Dan", "~dan", "host.example");
+    server.join_user("Dan", "#arena");
+    server.part_user("Dan", "#arena", Some("brb"));
     server.settle().await;
 
     let cara = match inbox.next_event().await.unwrap() {
@@ -180,13 +180,13 @@ async fn user_id_keys_and_consuming_inbox_combinators() {
     ordered.insert(alice_id);
     assert_eq!(ordered.len(), 2);
 
-    server.send_line(":[Alice]!u@h NICK :AliceRenamed\r\n");
+    server.rename_user("[Alice]", "AliceRenamed");
     server.settle().await;
     assert_eq!(bot.user("AliceRenamed").unwrap().id(), alice_id);
     assert_eq!(scores[&alice_1.id()], 10);
 
     server.quit_user("AliceRenamed", Some("reconnecting"));
-    server.send_line(":AliceRenamed!u@h JOIN #lobby\r\n");
+    server.join_user("AliceRenamed", "#lobby");
     server.settle().await;
     let alice_rejoined = bot.user("AliceRenamed").unwrap();
     assert_ne!(alice_rejoined.id(), alice_id);
@@ -232,7 +232,7 @@ async fn dynamic_casemapping_rekey_rfc1459_quit_and_accounts() {
     let room_brace = bot.room("#{lobby}").unwrap();
     let mut room_in = room_brace.inbox();
 
-    server.send_line(":irc.srv 005 GM CASEMAPPING=ascii :are supported\r\n");
+    server.isupport("CASEMAPPING=ascii");
     server.settle().await;
     assert_eq!(bot.casemap(), CaseMap::Ascii);
     assert!(u1.eq_nick("[alice]"));
@@ -259,16 +259,17 @@ async fn dynamic_casemapping_rekey_rfc1459_quit_and_accounts() {
     assert!(matches!(no_match, Error::TimedOut));
 
     let mut all_events = bot.inbox();
-    server.send_line(":Bob!~b@h JOIN #[lobby] bob_acct :Bob Real\r\n");
+    server.join_user_with_account("Bob", "#[lobby]", Some("bob_acct"));
     server.settle().await;
     let bob = bot.user("Bob").unwrap();
     assert_eq!(bob.account().as_deref(), Some("bob_acct"));
 
-    server.send_line(":Bob!~b@h ACCOUNT *\r\n");
+    server.account_notify("Bob", None);
     server.settle().await;
     assert_eq!(bob.account(), None);
 
-    server.send_line("@account=bob_v2 :Bob!~b@h PRIVMSG #[lobby] :reauthed\r\n");
+    server.set_account("Bob", Some("bob_v2"));
+    server.chat("Bob", "#[lobby]", "reauthed");
     server.settle().await;
     assert_eq!(bob.account().as_deref(), Some("bob_v2"));
 
@@ -286,7 +287,7 @@ async fn dynamic_casemapping_rekey_rfc1459_quit_and_accounts() {
         matches!(ev2, Event::Quit { ref nick, ref reason, .. } if nick == "[Alice]" && reason.as_deref() == Some("Client Quit"))
     );
 
-    server.send_line(":Bob!~b@h JOIN #[lobby] * :Bob\r\n");
+    server.join_user_with_account("Bob", "#[lobby]", None);
     server.settle().await;
     let bob_rejoined = bot.user("Bob").unwrap();
     assert_ne!(bob, bob_rejoined);

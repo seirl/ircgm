@@ -96,9 +96,9 @@ async fn registry_tracks_channel_interest_and_deduplicates_multi_match_events() 
     assert!(room_a.core().inboxes.has_interest_in_channel("#a"));
 
     // Put alice in both `#a` and `#b`, then have alice `/nick` so `candidates` hits `#a`, `#b`, AND `by_user`:
-    server.send_line(":alice!~a@h JOIN #a\r\n");
-    server.send_line(":alice!~a@h JOIN #b\r\n");
-    server.send_line(":alice!~a@h NICK alicia\r\n");
+    server.join_user("alice", "#a");
+    server.join_user("alice", "#b");
+    server.rename_user("alice", "alicia");
     server.chat("alicia", "#a", "after nick");
     server.settle().await;
 
@@ -207,7 +207,7 @@ async fn wait_combinators_and_lossy_on_triggers_resolve_cleanly() {
     // and `[KICK GM, PRIVMSG]` rejects the post-kick chat:
     let mut scoped_burst = room.inbox();
     server.chat("alice", "#lobby", "before kick");
-    server.send_line(":oper!~o@h KICK #lobby gm :bye\r\n");
+    server.kick_bot("oper", "#lobby", Some("bye"));
     server.chat("alice", "#lobby", "after kick");
     server.settle().await;
     assert_eq!(scoped_burst.next_chat().await.unwrap().text, "before kick");

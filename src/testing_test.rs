@@ -115,3 +115,119 @@ async fn test_server_disconnect_triggers_eof_on_open_inbox() {
         Err(Error::Disconnected(DisconnectReason::Eof))
     ));
 }
+
+#[tokio::test(start_paused = true)]
+async fn bot_quit_closes_test_server_connection_without_timeout_and_fails_when_drain_stalls() {
+    let (bot, mut server) = test_harness("gm");
+    bot.quit(Some("goodnight")).await.unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::QUIT(Some("goodnight".into())))
+    );
+    assert!(matches!(
+        bot.inbox().next_event().await,
+        Err(Error::Disconnected(DisconnectReason::Quit))
+    ));
+
+    // When throttled outbound backlog exceeds `handshake_timeout`, `quit` surfaces
+    // `HandshakeTimeout { operation: "quit outbound drain" }`:
+    let cfg = BotConfig {
+        outbound_burst: 1,
+        outbound_window: std::time::Duration::from_secs(10),
+        handshake_timeout: std::time::Duration::from_secs(2),
+        ..BotConfig::default()
+    };
+    let (bot2, server2) = test_harness_with("gm", cfg);
+    server2.complete_join("#lobby", &["alice"]);
+    server2.settle().await;
+    bot2.room("#lobby").unwrap().say("fills burst slot").unwrap();
+    let err = bot2.quit(Some("bye")).await.unwrap_err();
+    assert!(matches!(
+        err,
+        Error::HandshakeTimeout {
+            operation: "quit outbound drain"
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn peer_identity_survives_rename_resets_on_quit_and_supports_protocol_helpers() {
+    let (bot, mut server) = test_harness("gm");
+    server.isupport("MODES=3");
+    server.complete_join("#lobby", &["alice", "bob"]);
+    server.initial_topic("#lobby", "Welcome!");
+    server.settle().await;
+
+    let lobby = bot.room("#lobby").unwrap();
+    assert_eq!(lobby.topic().as_deref(), Some("Welcome!"));
+    let mut events = bot.inbox();
+
+    // Custom hostmask + account survive `rename_user` onto `part_user` and reset on `quit_user`:
+    let mut raw_events = bot.inbox();
+    server.set_user_host("alice", "~ali", "cloak.test");
+    server.set_account("alice", Some("acct_a"));
+    server.rename_user("alice", "alicia");
+    server.chat("alicia", "#lobby", "tagged hello");
+    server.part_user("alicia", "#lobby", Some("brb"));
+    server.settle().await;
+
+    let _ = raw_events.next_raw().await.unwrap(); // NICK
+    let _ = raw_events.next_raw().await.unwrap(); // PRIVMSG
+    let part_raw = raw_events.next_raw().await.unwrap();
+    assert_eq!(
+        part_raw.prefix,
+        Some(irc::proto::Prefix::Nickname(
+            "alicia".into(),
+            "~ali".into(),
+            "cloak.test".into()
+        ))
+    );
+
+    let _ = events.next_event().await.unwrap(); // NickChanged
+    match events.next_event().await.unwrap() {
+        crate::Event::Chat(m) => {
+            assert_eq!(m.nick, "alicia");
+            assert_eq!(m.ident.as_deref(), Some("~ali"));
+            assert_eq!(m.host.as_deref(), Some("cloak.test"));
+            assert_eq!(m.account.as_deref(), Some("acct_a"));
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+    match events.next_event().await.unwrap() {
+        crate::Event::Parted { nick, reason, .. } => {
+            assert_eq!(nick, "alicia");
+            assert_eq!(reason.as_deref(), Some("brb"));
+        }
+        other => panic!("expected Parted, got {other:?}"),
+    }
+
+    // `accept_breakout_invite` + `advance`:
+    let alice_u = bot.user("alicia").unwrap();
+    let bob_u = bot.user("bob").unwrap();
+    let br_task = tokio::spawn({
+        let bot = bot.clone();
+        async move {
+            let v = bot.breakout("#vault").await?;
+            v.invite_and_wait([&alice_u, &bob_u], std::time::Duration::from_secs(5))
+                .await?;
+            Ok::<_, Error>(v.name().to_owned())
+        }
+    });
+    let vault_ch = server
+        .accept_breakout_invite("#vault", &["alicia", "bob"])
+        .await;
+    assert_eq!(br_task.await.unwrap().unwrap(), vault_ch);
+
+    let timed = tokio::spawn({
+        let lobby = lobby.clone();
+        async move {
+            lobby
+                .ask("Quick!", |_| Some(()))
+                .reply_timeout(std::time::Duration::from_secs(5))
+                .await
+        }
+    });
+    server.flush().await;
+    server.advance(std::time::Duration::from_secs(5)).await;
+    assert_eq!(timed.await.unwrap().unwrap(), crate::Answer::TimedOut);
+}

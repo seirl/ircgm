@@ -54,7 +54,7 @@ fn breakout_naming_requires_explicit_channel_sigil_and_supports_single_or_double
 #[tokio::test]
 async fn build_teardown_commands_honors_kick_on_drop_and_targmax_kick() {
     let (bot, mut server) = test_harness("gm");
-    server.send_line(":srv 005 gm TARGMAX=KICK:2 :are supported\r\n");
+    server.isupport("TARGMAX=KICK:2");
 
     let br_task = tokio::spawn({
         let bot = bot.clone();

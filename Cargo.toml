@@ -9,6 +9,10 @@ edition = "2021"
 license = "MIT"
 description = "Direct-style async/await IRC game master and interactive bot library"
 
+[features]
+# `ircgm::testing`: the in-memory `test_harness` / `TestServer` for test suites.
+testing = []
+
 [dependencies]
 fastrand = "2"
 futures-util = "0.3"
@@ -20,5 +24,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 futures = "0.3"
+ircgm = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["test-util", "macros", "rt", "net", "io-util"] }
 tracing-subscriber = "0.3"

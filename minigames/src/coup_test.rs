@@ -132,7 +132,7 @@ async fn target_pm_block_or_quit_during_steal_resolves_as_unblocked_steal() {
     srv.flush().await;
 
     // Alice has `+g` callerid enabled (`716`) -> `settled()` resolves to unblocked steal!
-    srv.send_line(":irc.srv 716 GM Alice :is in +g mode\r\n");
+    srv.bounce(716, "Alice", "is in +g mode");
     let res = steal.await.unwrap().unwrap();
     assert_eq!(res, StealResolution::Stolen { coins: 2 });
     assert!(srv

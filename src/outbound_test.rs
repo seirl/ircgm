@@ -107,7 +107,7 @@ async fn crlf_splitting_ctcp_sanitization_and_396_wire_budget() {
 async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, _task) = OutboundSink::new(
-        RawTransport::Test(tx),
+        RawTransport::test_only(tx),
         2,
         Duration::from_secs(8),
         AtomicCaseMap::default(),
@@ -210,7 +210,7 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
 async fn join_followed_by_later_background_part_preserves_join_before_part() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, _task) = OutboundSink::new(
-        RawTransport::Test(tx),
+        RawTransport::test_only(tx),
         1,
         Duration::from_secs(8),
         AtomicCaseMap::default(),
@@ -253,7 +253,7 @@ async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_syn
     // written synchronously without allocating a `oneshot`:
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, task) = OutboundSink::new(
-        RawTransport::Test(tx),
+        RawTransport::test_only(tx),
         usize::MAX,
         Duration::from_secs(8),
         AtomicCaseMap::default(),
@@ -280,7 +280,7 @@ async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_syn
     // queued behind the rate limit gets a real receipt resolved by the pacer:
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     let (sink2, task2) = OutboundSink::new(
-        RawTransport::Test(tx2),
+        RawTransport::test_only(tx2),
         1,
         Duration::from_secs(8),
         AtomicCaseMap::default(),
