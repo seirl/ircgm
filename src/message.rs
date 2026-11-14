@@ -119,16 +119,22 @@ impl ChatMessage {
         self.cmd_args(cmd).filter(|s| !s.is_empty())
     }
 
+    /// Outbound kind for any automatic answer to this message: `NOTICE` for a `NOTICE` (which
+    /// must never trigger an automatic `PRIVMSG`, RFC 2812 §3.3.2), else `PRIVMSG`.
+    pub(crate) fn reply_kind(&self) -> OutboundChatKind {
+        match self.kind {
+            MessageKind::Notice => OutboundChatKind::Notice,
+            MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,
+        }
+    }
+
     /// Replies to the channel if this message arrived in a channel (failing with
     /// [`Error::BotLeftRoom`] if the bot has since left that channel), or directly to
     /// `self.sender`'s live nickname if this message was a DM (failing with [`Error::UserLeft`]
     /// if `self.sender` has quit), mirroring `self.kind` (`MessageKind::Notice` sends `NOTICE`;
     /// `Privmsg | Action` sends `PRIVMSG`).
     pub fn reply(&self, text: impl Into<Text>) -> Result<()> {
-        let out_kind = match self.kind {
-            MessageKind::Notice => OutboundChatKind::Notice,
-            MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,
-        };
+        let out_kind = self.reply_kind();
         match &self.target {
             Target::Channel(ch) => {
                 let core = self.sender.upgrade_core()?;

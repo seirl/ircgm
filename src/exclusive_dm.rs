@@ -87,10 +87,6 @@ impl ExclusiveDm {
         }
     }
 
-    pub(crate) fn core(&self) -> &Arc<BotCore> {
-        &self.core
-    }
-
     pub(crate) fn split_for_ask(&mut self) -> (&Arc<BotCore>, &User, &mut Inbox) {
         (&self.core, &self.lease.user, &mut self.inbox)
     }
@@ -301,7 +297,7 @@ fn skip_departed(
     }
 }
 
-pub(crate) async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
+async fn wait_any_track_quit(tracks: &[Arc<UserTrack>]) -> Error {
     let waiters = tracks.iter().map(|t| {
         let mut rx = t.status_tx.subscribe();
         async move {

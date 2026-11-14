@@ -11,7 +11,7 @@ use crate::exclusive_dm::DmLease;
 use crate::inbox::Inbox;
 use crate::message::ChatMessage;
 use crate::outbound::{OutboundChatKind, WriteReceipt};
-use crate::user::{User, UserId};
+use crate::user::{User, UserId, UserStatus};
 
 /// Disjoint outbound view of a [`Huddle`] so [`Ask`] can send prompts, countdown warnings,
 /// rejects, and banter relays while mutably polling `Huddle::inbox`.
@@ -99,11 +99,16 @@ impl<'a> HuddleSender<'a> {
             .find(|u| u.id() == uid)
     }
 
-    pub(crate) fn any_reachable_online(&self, bounced_users: &HashSet<UserId>) -> bool {
-        self.leases
-            .iter()
-            .map(DmLease::user)
-            .any(|u| u.is_online() && !bounced_users.contains(&u.id()))
+    /// Whether any member had neither bounced nor quit as of wire position `seq` (judged by
+    /// `QUIT` position, so a departure the reader has not reached yet still counts as online).
+    pub(crate) fn any_reachable_at(&self, bounced_users: &HashSet<UserId>, seq: u64) -> bool {
+        self.leases.iter().map(DmLease::user).any(|u| {
+            !bounced_users.contains(&u.id())
+                && match u.track().status() {
+                    UserStatus::Online => true,
+                    UserStatus::Quit { at_seq, .. } => at_seq > seq,
+                }
+        })
     }
 }
 
@@ -147,10 +152,6 @@ impl Huddle {
             relay_prefix: None,
             relay_commands: false,
         }
-    }
-
-    pub(crate) fn check_connected(&self) -> Result<()> {
-        self.core.check_connected()
     }
 
     fn sender_view(&self) -> HuddleSender<'_> {

@@ -160,3 +160,113 @@ async fn timeout_handler_renders_static_and_dynamic_messages() {
     let cleared = dyn_cfg.clear_warnings().no_timeout_message();
     assert!(cleared.timeout_handler.is_none());
 }
+
+#[tokio::test]
+async fn huddle_ask_ends_when_the_last_reachable_member_quits_after_others_bounce() {
+    let (bot, mut server) = test_harness("gm");
+    let users: Vec<User> = ["w1", "w2", "w3", "w4"]
+        .iter()
+        .map(|n| bot.user(n).unwrap())
+        .collect();
+
+    // 1. `w1` bounces 716 but stays online, so the huddle inbox stays open. The ask has already
+    //    consumed that bounce when `w2` quits, leaving nobody who can answer; previously the
+    //    prompt then sat out its 300s reply timeout:
+    let mut pack = bot.huddle(&users[..2]).await.unwrap();
+    let ask = pack.ask("Target?", |m| Some(m.text.clone()));
+    let drive = async {
+        assert_eq!(server.recv_message_to("w1").await, "Target?");
+        assert_eq!(server.recv_message_to("w2").await, "Target?");
+        server.send_line(":srv 716 gm w1 :is in +g mode\r\n");
+        server.settle().await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        server.quit_user("w2", Some("bye"));
+        server.settle().await;
+    };
+    let (res, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(1), ask), drive);
+    assert!(matches!(
+        res.expect("must not wait out the 300s reply timeout"),
+        Ok(Answer::Left { ref nick, ref reason }) if nick == "w2" && reason.as_deref() == Some("bye")
+    ));
+    drop(pack);
+
+    // 2. Same events, both buffered before the ask reads either: reachability is judged at each
+    //    event's wire position, so the bounce (while `w4` was still online) does not end the
+    //    prompt; the later `QUIT` does:
+    let mut pack = bot.huddle(&users[2..]).await.unwrap();
+    let ask = pack.ask("Target?", |m| Some(m.text.clone()));
+    let drive = async {
+        assert_eq!(server.recv_message_to("w3").await, "Target?");
+        assert_eq!(server.recv_message_to("w4").await, "Target?");
+        server.send_line(":srv 716 gm w3 :is in +g mode\r\n");
+        server.quit_user("w4", Some("gone"));
+        server.settle().await;
+    };
+    let (res, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(1), ask), drive);
+    assert!(matches!(
+        res.expect("must not wait out the 300s reply timeout"),
+        Ok(Answer::Left { ref nick, .. }) if nick == "w4"
+    ));
+}
+
+#[tokio::test]
+async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
+    use irc::proto::Command;
+
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#lobby", &["alice"]);
+    server.settle().await;
+    let alice = bot.user("alice").unwrap();
+    let lobby = bot.room("#lobby").unwrap();
+    let pick = |m: &ChatMessage| match m.text.as_str() {
+        "yes" => AskMatch::accept_say((), "Locked in"),
+        _ => AskMatch::reject("Say yes"),
+    };
+
+    // DM prompt answered by `NOTICE`s: the reject and the ack are `NOTICE`s too.
+    let ask = alice.ask("Ready?", pick).accept_notices();
+    let drive = async {
+        assert_eq!(
+            server.recv_sent().await,
+            Some(Command::PRIVMSG("alice".into(), "Ready?".into()))
+        );
+        server.notice("alice", "gm", "no");
+        server.notice("alice", "gm", "yes");
+        server.settle().await;
+    };
+    let (ans, ()) = tokio::join!(ask, drive);
+    assert!(ans.unwrap().is_ok());
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::NOTICE("alice".into(), "Say yes".into()))
+    );
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::NOTICE("alice".into(), "Locked in".into()))
+    );
+
+    // Channel prompt: a `NOTICE` answer gets a `NOTICE` ack, a `PRIVMSG` answer a `PRIVMSG` one.
+    for (notice, expected) in [
+        (true, Command::NOTICE("#lobby".into(), "Locked in".into())),
+        (false, Command::PRIVMSG("#lobby".into(), "Locked in".into())),
+    ] {
+        let ask = lobby.ask("Ready?", pick).accept_notices();
+        let drive = async {
+            assert_eq!(
+                server.recv_sent().await,
+                Some(Command::PRIVMSG("#lobby".into(), "Ready?".into()))
+            );
+            if notice {
+                server.notice("alice", "#lobby", "yes");
+            } else {
+                server.chat("alice", "#lobby", "yes");
+            }
+            server.settle().await;
+        };
+        let (ans, ()) = tokio::join!(ask, drive);
+        assert!(ans.unwrap().is_ok());
+        assert_eq!(server.recv_sent().await, Some(expected));
+    }
+}

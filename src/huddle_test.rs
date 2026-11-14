@@ -66,15 +66,20 @@ async fn huddle_sender_tracks_bounced_and_offline_members() {
     assert_eq!(sender.find_matching_user(None), None);
 
     let mut bounced = HashSet::new();
-    assert!(sender.any_reachable_online(&bounced));
+    assert!(sender.any_reachable_at(&bounced, u64::MAX));
 
     bounced.insert(w1.id());
-    assert!(sender.any_reachable_online(&bounced));
+    assert!(sender.any_reachable_at(&bounced, u64::MAX));
 
-    // If w2 quits while w1 bounced, nobody reachable remains:
+    // If w2 quits while w1 bounced, nobody reachable remains from the `QUIT` on, but w2 still
+    // counts as reachable at earlier wire positions:
     server.quit_user("wolf2", None);
     server.settle().await;
-    assert!(!sender.any_reachable_online(&bounced));
+    let UserStatus::Quit { at_seq, .. } = w2.track().status() else {
+        panic!("wolf2 must have quit");
+    };
+    assert!(!sender.any_reachable_at(&bounced, at_seq));
+    assert!(sender.any_reachable_at(&bounced, at_seq - 1));
 }
 
 #[tokio::test]
@@ -177,4 +182,23 @@ async fn huddle_ask_user_reads_the_shared_inbox_once_and_never_relays_the_answer
         ans.expect("ask_user must not wait out its timeout").unwrap(),
         crate::Answer::Left { ref nick, ref reason } if nick == "wolf3" && reason.as_deref() == Some("bye")
     ));
+}
+
+#[tokio::test]
+async fn failed_ask_user_on_departed_member_keeps_the_shared_inbox_backlog() {
+    let (bot, server) = test_harness("gm");
+    let w1 = bot.user("wolf1").unwrap();
+    let w2 = bot.user("wolf2").unwrap();
+    let mut pack = bot.huddle([&w1, &w2]).await.unwrap();
+
+    server.dm("wolf1", "still here");
+    server.quit_user("wolf2", Some("bye"));
+    server.settle().await;
+
+    // The prompt fails up front, before touching wolf1's unread message:
+    assert!(matches!(
+        pack.ask_user(&w2, "Confirm?", |m| Some(m.text.clone())).await,
+        Ok(crate::Answer::Left { ref nick, .. }) if nick == "wolf2"
+    ));
+    assert_eq!(pack.inbox().next_chat().await.unwrap().text, "still here");
 }

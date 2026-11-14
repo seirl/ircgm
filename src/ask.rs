@@ -3,7 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,10 +13,10 @@ use tracing::Instrument as _;
 
 use crate::bot::BotCore;
 use crate::error::{Error, Result};
-use crate::exclusive_dm::{wait_any_track_quit, ExclusiveDm};
+use crate::exclusive_dm::ExclusiveDm;
 use crate::huddle::{Huddle, HuddleSender};
 use crate::inbox::Inbox;
-use crate::message::{ChatMessage, Target};
+use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
 use crate::outbound::{OutboundChatKind, WriteReceipt};
 use crate::room::Room;
 use crate::user::{User, UserId};
@@ -51,12 +51,13 @@ impl<T> AskMatch<T> {
     /// Accepts `val`, immediately enqueues `msg` to the prompt's target (in-channel for
     /// [`Room`], in-DM while [`ExclusiveDm`] is still held for [`User`]/[`ExclusiveDm`], or
     /// broadcast to all members for [`Huddle`]), and resolves the [`Ask`] with [`Answer::Ok`].
+    /// `msg` is sent as a `NOTICE` when the accepted reply was one.
     pub fn accept_say(val: T, msg: impl Into<Text>) -> Self {
         Self(AskMatchInner::Accept(val, Some(msg.into())))
     }
 
-    /// Sends validation feedback `msg` to the responder and keeps waiting without resetting the
-    /// reply timer.
+    /// Sends validation feedback `msg` to the responder (as a `NOTICE` if the reply was one) and
+    /// keeps waiting without resetting the reply timer.
     pub fn reject(msg: impl Into<Text>) -> Self {
         Self(AskMatchInner::Reject(msg.into()))
     }
@@ -388,9 +389,12 @@ pub(crate) enum AskSource<'a> {
     ImmediateErr(Error),
 }
 
+/// Delivery bookkeeping of one running [`Ask`], owned by its wire-event hook (see
+/// [`EndpointSender::check_event`]): which DM recipients bounced, and how many times each one's
+/// prompt was re-sent after a `401` rename race.
 #[derive(Default)]
-struct HuddleBounceState {
-    bounced_users: HashSet<UserId>,
+struct DeliveryState {
+    bounced: HashSet<UserId>,
     rename_retries: HashMap<UserId, u8>,
 }
 
@@ -406,12 +410,10 @@ enum EndpointSender<'a> {
         core: &'a Arc<BotCore>,
         user: &'a User,
         prompt: Text,
-        rename_retries: Mutex<u8>,
     },
     Huddle {
         sender: HuddleSender<'a>,
         prompt: Text,
-        bounce_state: Mutex<HuddleBounceState>,
     },
 }
 
@@ -427,37 +429,28 @@ impl<'a> EndpointSender<'a> {
         }
     }
 
-    fn send_dm(core: &Arc<BotCore>, user: &User, text: Text) {
-        if core.check_connected().is_ok() && user.quit_error().is_none() {
-            let nick = user.nick();
-            let _ = core.send_chat(OutboundChatKind::Privmsg, &nick, text);
-        }
-    }
-
-    fn send_broadcast_or_target(&self, text: Text) {
+    /// Sends `text` where the prompt went: the channel, the DM'd user, or every huddle member.
+    fn send_to_target(&self, kind: OutboundChatKind, text: Text) {
         match self {
             EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
-                let _ = room.say(text);
+                let _ = room.send_chat(kind, text);
             }
-            EndpointSender::Dm { core, user, .. } => {
-                Self::send_dm(core, user, text);
+            EndpointSender::Dm { user, .. } => {
+                let _ = user.send_chat(kind, text);
             }
             EndpointSender::Huddle { sender, .. } => {
-                let _ = sender.broadcast_kind(OutboundChatKind::Privmsg, text);
+                let _ = sender.broadcast_kind(kind, text);
             }
         }
     }
 
-    fn send_reject(&self, sender_user: &User, feedback: Text) {
+    fn send_reject(&self, sender_user: &User, kind: OutboundChatKind, feedback: Text) {
         match self {
-            EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => {
-                let _ = room.say(feedback);
-            }
-            EndpointSender::Dm { core, user, .. } => {
-                Self::send_dm(core, user, feedback);
-            }
+            EndpointSender::RoomOpen { .. }
+            | EndpointSender::RoomUser { .. }
+            | EndpointSender::Dm { .. } => self.send_to_target(kind, feedback),
             EndpointSender::Huddle { .. } => {
-                let _ = sender_user.say(feedback);
+                let _ = sender_user.send_chat(kind, feedback);
             }
         }
     }
@@ -470,13 +463,59 @@ impl<'a> EndpointSender<'a> {
         }
     }
 
+    /// Judges a non-reply wire event: returns the error that ends the prompt once its
+    /// responders are out of reach, or `None` to keep waiting.
+    ///
+    /// Reachability is tracked across both kinds of event that can take a responder away: DM
+    /// bounces (`401`, `716`, `486`, ...) and `QUIT`s.
+    fn check_event(&self, wire: &WireEvent, state: &mut DeliveryState) -> Option<Error> {
+        match &wire.kind {
+            WireKind::Event(Event::DeliveryFailed {
+                target,
+                code,
+                message,
+                ..
+            }) => self.check_send_error(wire, target, *code, message, state),
+            WireKind::Event(Event::Quit {
+                user: quitter,
+                nick,
+                reason,
+                ..
+            }) => {
+                let gone = || Error::UserLeft {
+                    nick: nick.clone(),
+                    reason: reason.clone(),
+                };
+                match self {
+                    // `UsersInRoom` inboxes end on their own once every awaited user is gone:
+                    EndpointSender::RoomOpen { .. } | EndpointSender::RoomUser { .. } => None,
+                    EndpointSender::Dm { user, .. } => (quitter == *user).then(gone),
+                    EndpointSender::Huddle { sender, .. } => {
+                        // A member quitting can leave only bounced members behind, which the
+                        // huddle inbox (alive while any member is online) never notices:
+                        sender.find_matching_user(Some(quitter.track_id()))?;
+                        (!sender.any_reachable_at(&state.bounced, wire.seq)).then(gone)
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn check_send_error(
         &self,
+        wire: &WireEvent,
         target: &str,
-        target_user_id: Option<u64>,
         code: u16,
         message: &str,
+        state: &mut DeliveryState,
     ) -> Option<Error> {
+        let target_user_id = wire.bounce_user_id();
+        let unreachable = || Error::UserUnreachable {
+            nick: target.to_owned(),
+            code,
+            message: message.to_owned(),
+        };
         match self {
             EndpointSender::RoomOpen { room } | EndpointSender::RoomUser { room, .. } => room
                 .casemap()
@@ -486,66 +525,44 @@ impl<'a> EndpointSender<'a> {
                     code,
                     message: message.to_owned(),
                 }),
-            EndpointSender::Dm {
-                core,
-                user,
-                prompt,
-                rename_retries,
-            } => {
+            EndpointSender::Dm { core, user, prompt } => {
                 if target_user_id != Some(user.track_id()) {
                     return None;
                 }
-                if code == 401 {
-                    let mut retries = rename_retries.lock().unwrap();
-                    if let Some(new_nick) = user
-                        .track_arc()
-                        .next_rename_retry_nick(target, &mut retries)
-                    {
-                        let _ = core.send_chat(
-                            OutboundChatKind::Privmsg,
-                            &new_nick,
-                            prompt.clone(),
-                        );
-                        return None;
-                    }
+                if code == 401 && Self::resend_to_renamed(core, user, target, prompt, state) {
+                    return None;
                 }
-                Some(Error::UserUnreachable {
-                    nick: target.to_owned(),
-                    code,
-                    message: message.to_owned(),
-                })
+                Some(unreachable())
             }
-            EndpointSender::Huddle {
-                sender,
-                prompt,
-                bounce_state,
-            } => {
-                if let Some(member) = sender.find_matching_user(target_user_id) {
-                    let mut state = bounce_state.lock().unwrap();
-                    if code == 401 {
-                        let retries = state.rename_retries.entry(member.id()).or_insert(0);
-                        if let Some(new_nick) =
-                            member.track_arc().next_rename_retry_nick(target, retries)
-                        {
-                            let _ = sender.core().send_chat(
-                                OutboundChatKind::Privmsg,
-                                &new_nick,
-                                prompt.clone(),
-                            );
-                            return None;
-                        }
-                    }
-                    state.bounced_users.insert(member.id());
-                    if !sender.any_reachable_online(&state.bounced_users) {
-                        return Some(Error::UserUnreachable {
-                            nick: target.to_owned(),
-                            code,
-                            message: message.to_owned(),
-                        });
-                    }
+            EndpointSender::Huddle { sender, prompt } => {
+                let member = sender.find_matching_user(target_user_id)?;
+                if code == 401
+                    && Self::resend_to_renamed(sender.core(), member, target, prompt, state)
+                {
+                    return None;
                 }
-                None
+                state.bounced.insert(member.id());
+                (!sender.any_reachable_at(&state.bounced, wire.seq)).then(unreachable)
             }
+        }
+    }
+
+    /// On a `401` for `user`'s former nick, re-sends `prompt` to their current nick (bounded per
+    /// user), returning `true` if it did.
+    fn resend_to_renamed(
+        core: &Arc<BotCore>,
+        user: &User,
+        bounced_nick: &str,
+        prompt: &Text,
+        state: &mut DeliveryState,
+    ) -> bool {
+        let retries = state.rename_retries.entry(user.id()).or_insert(0);
+        match user.track().next_rename_retry_nick(bounced_nick, retries) {
+            Some(new_nick) => {
+                let _ = core.send_chat(OutboundChatKind::Privmsg, &new_nick, prompt.clone());
+                true
+            }
+            None => false,
         }
     }
 }
@@ -556,7 +573,7 @@ struct AskUnstarted<'a, F> {
     cfg: AskConfig,
     source: AskSource<'a>,
     prompt: Text,
-    matcher: Box<F>,
+    matcher: F,
 }
 
 enum AskState<'a, F, O> {
@@ -589,7 +606,7 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
                 cfg: base_cfg,
                 source,
                 prompt,
-                matcher: Box::new(matcher),
+                matcher,
             })),
         }
     }
@@ -754,17 +771,20 @@ where
 
     let (configured_timeout, deadline, warnings) = compute_schedule(cfg, write_completed_at);
 
+    let mut delivery = DeliveryState::default();
     let reply_fut = inbox.wait_reply_map(
         cfg.ignore_commands,
         cfg.accept_notices,
-        |target, target_user_id, code, message| {
-            let err = sender.check_send_error(target, target_user_id, code, message);
+        |wire| {
+            let err = sender.check_event(wire, &mut delivery);
             if let Some(ref e) = err {
-                tracing::debug!(error = %e, "ask delivery bounced");
+                tracing::debug!(error = %e, "ask responders out of reach");
             }
             err
         },
         |msg| match matcher(msg).into_ask_match().0 {
+            // Answers to a reply mirror its kind: a `NOTICE` must never trigger an automatic
+            // `PRIVMSG` (RFC 2812 §3.3.2).
             AskMatchInner::Accept(val, ack) => {
                 tracing::debug!(
                     sender = %msg.nick,
@@ -772,12 +792,12 @@ where
                     "ask reply accepted"
                 );
                 if let Some(ack_msg) = ack {
-                    sender.send_broadcast_or_target(ack_msg);
+                    sender.send_to_target(msg.reply_kind(), ack_msg);
                 }
                 Some(val)
             }
             AskMatchInner::Reject(feedback) => {
-                sender.send_reject(&msg.sender, feedback);
+                sender.send_reject(&msg.sender, msg.reply_kind(), feedback);
                 None
             }
             AskMatchInner::Ignore => {
@@ -795,7 +815,7 @@ where
                     for (warn_at, warn_msg) in warnings {
                         tokio::time::sleep_until(warn_at).await;
                         if Instant::now() < dl {
-                            sender.send_broadcast_or_target(warn_msg);
+                            sender.send_to_target(OutboundChatKind::Privmsg, warn_msg);
                         }
                     }
                     std::future::pending::<()>().await
@@ -826,7 +846,7 @@ where
                     configured_timeout,
                     elapsed: write_completed_at.elapsed(),
                 };
-                sender.send_broadcast_or_target(handler.render(&ctx));
+                sender.send_to_target(OutboundChatKind::Privmsg, handler.render(&ctx));
             }
             tracing::debug!("ask reply timer expired");
             Err(Error::TimedOut)
@@ -838,7 +858,7 @@ async fn run_ask<'a, F, R>(
     cfg: AskConfig,
     source: AskSource<'a>,
     prompt: Text,
-    mut matcher: Box<F>,
+    mut matcher: F,
 ) -> Result<R::Output>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
@@ -851,17 +871,9 @@ where
     match source {
         AskSource::ImmediateErr(err) => Err(err),
         AskSource::RoomOpen { room, caller } => {
-            room.ensure_bot_in_room_if_tracked()?;
-            let mut inbox = room.inbox_at(caller);
-            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::RoomOpen { room },
-                &mut inbox,
-                receipt,
-            )
-            .await
+            let inbox = room.inbox_at(caller);
+            let sender = EndpointSender::RoomOpen { room };
+            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
         }
         AskSource::RoomUser { room, user, caller } => {
             if !user.belongs_to(room.core()) {
@@ -870,16 +882,9 @@ where
                 ));
             }
             room.ensure_user_askable(user)?;
-            let mut inbox = room.inbox_users_at(std::slice::from_ref(user), caller);
-            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::RoomUser { room, user },
-                &mut inbox,
-                receipt,
-            )
-            .await
+            let inbox = room.inbox_users_at(std::slice::from_ref(user), caller);
+            let sender = EndpointSender::RoomUser { room, user };
+            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
         }
         AskSource::RoomUsers {
             room,
@@ -887,16 +892,9 @@ where
             caller,
         } => {
             room.ensure_any_user_askable(&users)?;
-            let mut inbox = room.inbox_users_at(&users, caller);
-            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::RoomOpen { room },
-                &mut inbox,
-                receipt,
-            )
-            .await
+            let inbox = room.inbox_users_at(&users, caller);
+            let sender = EndpointSender::RoomOpen { room };
+            ask_in_room(&cfg, &mut matcher, room, inbox, sender, prompt).await
         }
         AskSource::UserDm { user, caller } => {
             let mut dm = match user.exclusive_at(caller).await {
@@ -906,75 +904,27 @@ where
                     return Err(e);
                 }
             };
-            dm.inbox().clear();
-            let receipt = dm
-                .user()
-                .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
-            let (core, dm_user, inbox) = dm.split_for_ask();
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::Dm {
-                    core,
-                    user: dm_user,
-                    prompt,
-                    rename_retries: Mutex::new(0),
-                },
-                inbox,
-                receipt,
-            )
-            .await
+            ask_in_dm(&cfg, &mut matcher, &mut dm, prompt).await
         }
-        AskSource::BorrowedDm { dm } => {
-            dm.core().check_connected()?;
-            if let Some(err) = dm.user().quit_error() {
-                return Err(err);
-            }
-            dm.inbox().clear();
-            let receipt = dm
-                .user()
-                .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
-            let (core, dm_user, inbox) = dm.split_for_ask();
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::Dm {
-                    core,
-                    user: dm_user,
-                    prompt,
-                    rename_retries: Mutex::new(0),
-                },
-                inbox,
-                receipt,
-            )
-            .await
-        }
+        AskSource::BorrowedDm { dm } => ask_in_dm(&cfg, &mut matcher, dm, prompt).await,
         AskSource::BorrowedHuddle { huddle } => {
-            huddle.check_connected()?;
-            huddle.inbox().clear();
             let (sender, inbox) = huddle.split_for_ask();
+            // Fail before clearing the shared inbox, which holds other members' unread messages:
+            sender.core().check_connected()?;
+            inbox.clear();
             let receipt = sender.broadcast_prompt_with_receipt(prompt.clone())?;
-            await_ask_loop(
-                &cfg,
-                &mut *matcher,
-                EndpointSender::Huddle {
-                    sender,
-                    prompt,
-                    bounce_state: Mutex::new(HuddleBounceState::default()),
-                },
-                inbox,
-                receipt,
-            )
-            .await
+            let sender = EndpointSender::Huddle { sender, prompt };
+            await_ask_loop(&cfg, &mut matcher, sender, inbox, receipt).await
         }
         AskSource::HuddleMember { huddle, user } => {
-            huddle.check_connected()?;
+            let (members, inbox) = huddle.split_for_ask();
+            // Fail before clearing the shared inbox, which holds other members' unread messages:
+            members.core().check_connected()?;
             if let Some(err) = user.quit_error() {
                 return Err(err);
             }
-            huddle.inbox().clear();
+            inbox.clear();
             let receipt = user.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
-            let (members, inbox) = huddle.split_for_ask();
             // Only `user` answers, over the huddle's single inbox; teammates' banter meanwhile is
             // relayed (if enabled) rather than matched:
             let mut member_matcher = |msg: &ChatMessage| {
@@ -987,28 +937,54 @@ where
                     AskMatch::ignore()
                 }
             };
-            let reply = await_ask_loop(
-                &cfg,
-                &mut member_matcher,
-                EndpointSender::Dm {
-                    core: members.core(),
-                    user: &user,
-                    prompt,
-                    rename_retries: Mutex::new(0),
-                },
-                inbox,
-                receipt,
-            );
-            // The huddle inbox only ends once every member is gone, so watch `user` directly.
-            // `biased` drains replies that precede the `QUIT` on the wire first:
-            let tracks = [user.track_arc()];
-            tokio::select! {
-                biased;
-                res = reply => res,
-                err = wait_any_track_quit(&tracks) => Err(err),
-            }
+            // The huddle inbox outlives `user`, so `Dm`'s own `QUIT` check ends the prompt:
+            let sender = EndpointSender::Dm {
+                core: members.core(),
+                user: &user,
+                prompt,
+            };
+            await_ask_loop(&cfg, &mut member_matcher, sender, inbox, receipt).await
         }
     }
+}
+
+/// Channel prompt: writes `prompt` to `room` (which fails if the bot is known to be out of it)
+/// and awaits a reply on the already-subscribed `inbox`.
+async fn ask_in_room<F, R>(
+    cfg: &AskConfig,
+    matcher: &mut F,
+    room: &Room,
+    mut inbox: Inbox,
+    sender: EndpointSender<'_>,
+    prompt: Text,
+) -> Result<R::Output>
+where
+    F: FnMut(&ChatMessage) -> R + Send,
+    R: IntoAskMatch,
+{
+    let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
+    await_ask_loop(cfg, matcher, sender, &mut inbox, receipt).await
+}
+
+/// DM prompt over a held [`ExclusiveDm`]: drops any backlog, writes `prompt` (which fails if
+/// the session or the user is gone) and awaits a reply on the DM's own inbox.
+async fn ask_in_dm<F, R>(
+    cfg: &AskConfig,
+    matcher: &mut F,
+    dm: &mut ExclusiveDm,
+    prompt: Text,
+) -> Result<R::Output>
+where
+    F: FnMut(&ChatMessage) -> R + Send,
+    R: IntoAskMatch,
+{
+    dm.inbox().clear();
+    let receipt = dm
+        .user()
+        .send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
+    let (core, user, inbox) = dm.split_for_ask();
+    let sender = EndpointSender::Dm { core, user, prompt };
+    await_ask_loop(cfg, matcher, sender, inbox, receipt).await
 }
 
 impl<'a, F, R> Future for Ask<'a, F, R>

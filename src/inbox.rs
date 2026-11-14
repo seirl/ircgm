@@ -740,18 +740,21 @@ impl Inbox {
     }
 
     /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`] and [`crate::Ask`].
+    ///
+    /// `f` sees every reply candidate (chat, plus human notices if `accept_notices`);
+    /// `on_other` sees every other wire event (bounces, departures, ...) and may end the wait.
     pub(crate) async fn wait_reply_map<B, F, T>(
         &mut self,
         ignore_commands: bool,
         accept_notices: bool,
-        check_bounce: B,
+        on_other: B,
         f: F,
     ) -> Result<T>
     where
-        B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
+        B: FnMut(&WireEvent) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        self.wait_reply_map_inner(TimeLimit::None, ignore_commands, accept_notices, check_bounce, f)
+        self.wait_reply_map_inner(TimeLimit::None, ignore_commands, accept_notices, on_other, f)
             .await
     }
 
@@ -760,56 +763,39 @@ impl Inbox {
         read_limit: TimeLimit,
         ignore_commands: bool,
         accept_notices: bool,
-        mut check_bounce: B,
+        mut on_other: B,
         mut f: F,
     ) -> Result<T>
     where
-        B: FnMut(&str, Option<u64>, u16, &str) -> Option<Error>,
+        B: FnMut(&WireEvent) -> Option<Error>,
         F: FnMut(&ChatMessage) -> Option<T>,
     {
         let deadline = read_limit.deadline_from(Instant::now());
         loop {
             let wire = self.next_wire_until(deadline).await?;
-            match &wire.kind {
-                WireKind::Event(Event::DeliveryFailed {
-                    target,
-                    code,
-                    message,
-                    ..
-                }) => {
-                    if let Some(err) = check_bounce(target, wire.bounce_user_id(), *code, message) {
+            let candidate = match &wire.kind {
+                WireKind::Event(Event::Chat(msg)) => Some(msg),
+                WireKind::Event(Event::Notice { .. }) if accept_notices => wire.human_notice(),
+                _ => {
+                    if let Some(err) = on_other(&wire) {
                         return Err(err);
                     }
+                    None
                 }
-                WireKind::Event(Event::Chat(msg)) => {
-                    if ignore_commands
-                        && self
-                            .sub
-                            .core()
-                            .is_some_and(|c| c.is_command_text(&msg.text))
-                    {
-                        continue;
-                    }
-                    if let Some(val) = f(msg) {
-                        return Ok(val);
-                    }
-                }
-                WireKind::Event(Event::Notice { .. }) if accept_notices => {
-                    if let Some(msg) = wire.human_notice() {
-                        if ignore_commands
-                            && self
-                                .sub
-                                .core()
-                                .is_some_and(|c| c.is_command_text(&msg.text))
-                        {
-                            continue;
-                        }
-                        if let Some(val) = f(msg) {
-                            return Ok(val);
-                        }
-                    }
-                }
-                _ => {}
+            };
+            let Some(msg) = candidate else {
+                continue;
+            };
+            if ignore_commands
+                && self
+                    .sub
+                    .core()
+                    .is_some_and(|c| c.is_command_text(&msg.text))
+            {
+                continue;
+            }
+            if let Some(val) = f(msg) {
+                return Ok(val);
             }
         }
     }
@@ -822,7 +808,7 @@ impl Inbox {
             self.read_limit,
             self.ignore_commands,
             self.accept_notices,
-            |_, _, _, _| None,
+            |_| None,
             f,
         )
         .await
@@ -842,7 +828,7 @@ impl Inbox {
             self.read_limit,
             false,
             self.accept_notices,
-            |_, _, _, _| None,
+            |_| None,
             |m| m.is_cmd(cmd).then(|| m.clone()),
         )
         .await
@@ -854,7 +840,7 @@ impl Inbox {
             self.read_limit,
             false,
             self.accept_notices,
-            |_, _, _, _| None,
+            |_| None,
             |m| m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned())),
         )
         .await
@@ -881,7 +867,7 @@ impl Inbox {
                 TimeLimit::None,
                 self.ignore_commands,
                 self.accept_notices,
-                |_, _, _, _| None,
+                |_| None,
                 f,
             )
             .await
