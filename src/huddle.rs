@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
 
-use crate::ask::{Ask, AskMany, IntoAskMatch};
-use crate::bot::BotCore;
 use crate::chat::{Chat, GroupChat, InboxRef};
+use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::exclusive_dm::DmLease;
 use crate::inbox::Inbox;
@@ -138,32 +137,6 @@ impl Huddle {
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
         self.broadcast_kind(OutboundChatKind::Action, text.into())
-    }
-
-    #[track_caller]
-    pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        Ask::from_group(self, prompt.into(), matcher)
-    }
-
-    /// Broadcasts `prompt` to all online huddle members and collects up to one answer per member
-    /// (or restricted subset via [`AskMany::from_users`]) while relaying member chat.
-    #[track_caller]
-    pub fn ask_many<'a, F, R>(
-        &'a mut self,
-        prompt: impl Into<Text>,
-        matcher: F,
-    ) -> AskMany<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        crate::ask::ask_many(self, prompt, matcher)
     }
 
     pub fn inbox(&mut self) -> &mut Inbox {

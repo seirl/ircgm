@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::poll_fn;
@@ -10,68 +9,12 @@ use std::task::{Context, Poll};
 use irc::proto::Message;
 use tokio::sync::mpsc;
 
-use crate::bot::BotCore;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
+use crate::core::BotCore;
 use crate::error::{DisconnectReason, Error, Result};
 use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
-use crate::room::Room;
 use crate::state::WorldState;
-use crate::user::{User, UserStatus, UserTrack};
-
-/// Multi-source filter builder for [`crate::Bot::inbox_scope`] (delivers matching channels
-/// and/or DMs into one wire-ordered [`Inbox`]).
-#[derive(Clone, Debug, Default)]
-pub struct InboxScope {
-    pub(crate) rooms: Vec<Room>,
-    pub(crate) dm_users: Vec<User>,
-}
-
-impl InboxScope {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn room(mut self, room: &Room) -> Self {
-        let cm = room.casemap();
-        if !self
-            .rooms
-            .iter()
-            .any(|existing| existing.belongs_to(room.core()) && cm.str_eq(existing.name(), room.name()))
-        {
-            self.rooms.push(room.clone());
-        }
-        self
-    }
-
-    pub fn rooms<I, R>(mut self, rooms: I) -> Self
-    where
-        I: IntoIterator<Item = R>,
-        R: Borrow<Room>,
-    {
-        for r in rooms {
-            self = self.room(r.borrow());
-        }
-        self
-    }
-
-    pub fn dm_from(mut self, user: &User) -> Self {
-        if !self.dm_users.iter().any(|u| u == user) {
-            self.dm_users.push(user.clone());
-        }
-        self
-    }
-
-    pub fn dms_from<I, U>(mut self, users: I) -> Self
-    where
-        I: IntoIterator<Item = U>,
-        U: Borrow<User>,
-    {
-        for u in users {
-            self = self.dm_from(u.borrow());
-        }
-        self
-    }
-}
+use crate::user::{UserStatus, UserTrack};
 
 #[derive(Clone, Debug)]
 pub(crate) enum Filter {
@@ -704,6 +647,11 @@ impl Inbox {
 
     pub(crate) fn is_departed_in_room(&self, track_id: u64) -> bool {
         self.departed_users.contains(&track_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_label(&self) -> &str {
+        &self.scope_label
     }
 
     pub(crate) fn set_opened_at(&mut self, opened_at: &'static Location<'static>) {

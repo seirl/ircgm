@@ -1,21 +1,16 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use irc_colors::Text;
 use tokio::sync::watch;
-use tracing::Instrument as _;
 
-use crate::ask::{Ask, IntoAskMatch};
-use crate::bot::BotCore;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
+use crate::core::BotCore;
 use crate::error::{DisconnectReason, Error, Result};
-use crate::exclusive_dm::{acquire_dm_lease, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
-use crate::message::ChatMessage;
 use crate::outbound::OutboundChatKind;
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
@@ -393,40 +388,6 @@ impl User {
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
         self.send_chat(OutboundChatKind::Action, text.into())
-    }
-
-    /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`].
-    #[track_caller]
-    pub fn exclusive(&self) -> impl Future<Output = Result<ExclusiveDm>> + Send + '_ {
-        let caller = Location::caller();
-        self.exclusive_at(caller)
-    }
-
-    pub(crate) async fn exclusive_at(
-        &self,
-        caller: &'static Location<'static>,
-    ) -> Result<ExclusiveDm> {
-        let core = self.upgrade_core()?;
-        let span = tracing::debug_span!(
-            "ircgm::exclusive",
-            user_id = self.track.id,
-            nick = %self.nick()
-        );
-        let lease = acquire_dm_lease(&core, self.clone(), caller)
-            .instrument(span)
-            .await?;
-        Ok(ExclusiveDm::from_lease(core, lease, caller))
-    }
-
-    /// Acquires `exclusive()`, sends `prompt` in DM, and awaits one matching reply.
-    #[track_caller]
-    pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        Ask::from_user_dm(self, Location::caller(), prompt.into(), matcher)
     }
 
     /// Opens an unserialized DM [`Inbox`] tracking `NICK` changes and failing with

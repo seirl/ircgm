@@ -15,9 +15,11 @@ use tracing::Instrument as _;
 use crate::casemap::CaseMap;
 use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
+use crate::exclusive_dm::ExclusiveDm;
+use crate::huddle::Huddle;
 use crate::inbox::Inbox;
 use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
-use crate::outbound::OutboundChatKind;
+use crate::room::Room;
 use crate::state::BotPresence;
 use crate::user::{User, UserId};
 
@@ -213,20 +215,18 @@ pub struct TimeoutCtx<'a> {
     pub user: Option<&'a User>,
 }
 
-const FALLBACK_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug)]
 enum TimeLimit {
-    Default,
     None,
     Duration(Duration),
     Deadline(Instant),
 }
 
 impl TimeLimit {
-    fn deadline_from(self, base: Instant, default_timeout: Duration) -> Option<Instant> {
+    fn deadline_from(self, base: Instant) -> Option<Instant> {
         match self {
-            Self::Default => Some(crate::future::deadline_after_from(base, default_timeout)),
             Self::None => None,
             Self::Duration(dur) => Some(crate::future::deadline_after_from(base, dur)),
             Self::Deadline(dl) => Some(dl),
@@ -271,7 +271,7 @@ pub struct AskConfig {
 impl Default for AskConfig {
     fn default() -> Self {
         Self {
-            time_limit: TimeLimit::Default,
+            time_limit: TimeLimit::Duration(DEFAULT_REPLY_TIMEOUT),
             warnings: Vec::new(),
             timeout_handler: None,
             ignore_commands: false,
@@ -379,6 +379,104 @@ where
     R::Output: Send + 'a,
 {
     AskMany::from_group(group, prompt.into(), matcher)
+}
+
+impl Room {
+    #[track_caller]
+    pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        Ask::from_group(self, prompt.into(), matcher)
+    }
+
+    /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`TimeoutCtx::user`]
+    /// to `Some(user)`).
+    #[track_caller]
+    pub fn ask_user<'a, F, R>(
+        &'a self,
+        user: &User,
+        prompt: impl Into<Text>,
+        matcher: F,
+    ) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        self.ask(prompt, matcher).from_user(user)
+    }
+
+    /// Prompts this channel once and collects answers from `1..N` responders (`Result<Answers<T>>`).
+    ///
+    /// By default anyone in the room (including newcomers joining mid-prompt) may respond; chain
+    /// [`AskMany::from_users`] to restrict to a specific set of players, [`AskMany::allow_change`]
+    /// to let responders update their answer, and [`AskMany::max_answers`] or
+    /// [`AskMany::stop_when`] to customize early completion.
+    #[track_caller]
+    pub fn ask_many<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        ask_many(self, prompt, matcher)
+    }
+}
+
+impl Huddle {
+    #[track_caller]
+    pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        Ask::from_group(self, prompt.into(), matcher)
+    }
+
+    /// Broadcasts `prompt` to all online huddle members and collects up to one answer per member
+    /// (or restricted subset via [`AskMany::from_users`]) while relaying member chat.
+    #[track_caller]
+    pub fn ask_many<'a, F, R>(
+        &'a mut self,
+        prompt: impl Into<Text>,
+        matcher: F,
+    ) -> AskMany<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        ask_many(self, prompt, matcher)
+    }
+}
+
+impl ExclusiveDm {
+    #[track_caller]
+    pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        ask(self, prompt, matcher)
+    }
+}
+
+impl User {
+    /// Acquires `exclusive()`, sends `prompt` in DM, and awaits one matching reply.
+    #[track_caller]
+    pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
+    where
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        Ask::from_user_dm(self, Location::caller(), prompt.into(), matcher)
+    }
 }
 
 trait ChatDyn: Send + Sync {
@@ -975,7 +1073,7 @@ where
         self.get_mut().state.poll_with(cx, |u| {
             let timeout_ms = match u.cfg.time_limit {
                 TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-                TimeLimit::Default | TimeLimit::Deadline(_) | TimeLimit::None => None,
+                TimeLimit::Deadline(_) | TimeLimit::None => None,
             };
             let target = u.endpoint.chat().target();
             let span = tracing::debug_span!(
@@ -999,7 +1097,7 @@ fn target_span_label(target: &Target) -> &str {
 fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
     let timeout_ms = match cfg.time_limit {
         TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-        TimeLimit::Default | TimeLimit::Deadline(_) | TimeLimit::None => None,
+        TimeLimit::Deadline(_) | TimeLimit::None => None,
     };
     match source {
         AskSource::Endpoint {
@@ -1033,12 +1131,8 @@ fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
     }
 }
 
-fn compute_schedule(
-    cfg: &AskConfig,
-    sent_at: Instant,
-    default_timeout: Duration,
-) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
-    let Some(deadline) = cfg.time_limit.deadline_from(sent_at, default_timeout) else {
+fn compute_schedule(cfg: &AskConfig, sent_at: Instant) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
+    let Some(deadline) = cfg.time_limit.deadline_from(sent_at) else {
         return (None, VecDeque::new());
     };
     let budget = deadline.saturating_duration_since(sent_at);
@@ -1093,14 +1187,11 @@ fn dedup_users(users: Vec<User>) -> Vec<User> {
     out
 }
 
-fn send_reply_kind(chat: &dyn ChatDyn, kind: OutboundChatKind, text: Text) {
-    match kind {
-        OutboundChatKind::Notice => {
-            let _ = chat.notice_text(text);
-        }
-        OutboundChatKind::Privmsg | OutboundChatKind::Action => {
-            let _ = chat.say_text(text);
-        }
+fn send_reply_to_msg(chat: &dyn ChatDyn, is_notice: bool, text: Text) {
+    if is_notice {
+        let _ = chat.notice_text(text);
+    } else {
+        let _ = chat.say_text(text);
     }
 }
 
@@ -1275,10 +1366,7 @@ where
     }
 
     let sent_at = Instant::now();
-    let default_timeout = inbox_core
-        .as_ref()
-        .map_or(FALLBACK_REPLY_TIMEOUT, |c| c.default_reply_timeout);
-    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at, default_timeout);
+    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at);
     let endpoint_target = endpoint.chat().target();
     let casemap = inbox_core
         .as_ref()
@@ -1531,7 +1619,7 @@ where
                             // `PRIVMSG` (RFC 2812 §3.3.2).
                             AskMatchInner::Accept(val, ack) => {
                                 if let Some(ack_msg) = ack {
-                                    send_reply_kind(endpoint.chat(), msg.reply_kind(), ack_msg);
+                                    send_reply_to_msg(endpoint.chat(), msg.is_notice(), ack_msg);
                                 }
                                 answers.record_answer(&msg.sender, val);
                                 if let Some(ref mut pred) = stop_pred {
@@ -1544,7 +1632,7 @@ where
                                 }
                             }
                             AskMatchInner::Reject(feedback) => {
-                                send_reply_kind(endpoint.chat(), msg.reply_kind(), feedback);
+                                send_reply_to_msg(endpoint.chat(), msg.is_notice(), feedback);
                             }
                             AskMatchInner::Ignore => {}
                         }

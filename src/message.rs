@@ -6,7 +6,6 @@ use tokio::time::Instant;
 
 use crate::error::Result;
 use crate::outbound::OutboundChatKind;
-use crate::room::Room;
 use crate::state::BotPresence;
 use crate::user::User;
 
@@ -71,14 +70,6 @@ impl ChatMessage {
         self.kind == MessageKind::Notice
     }
 
-    /// Case-folded channel match using `room`'s active `CaseMap`.
-    pub fn is_in(&self, room: &Room) -> bool {
-        match &self.target {
-            Target::Channel(ch) => room.casemap().str_eq(ch, room.name()),
-            Target::Dm => false,
-        }
-    }
-
     /// Re-parses `raw_text` into an `irc_colors::Text` preserving sender colors/styles.
     pub fn to_styled(&self) -> Text {
         Text::parse(&self.raw_text)
@@ -121,7 +112,7 @@ impl ChatMessage {
 
     /// Outbound kind for any automatic answer to this message: `NOTICE` for a `NOTICE` (which
     /// must never trigger an automatic `PRIVMSG`, RFC 2812 §3.3.2), else `PRIVMSG`.
-    pub(crate) fn reply_kind(&self) -> OutboundChatKind {
+    fn reply_kind(&self) -> OutboundChatKind {
         match self.kind {
             MessageKind::Notice => OutboundChatKind::Notice,
             MessageKind::Privmsg | MessageKind::Action => OutboundChatKind::Privmsg,

@@ -293,7 +293,7 @@ async fn unconfigured_dm_ask_uses_300s_default_reply_timeout_while_raw_inbox_rea
 
     let bouncer = bot.user("BouncerUser").unwrap();
 
-    // 1. Unconfigured `Ask` uses `BotConfig::default_reply_timeout` (300s by default):
+    // 1. Unconfigured `Ask` uses `AskConfig::default()` (300s reply timeout):
     {
         let start = tokio::time::Instant::now();
         let ask_task = tokio::spawn({

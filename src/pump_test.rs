@@ -1,8 +1,28 @@
+use std::time::Duration;
+
 use super::*;
-use crate::bot::BotConfig;
 use crate::casemap::AtomicCaseMap;
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::state::parse_irc_message;
+
+fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
+    let casemap = AtomicCaseMap::default();
+    let (outbound, _task) = OutboundSink::new(
+        RawTransport::test_only(out_tx),
+        usize::MAX,
+        Duration::from_secs(8),
+        casemap.clone(),
+    );
+    BotCore::new(
+        "gm".into(),
+        casemap,
+        outbound,
+        1024,
+        vec!["!".into()],
+        Duration::from_secs(15),
+        450,
+    )
+}
 
 #[test]
 fn is_services_pseudoclient_matches_case_insensitively() {
@@ -49,18 +69,7 @@ fn extract_tags_parses_account_and_bot_flags() {
 #[tokio::test]
 async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registered() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let cfg = BotConfig {
-        outbound_burst: usize::MAX,
-        ..BotConfig::default()
-    };
-    let casemap = AtomicCaseMap::default();
-    let (outbound, _task) = OutboundSink::new(
-        RawTransport::test_only(out_tx),
-        usize::MAX,
-        cfg.outbound_window,
-        casemap.clone(),
-    );
-    let core = BotCore::new("gm".into(), casemap, outbound, &cfg);
+    let core = test_core(out_tx);
 
     let mut reg = RegistrationTracker {
         cap_pending: true,
@@ -94,18 +103,7 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
 #[tokio::test]
 async fn self_echo_notice_updates_tracked_account_without_emitting_chat_event() {
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
-    let cfg = BotConfig {
-        outbound_burst: usize::MAX,
-        ..BotConfig::default()
-    };
-    let casemap = AtomicCaseMap::default();
-    let (outbound, _task) = OutboundSink::new(
-        RawTransport::test_only(out_tx),
-        usize::MAX,
-        cfg.outbound_window,
-        casemap.clone(),
-    );
-    let core = BotCore::new("gm".into(), casemap, outbound, &cfg);
+    let core = test_core(out_tx);
     let self_track = core.users.get_or_create("gm");
     assert_eq!(self_track.account(), None);
 

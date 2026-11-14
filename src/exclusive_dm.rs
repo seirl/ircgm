@@ -1,18 +1,19 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::panic::Location;
 use std::sync::Arc;
 use std::time::Duration;
 
 use irc_colors::Text;
 use tokio::sync::OwnedMutexGuard;
+use tracing::Instrument as _;
 
-use crate::ask::{Ask, IntoAskMatch};
-use crate::bot::BotCore;
 use crate::chat::{Chat, InboxRef};
+use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
-use crate::message::{ChatMessage, Target};
+use crate::message::Target;
 use crate::user::{User, UserStatus, UserTrack};
 
 /// Held lock on a [`User`]'s interactive DM prompt slot (`UserTrack::dm_mutex`).
@@ -96,18 +97,33 @@ impl ExclusiveDm {
         self.user().action(text)
     }
 
-    #[track_caller]
-    pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        crate::ask::ask(self, prompt, matcher)
-    }
-
     pub fn inbox(&mut self) -> &mut Inbox {
         &mut self.inbox
+    }
+}
+
+impl User {
+    /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`].
+    #[track_caller]
+    pub fn exclusive(&self) -> impl Future<Output = Result<ExclusiveDm>> + Send + '_ {
+        let caller = Location::caller();
+        self.exclusive_at(caller)
+    }
+
+    pub(crate) async fn exclusive_at(
+        &self,
+        caller: &'static Location<'static>,
+    ) -> Result<ExclusiveDm> {
+        let core = self.upgrade_core()?;
+        let span = tracing::debug_span!(
+            "ircgm::exclusive",
+            user_id = self.track_id(),
+            nick = %self.nick()
+        );
+        let lease = acquire_dm_lease(&core, self.clone(), caller)
+            .instrument(span)
+            .await?;
+        Ok(ExclusiveDm::from_lease(core, lease, caller))
     }
 }
 

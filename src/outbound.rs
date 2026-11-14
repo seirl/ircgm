@@ -120,9 +120,9 @@ pub(crate) enum RawTransport {
     #[cfg(any(test, feature = "testing"))]
     Test {
         outbound_tx: mpsc::UnboundedSender<Command>,
-        /// Notified (`PumpInput::Eof`) once `QUIT` hits the wire, modeling an RFC 2812 server
-        /// closing the connection after receiving `QUIT`.
-        quit_eof_tx: Option<mpsc::UnboundedSender<crate::pump::PumpInput>>,
+        /// Invoked once `QUIT` hits the wire, modeling an RFC 2812 server closing the connection
+        /// after receiving `QUIT`.
+        on_quit: Option<Box<dyn Fn() + Send + Sync>>,
     },
 }
 
@@ -131,7 +131,7 @@ impl RawTransport {
     pub(crate) fn test_only(outbound_tx: mpsc::UnboundedSender<Command>) -> Self {
         Self::Test {
             outbound_tx,
-            quit_eof_tx: None,
+            on_quit: None,
         }
     }
 
@@ -141,13 +141,13 @@ impl RawTransport {
             #[cfg(any(test, feature = "testing"))]
             RawTransport::Test {
                 outbound_tx,
-                quit_eof_tx,
+                on_quit,
             } => {
                 let is_quit = matches!(cmd, Command::QUIT(_));
                 let ok = outbound_tx.send(cmd).is_ok();
                 if is_quit {
-                    if let Some(eof_tx) = quit_eof_tx {
-                        let _ = eof_tx.send(crate::pump::PumpInput::Eof);
+                    if let Some(f) = on_quit {
+                        f();
                     }
                 }
                 ok

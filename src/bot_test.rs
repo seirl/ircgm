@@ -465,3 +465,30 @@ async fn shared_join_refuses_to_coalesce_onto_breakout_pending_join() {
     server.complete_join("#game", &[]);
     assert_eq!(setup.await.unwrap().unwrap().name(), "#game");
 }
+
+#[tokio::test]
+async fn inbox_scope_deduplicates_case_folded_rooms_and_same_user() {
+    let (bot, _server) = test_harness("gm");
+    let r1 = bot.room("#Lobby").unwrap();
+    let r2 = bot.room("#lobby").unwrap();
+    let r3 = bot.room("#Arena").unwrap();
+    let alice1 = bot.user("Alice").unwrap();
+    let alice2 = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+
+    let scope = InboxScope::new()
+        .rooms([&r1, &r2, &r3])
+        .dms_from([&alice1, &alice2, &bob]);
+
+    assert_eq!(scope.rooms.len(), 2);
+    assert_eq!(scope.dm_users.len(), 2);
+
+    // Rooms, like users, can be passed owned as well as borrowed:
+    let owned = InboxScope::new()
+        .rooms(vec![r1.clone(), r3.clone()])
+        .dms_from(vec![bob.clone()]);
+    assert_eq!(owned.rooms.len(), 2);
+    assert_eq!(owned.dm_users.len(), 1);
+    let rooms_inbox = bot.inbox_rooms(vec![r1.clone(), r3.clone()]);
+    assert_eq!(rooms_inbox.scope_label(), "rooms #Lobby, #Arena");
+}

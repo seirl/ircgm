@@ -13,8 +13,9 @@ use irc::proto::Command;
 use irc_colors::Text;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::bot::{Bot, BotConfig, BotCore, BotOwner};
+use crate::bot::{Bot, BotConfig, BotOwner};
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
+use crate::core::BotCore;
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::pump::{run_pump, PumpInput, PumpSource, RegistrationTracker};
 use crate::state::parse_irc_message;
@@ -37,16 +38,27 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
 
     let casemap = AtomicCaseMap::default();
+    let eof_tx = inbound_tx.clone();
     let (outbound, outbound_task) = OutboundSink::new(
         RawTransport::Test {
             outbound_tx,
-            quit_eof_tx: Some(inbound_tx.clone()),
+            on_quit: Some(Box::new(move || {
+                let _ = eof_tx.send(PumpInput::Eof);
+            })),
         },
         config.outbound_burst,
         config.outbound_window,
         casemap.clone(),
     );
-    let core = BotCore::new(initial_nick.clone(), casemap, outbound, &config);
+    let core = BotCore::new(
+        initial_nick.clone(),
+        casemap,
+        outbound,
+        config.inbox_capacity,
+        config.command_prefixes.clone(),
+        config.handshake_timeout,
+        config.max_payload_bytes,
+    );
     core.mark_registered();
     let reg = RegistrationTracker {
         cap_pending: false,

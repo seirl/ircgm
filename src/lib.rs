@@ -67,6 +67,7 @@ mod bot;
 mod breakout;
 mod casemap;
 mod chat;
+mod core;
 mod error;
 mod exclusive_dm;
 pub mod future;
@@ -98,7 +99,7 @@ pub mod prelude {
 
 pub use crate::{
     ask::{ask, ask_many, Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch, TimeoutCtx},
-    bot::{Bot, BotConfig},
+    bot::{Bot, BotConfig, InboxScope},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
     chat::{Chat, GroupChat, InboxRef},
@@ -106,7 +107,7 @@ pub use crate::{
     exclusive_dm::ExclusiveDm,
     future::{race_all, GameFutureExt, Outcome},
     huddle::Huddle,
-    inbox::{Inbox, InboxScope},
+    inbox::Inbox,
     message::{ChatMessage, Event, MessageKind, Target},
     room::{Member, ModerationGuard, Room},
     user::{User, UserId},

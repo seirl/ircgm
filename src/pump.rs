@@ -7,7 +7,7 @@ use irc_colors::Text;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::bot::BotCore;
+use crate::core::BotCore;
 use crate::error::DisconnectReason;
 use crate::message::{
     parse_privmsg_body, ChatMessage, Event, MessageKind, Target, WireEvent, WireKind, WireMeta,

@@ -79,16 +79,15 @@ fn into_ask_match_and_answer_conversions() {
 #[test]
 fn compute_schedule_filters_and_sorts_countdown_warnings() {
     let now = Instant::now();
-    let def_to = Duration::from_secs(300);
 
-    // Default `AskConfig::new()` uses `default_timeout`:
-    let (def_dl, def_warns) = compute_schedule(&AskConfig::new(), now, def_to);
-    assert_eq!(def_dl, Some(now + def_to));
+    // Default `AskConfig::new()` uses the 300s default reply timeout:
+    let (def_dl, def_warns) = compute_schedule(&AskConfig::new(), now);
+    assert_eq!(def_dl, Some(now + Duration::from_secs(300)));
     assert!(def_warns.is_empty());
 
     // TimeLimit::None produces no deadline and no warnings even if configured:
     let none_cfg = AskConfig::untimed().warn_remaining(Duration::from_secs(10), "10s!");
-    let (dl, warns) = compute_schedule(&none_cfg, now, def_to);
+    let (dl, warns) = compute_schedule(&none_cfg, now);
     assert!(dl.is_none());
     assert!(warns.is_empty());
 
@@ -100,7 +99,7 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
         .warn_remaining(Duration::from_secs(45), "greater than timeout ignored")
         .warn_remaining(Duration::from_secs(20), "20s left");
 
-    let (dl, warns) = compute_schedule(&dur_cfg, now, def_to);
+    let (dl, warns) = compute_schedule(&dur_cfg, now);
     assert_eq!(dl, Some(now + Duration::from_secs(30)));
     assert_eq!(warns.len(), 2);
     // 20s remaining fires at now + 10s; 5s remaining fires at now + 25s:
@@ -114,7 +113,7 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
     let dl_cfg = AskConfig::deadline(target_dl)
         .warn_remaining(Duration::from_secs(20), "exceeds budget")
         .warn_remaining(Duration::from_secs(5), "5s left");
-    let (dl, warns) = compute_schedule(&dl_cfg, now, def_to);
+    let (dl, warns) = compute_schedule(&dl_cfg, now);
     assert_eq!(dl, Some(target_dl));
     assert_eq!(warns.len(), 1);
     assert_eq!(warns[0].0, now + Duration::from_secs(10));
@@ -270,12 +269,8 @@ async fn ask_answers_a_notice_reply_with_notice_rejects_and_acks() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn bot_config_default_reply_timeout_applies_to_unconfigured_prompts() {
-    let cfg = crate::BotConfig {
-        default_reply_timeout: Duration::from_secs(7),
-        ..crate::BotConfig::default()
-    };
-    let (bot, mut server) = crate::testing::test_harness_with("gm", cfg);
+async fn unconfigured_prompts_use_default_300s_reply_timeout() {
+    let (bot, mut server) = test_harness("gm");
     server.complete_join("#lobby", &["alice"]);
     server.settle().await;
     let room = bot.room("#lobby").unwrap();
@@ -285,7 +280,7 @@ async fn bot_config_default_reply_timeout_applies_to_unconfigured_prompts() {
         async move { room.ask("Ping?", |m| Some(m.text.clone())).await }
     });
     assert_eq!(server.recv_message_to("#lobby").await, "Ping?");
-    server.advance(Duration::from_secs(6)).await;
+    server.advance(Duration::from_secs(299)).await;
     assert!(!ask_task.is_finished());
     server.advance(Duration::from_secs(1)).await;
     assert_eq!(ask_task.await.unwrap().unwrap(), Answer::TimedOut);

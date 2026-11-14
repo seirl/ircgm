@@ -6,10 +6,9 @@ use std::sync::Arc;
 use irc::proto::Command;
 use irc_colors::Text;
 
-use crate::ask::{Ask, AskMany, IntoAskMatch};
-use crate::bot::BotCore;
 use crate::casemap::CaseMap;
 use crate::chat::{Chat, GroupChat, InboxRef};
+use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
 use crate::message::{ChatMessage, Target};
@@ -346,49 +345,6 @@ impl Room {
             }
         }
         Ok(ModerationGuard::new(self.clone()))
-    }
-
-    #[track_caller]
-    pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        Ask::from_group(self, prompt.into(), matcher)
-    }
-
-    /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`crate::TimeoutCtx::user`]
-    /// to `Some(user)`).
-    #[track_caller]
-    pub fn ask_user<'a, F, R>(
-        &'a self,
-        user: &User,
-        prompt: impl Into<Text>,
-        matcher: F,
-    ) -> Ask<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        self.ask(prompt, matcher).from_user(user)
-    }
-
-    /// Prompts this channel once and collects answers from `1..N` responders (`Result<Answers<T>>`).
-    ///
-    /// By default anyone in the room (including newcomers joining mid-prompt) may respond; chain
-    /// [`AskMany::from_users`] to restrict to a specific set of players, [`AskMany::allow_change`]
-    /// to let responders update their answer, and [`AskMany::max_answers`] or
-    /// [`AskMany::stop_when`] to customize early completion.
-    #[track_caller]
-    pub fn ask_many<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
-    where
-        F: FnMut(&ChatMessage) -> R + Send + 'a,
-        R: IntoAskMatch + 'a,
-        R::Output: Send + 'a,
-    {
-        crate::ask::ask_many(self, prompt, matcher)
     }
 
     #[track_caller]
@@ -730,6 +686,16 @@ impl Drop for ModerationGuard {
     fn drop(&mut self) {
         if !self.disarmed && self.room.bot_is_op() {
             let _ = self.restore_inner();
+        }
+    }
+}
+
+impl ChatMessage {
+    /// Case-folded channel match using `room`'s active `CaseMap`.
+    pub fn is_in(&self, room: &Room) -> bool {
+        match &self.target {
+            Target::Channel(ch) => room.casemap().str_eq(ch, room.name()),
+            Target::Dm => false,
         }
     }
 }

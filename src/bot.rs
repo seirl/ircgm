@@ -1,29 +1,84 @@
 use std::borrow::Borrow;
 use std::future::Future;
 use std::panic::Location;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use irc::proto::{CapSubCommand, Command};
-use irc_colors::Text;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
 use crate::breakout::{Breakout, BreakoutOptions};
 use crate::casemap::{AtomicCaseMap, CaseMap};
+use crate::core::{BotCore, ConnLifecycle};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDm};
 use crate::huddle::Huddle;
-use crate::inbox::{Filter, Inbox, InboxRegistry, InboxScope};
+use crate::inbox::{Filter, Inbox};
 use crate::outbound::{
-    build_chat_commands, validate_param, validate_target, OutboundChatKind, OutboundSink, Priority,
-    RawTransport,
+     validate_param, validate_target, OutboundSink, Priority, RawTransport,
 };
 use crate::pump::{run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
-use crate::state::{JoinOutcome, WorldState};
-use crate::user::{User, UserRegistry, UserTrack};
+use crate::state::JoinOutcome;
+use crate::user::{User, UserTrack};
+
+/// Multi-source filter builder for [`Bot::inbox_scope`] (delivers matching channels
+/// and/or DMs into one wire-ordered [`Inbox`]).
+#[derive(Clone, Debug, Default)]
+pub struct InboxScope {
+    pub(crate) rooms: Vec<Room>,
+    pub(crate) dm_users: Vec<User>,
+}
+
+impl InboxScope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn room(mut self, room: &Room) -> Self {
+        let cm = room.casemap();
+        if !self
+            .rooms
+            .iter()
+            .any(|existing| {
+                existing.belongs_to(room.core()) && cm.str_eq(existing.name(), room.name())
+            })
+        {
+            self.rooms.push(room.clone());
+        }
+        self
+    }
+
+    pub fn rooms<I, R>(mut self, rooms: I) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: Borrow<Room>,
+    {
+        for r in rooms {
+            self = self.room(r.borrow());
+        }
+        self
+    }
+
+    pub fn dm_from(mut self, user: &User) -> Self {
+        if !self.dm_users.iter().any(|u| u == user) {
+            self.dm_users.push(user.clone());
+        }
+        self
+    }
+
+    pub fn dms_from<I, U>(mut self, users: I) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Borrow<User>,
+    {
+        for u in users {
+            self = self.dm_from(u.borrow());
+        }
+        self
+    }
+}
 
 /// Whether `Bot::join_inner` may reuse a channel the bot already holds (`Bot::join`) or must
 /// claim it fresh (`Bot::breakout_with`, whose `Drop` tears the room down).
@@ -45,8 +100,6 @@ pub struct BotConfig {
     pub command_prefixes: Vec<String>,
     /// Default timeout for protocol handshakes like `JOIN`/`NAMES`, `Breakout`, and `quit` drain (default: `15s`).
     pub handshake_timeout: Duration,
-    /// Default reply timeout applied to [`crate::Ask`] / [`crate::AskMany`] prompts when not overridden via [`crate::AskConfig`] (default: `300s`).
-    pub default_reply_timeout: Duration,
     /// Upper ceiling on payload bytes per outbound `PRIVMSG`/`NOTICE` passed to `Text::wrap` (default: `450`).
     pub max_payload_bytes: usize,
     /// Outbound scheduler burst allowance (default: `15` lines per `8s` on live connections).
@@ -75,7 +128,6 @@ impl BotConfig {
             ],
             command_prefixes: vec!["!".into()],
             handshake_timeout: Duration::from_secs(15),
-            default_reply_timeout: Duration::from_secs(300),
             max_payload_bytes: 450,
             outbound_burst: 15,
             outbound_window: Duration::from_secs(8),
@@ -89,204 +141,6 @@ impl BotConfig {
     {
         self.command_prefixes = prefixes.into_iter().map(Into::into).collect();
         self
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConnLifecycle {
-    Registering { welcomed: bool },
-    Active,
-    Disconnected(DisconnectReason),
-}
-
-pub(crate) struct BotCore {
-    pub(crate) casemap: AtomicCaseMap,
-    pub(crate) state: RwLock<WorldState>,
-    pub(crate) users: UserRegistry,
-    pub(crate) inboxes: InboxRegistry,
-    pub(crate) outbound: Arc<OutboundSink>,
-    pub(crate) lifecycle_tx: watch::Sender<ConnLifecycle>,
-    pub(crate) shutdown_tx: watch::Sender<bool>,
-    pub(crate) inbox_capacity: usize,
-    pub(crate) command_prefixes: Vec<String>,
-    pub(crate) handshake_timeout: Duration,
-    pub(crate) default_reply_timeout: Duration,
-    pub(crate) max_payload_bytes: usize,
-}
-
-impl std::fmt::Debug for BotCore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BotCore")
-            .field("ptr", &std::ptr::from_ref(self))
-            .finish_non_exhaustive()
-    }
-}
-
-impl BotCore {
-    pub(crate) fn new(
-        initial_nick: String,
-        casemap: AtomicCaseMap,
-        outbound: Arc<OutboundSink>,
-        config: &BotConfig,
-    ) -> Arc<Self> {
-        let (lifecycle_tx, _) = watch::channel(ConnLifecycle::Registering { welcomed: false });
-        let (shutdown_tx, _) = watch::channel(false);
-        Arc::new(Self {
-            state: RwLock::new(WorldState::new(initial_nick, casemap.clone())),
-            users: UserRegistry::new(casemap.clone()),
-            inboxes: InboxRegistry::new(casemap.clone()),
-            casemap,
-            outbound,
-            lifecycle_tx,
-            shutdown_tx,
-            inbox_capacity: config.inbox_capacity.max(1),
-            command_prefixes: config.command_prefixes.clone(),
-            handshake_timeout: config.handshake_timeout,
-            default_reply_timeout: config.default_reply_timeout,
-            max_payload_bytes: config.max_payload_bytes.max(1),
-        })
-    }
-
-    pub(crate) fn casemap(&self) -> CaseMap {
-        self.casemap.load()
-    }
-
-    pub(crate) fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        match &*self.lifecycle_tx.borrow() {
-            ConnLifecycle::Disconnected(reason) => Some(reason.clone()),
-            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => None,
-        }
-    }
-
-    pub(crate) fn check_connected(&self) -> Result<()> {
-        if let Some(reason) = self.disconnect_reason() {
-            return Err(Error::Disconnected(reason));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_registered(&self) -> bool {
-        matches!(*self.lifecycle_tx.borrow(), ConnLifecycle::Active)
-    }
-
-    pub(crate) fn mark_welcomed(&self) {
-        self.lifecycle_tx.send_if_modified(|state| match state {
-            ConnLifecycle::Registering { welcomed } if !*welcomed => {
-                *welcomed = true;
-                true
-            }
-            _ => false,
-        });
-    }
-
-    pub(crate) fn mark_registered(&self) {
-        self.lifecycle_tx.send_if_modified(|state| match state {
-            ConnLifecycle::Registering { .. } => {
-                *state = ConnLifecycle::Active;
-                true
-            }
-            _ => false,
-        });
-    }
-
-    /// Transitions to `Disconnected` at most once.
-    ///
-    /// Ordering invariant: `lifecycle_tx` MUST publish `Disconnected` before `outbound.abort()`
-    /// and `inboxes.clear()`. `Inbox` does not subscribe to `lifecycle_tx`; instead, dropping
-    /// every sender in `inboxes.clear()` wakes parked `Inbox` polls with `Ready(None)`, which
-    /// then read `disconnect_reason()`.
-    pub(crate) fn mark_disconnected(&self, reason: DisconnectReason) {
-        let transitioned = self.lifecycle_tx.send_if_modified(|state| match state {
-            ConnLifecycle::Disconnected(_) => false,
-            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => {
-                *state = ConnLifecycle::Disconnected(reason);
-                true
-            }
-        });
-        if transitioned {
-            self.outbound.abort();
-            self.inboxes.clear();
-        }
-    }
-
-    pub(crate) fn finalize_quit(&self) {
-        let _ = self.shutdown_tx.send_replace(true);
-        let mut was_connected = false;
-        self.lifecycle_tx.send_if_modified(|state| match state {
-            ConnLifecycle::Disconnected(reason) => {
-                if *reason == DisconnectReason::Quit {
-                    false
-                } else {
-                    *reason = DisconnectReason::Quit;
-                    true
-                }
-            }
-            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => {
-                was_connected = true;
-                *state = ConnLifecycle::Disconnected(DisconnectReason::Quit);
-                true
-            }
-        });
-        if was_connected {
-            self.outbound.abort();
-            self.inboxes.clear();
-        }
-    }
-
-    pub(crate) async fn wait_disconnected(&self) -> DisconnectReason {
-        let mut rx = self.lifecycle_tx.subscribe();
-        loop {
-            if let ConnLifecycle::Disconnected(reason) = rx.borrow_and_update().clone() {
-                return reason;
-            }
-            if rx.changed().await.is_err() {
-                return DisconnectReason::BotDropped;
-            }
-        }
-    }
-
-    pub(crate) fn is_command_text(&self, plain_text: &str) -> bool {
-        let trimmed = plain_text.trim_start();
-        if trimmed.is_empty() {
-            return false;
-        }
-        self.command_prefixes
-            .iter()
-            .any(|p| !p.is_empty() && trimmed.starts_with(p.as_str()))
-    }
-
-    /// Enqueues `cmds` (ending with our own `PART channel`) and marks `channel` `Parting` under
-    /// the `WorldState` write lock, so a concurrent `Bot::join` either completes before the
-    /// `PART` is queued or sees `Parting` and queues its `JOIN` behind the `PART`.
-    /// `evict_on_leave` is `true` only for ephemeral `Breakout` teardown (see
-    /// `ChannelPhase::Parting`); `Room::part` keeps a `Left` record.
-    pub(crate) fn enqueue_part(
-        &self,
-        channel: &str,
-        priority: Priority,
-        cmds: Vec<Command>,
-        evict_on_leave: bool,
-    ) {
-        let mut ws = self.state.write().unwrap();
-        ws.mark_parting(channel, evict_on_leave);
-        self.outbound.enqueue_batch(priority, cmds);
-    }
-
-    /// Enqueues a validated, line-wrapped outbound chat message.
-    pub(crate) fn send_chat(
-        &self,
-        kind: OutboundChatKind,
-        target: &str,
-        text: Text,
-    ) -> Result<()> {
-        self.check_connected()?;
-        validate_target(target, "message target")?;
-        let ws = self.state.read().unwrap();
-        let cmds = build_chat_commands(kind, target, text, &ws, self.max_payload_bytes);
-        drop(ws);
-        self.outbound.enqueue_batch(Priority::Interactive, cmds);
-        Ok(())
     }
 }
 
@@ -373,7 +227,15 @@ impl Bot {
             config.outbound_window,
             casemap.clone(),
         );
-        let core = BotCore::new(nick.clone(), casemap, outbound, &config);
+        let core = BotCore::new(
+            nick.clone(),
+            casemap,
+            outbound,
+            config.inbox_capacity,
+            config.command_prefixes.clone(),
+            config.handshake_timeout,
+            config.max_payload_bytes,
+        );
 
         let has_caps = !config.request_caps.is_empty();
         let reg = RegistrationTracker {
