@@ -37,6 +37,7 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
         casemap.clone(),
     );
     let core = BotCore::new(initial_nick.clone(), casemap, outbound, true, &config);
+    core.mark_registered();
     let reg = RegistrationTracker {
         cap_pending: false,
         motd_done: true,
@@ -50,8 +51,8 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
     let weak_core = Arc::downgrade(&core);
     let owner = Arc::new(BotOwner {
         core,
-        pump_task: Mutex::new(Some(pump_task)),
-        outbound_task: Mutex::new(outbound_task),
+        pump_task,
+        outbound_task,
         _live_client: Mutex::new(None),
     });
 

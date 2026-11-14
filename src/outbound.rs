@@ -293,7 +293,10 @@ impl OutboundSink {
             casemap,
         });
 
-        let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let task = if burst == usize::MAX {
+            // Unthrottled: every enqueue flushes synchronously, so no pacer task is ever needed.
+            None
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let sink_clone = Arc::clone(&sink);
             Some(handle.spawn(async move {
                 Self::run_pacer(sink_clone).await;
@@ -334,15 +337,15 @@ impl OutboundSink {
     }
 
     /// Enqueues a batch of commands under `priority` and returns a [`WriteReceipt`] resolved
-    /// when the final command in `cmds` is written to the underlying sink.
+    /// when the final command in `cmds` is written to the underlying sink (allocating a
+    /// `oneshot` only when the batch could not be flushed synchronously).
     pub(crate) fn enqueue_batch(&self, priority: Priority, cmds: Vec<Command>) -> WriteReceipt {
         if cmds.is_empty() {
             return WriteReceipt::immediate();
         }
 
         let casemap = self.casemap.load();
-        let (tx, rx) = oneshot::channel();
-        let needs_wake = {
+        let (needs_wake, receipt) = {
             let mut st = self.state.lock().unwrap();
             if st.closed || st.aborted || st.quit_pending.is_some() {
                 return WriteReceipt::immediate();
@@ -390,24 +393,34 @@ impl OutboundSink {
                     Priority::Background => st.background.push_back(q),
                 }
             }
-            // Attach receipt_tx to the last pushed item:
+
+            let needs_wake = st.try_flush_ready(Instant::now()).is_some();
+
+            // `try_flush_ready` only pops from the front of each queue and nothing else can push
+            // while we hold the lock, so if our queue is still non-empty its back is our final
+            // command; otherwise the whole batch was already written synchronously.
             let queue = match priority {
                 Priority::Interactive => &mut st.interactive,
                 Priority::Background => &mut st.background,
             };
-            if let Some(last) = queue.back_mut() {
-                last.receipt_tx = Some(tx);
-            }
-
-            st.try_flush_ready(Instant::now()).is_some()
+            let receipt = match queue.back_mut() {
+                Some(last) => {
+                    let (tx, rx) = oneshot::channel();
+                    last.receipt_tx = Some(tx);
+                    WriteReceipt::from_rx(rx)
+                }
+                _ => WriteReceipt::immediate(),
+            };
+            (needs_wake, receipt)
         };
 
         if needs_wake {
             self.notify.notify_one();
         }
-        WriteReceipt::from_rx(rx)
+        receipt
     }
 
+    /// Enqueues a single command under `priority` and returns its [`WriteReceipt`].
     pub(crate) fn enqueue_one(&self, priority: Priority, cmd: Command) -> WriteReceipt {
         self.enqueue_batch(priority, vec![cmd])
     }

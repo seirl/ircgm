@@ -48,17 +48,17 @@ impl ExclusiveDm {
         (&self.core, &self.user, &mut self.inbox)
     }
 
-    pub(crate) fn send_chat_with_receipt(
-        &self,
-        kind: OutboundChatKind,
-        text: Text,
-    ) -> Result<WriteReceipt> {
+    fn live_nick(&self) -> Result<String> {
         self.core.check_connected()?;
         if let Some(err) = self.user.quit_error() {
             return Err(err);
         }
-        let nick = self.user.nick();
-        self.core.send_chat_with_receipt(kind, &nick, text)
+        Ok(self.user.nick())
+    }
+
+    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
+        let nick = self.live_nick()?;
+        self.core.send_chat(kind, &nick, text)
     }
 
     pub fn user(&self) -> &User {
@@ -88,18 +88,18 @@ impl ExclusiveDm {
     }
 
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Privmsg, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Privmsg, text.into())
+            .map(|_| ())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Notice, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Notice, text.into())
+            .map(|_| ())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Action, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Action, text.into())
+            .map(|_| ())
     }
 
     pub fn ask<'a, F, R>(&'a mut self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>

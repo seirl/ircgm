@@ -80,6 +80,21 @@ async fn shutdown_requested_resolves_before_and_after_request_shutdown() {
 
     // Subsequent calls resolve immediately:
     bot.shutdown_requested().await;
+
+    // Coalescing `request_shutdown()` followed by `Eof` disconnect preserves `is_shutting_down()`
+    // and wakes an unpolled `shutdown_requested()` future instead of parking forever:
+    let (bot2, srv2) = test_harness("gm2");
+    let unpolled_waiter = bot2.shutdown_requested();
+    bot2.request_shutdown();
+    srv2.disconnect();
+    assert_eq!(
+        bot2.owner.core.wait_disconnected().await,
+        DisconnectReason::Eof
+    );
+    assert!(bot2.is_shutting_down());
+    tokio::time::timeout(Duration::from_secs(1), unpolled_waiter)
+        .await
+        .expect("unpolled shutdown_requested() hung across Eof disconnect");
 }
 
 #[tokio::test]
@@ -136,5 +151,46 @@ async fn user_ids_are_globally_unique_and_cross_bot_inbox_scope_is_rejected() {
     assert!(matches!(
         foreign_room_inbox.next_chat().await,
         Err(Error::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn socket_eof_aborts_throttled_outbound_write_receipt_immediately() {
+    let cfg = BotConfig {
+        outbound_burst: 1,
+        outbound_window: Duration::from_secs(3600),
+        ..BotConfig::default()
+    };
+    let (bot, mut server) = test_harness_with("gm", cfg);
+    server.complete_join("#lobby", &["alice"]);
+    server.settle().await;
+    let room = bot.room("#lobby").unwrap();
+
+    // Consume the single burst slot so the next outbound send is throttled for 3600s:
+    room.say("first line consumes burst").unwrap();
+    assert_eq!(
+        server.recv_sent().await,
+        Some(Command::PRIVMSG(
+            "#lobby".into(),
+            "first line consumes burst".into()
+        ))
+    );
+
+    // Spawn an `Ask` whose prompt is parked in `OutboundSink` awaiting `WriteReceipt::wait`:
+    let ask_task = tokio::spawn(async move {
+        room.ask("throttled prompt", |m| Some(m.text.clone())).await
+    });
+    tokio::task::yield_now().await;
+    assert!(server.try_recv_sent().is_none());
+
+    // Socket EOF must abort `OutboundSink` atomically so `WriteReceipt::wait` unblocks immediately:
+    server.disconnect();
+    let res = tokio::time::timeout(Duration::from_secs(1), ask_task)
+        .await
+        .expect("throttled Ask stalled on WriteReceipt::wait after EOF")
+        .unwrap();
+    assert!(matches!(
+        res,
+        Err(Error::Disconnected(DisconnectReason::Eof))
     ));
 }

@@ -1,13 +1,12 @@
 use std::borrow::Borrow;
 use std::future::Future;
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use irc::proto::{CapSubCommand, Command};
 use irc_colors::Text;
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
@@ -91,6 +90,13 @@ impl BotConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConnLifecycle {
+    Registering { welcomed: bool },
+    Active,
+    Disconnected(DisconnectReason),
+}
+
 pub(crate) struct BotCore {
     pub(crate) casemap: AtomicCaseMap,
     pub(crate) state: RwLock<WorldState>,
@@ -98,11 +104,8 @@ pub(crate) struct BotCore {
     pub(crate) inboxes: InboxRegistry,
     pub(crate) outbound: Arc<OutboundSink>,
     pub(crate) is_test_transport: bool,
+    pub(crate) lifecycle_tx: watch::Sender<ConnLifecycle>,
     pub(crate) shutdown_tx: watch::Sender<bool>,
-    pub(crate) registered_tx: watch::Sender<bool>,
-    pub(crate) registered_flag: AtomicBool,
-    pub(crate) disconnect_reason: Mutex<Option<DisconnectReason>>,
-    pub(crate) disconnect_notify: Notify,
     pub(crate) inbox_capacity: usize,
     pub(crate) command_prefixes: Vec<String>,
     pub(crate) handshake_timeout: Duration,
@@ -126,8 +129,8 @@ impl BotCore {
         is_test_transport: bool,
         config: &BotConfig,
     ) -> Arc<Self> {
+        let (lifecycle_tx, _) = watch::channel(ConnLifecycle::Registering { welcomed: false });
         let (shutdown_tx, _) = watch::channel(false);
-        let (registered_tx, _) = watch::channel(false);
         Arc::new(Self {
             state: RwLock::new(WorldState::new(initial_nick, casemap.clone())),
             users: UserRegistry::new(casemap.clone()),
@@ -135,11 +138,8 @@ impl BotCore {
             casemap,
             outbound,
             is_test_transport,
+            lifecycle_tx,
             shutdown_tx,
-            registered_tx,
-            registered_flag: AtomicBool::new(false),
-            disconnect_reason: Mutex::new(None),
-            disconnect_notify: Notify::new(),
             inbox_capacity: config.inbox_capacity.max(1),
             command_prefixes: config.command_prefixes.clone(),
             handshake_timeout: config.handshake_timeout,
@@ -153,7 +153,10 @@ impl BotCore {
     }
 
     pub(crate) fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.disconnect_reason.lock().unwrap().clone()
+        match &*self.lifecycle_tx.borrow() {
+            ConnLifecycle::Disconnected(reason) => Some(reason.clone()),
+            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => None,
+        }
     }
 
     pub(crate) fn check_connected(&self) -> Result<()> {
@@ -163,27 +166,78 @@ impl BotCore {
         Ok(())
     }
 
-    pub(crate) fn mark_registered(&self) {
-        self.registered_flag.store(true, Ordering::Release);
-        let _ = self.registered_tx.send_replace(true);
+    #[cfg(test)]
+    pub(crate) fn is_registered(&self) -> bool {
+        matches!(*self.lifecycle_tx.borrow(), ConnLifecycle::Active)
     }
 
-    pub(crate) fn mark_disconnected_if_unset(&self, reason: DisconnectReason) {
-        let mut guard = self.disconnect_reason.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(reason);
-            drop(guard);
-            self.disconnect_notify.notify_waiters();
+    pub(crate) fn mark_welcomed(&self) {
+        self.lifecycle_tx.send_if_modified(|state| match state {
+            ConnLifecycle::Registering { welcomed } if !*welcomed => {
+                *welcomed = true;
+                true
+            }
+            _ => false,
+        });
+    }
+
+    pub(crate) fn mark_registered(&self) {
+        self.lifecycle_tx.send_if_modified(|state| match state {
+            ConnLifecycle::Registering { .. } => {
+                *state = ConnLifecycle::Active;
+                true
+            }
+            _ => false,
+        });
+    }
+
+    pub(crate) fn mark_disconnected(&self, reason: DisconnectReason) {
+        let transitioned = self.lifecycle_tx.send_if_modified(|state| match state {
+            ConnLifecycle::Disconnected(_) => false,
+            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => {
+                *state = ConnLifecycle::Disconnected(reason);
+                true
+            }
+        });
+        if transitioned {
+            self.outbound.abort();
+            self.inboxes.clear();
+        }
+    }
+
+    pub(crate) fn finalize_quit(&self) {
+        let _ = self.shutdown_tx.send_replace(true);
+        let mut was_connected = false;
+        self.lifecycle_tx.send_if_modified(|state| match state {
+            ConnLifecycle::Disconnected(reason) => {
+                if *reason == DisconnectReason::Quit {
+                    false
+                } else {
+                    *reason = DisconnectReason::Quit;
+                    true
+                }
+            }
+            ConnLifecycle::Registering { .. } | ConnLifecycle::Active => {
+                was_connected = true;
+                *state = ConnLifecycle::Disconnected(DisconnectReason::Quit);
+                true
+            }
+        });
+        if was_connected {
+            self.outbound.abort();
+            self.inboxes.clear();
         }
     }
 
     pub(crate) async fn wait_disconnected(&self) -> DisconnectReason {
+        let mut rx = self.lifecycle_tx.subscribe();
         loop {
-            let notified = self.disconnect_notify.notified();
-            if let Some(reason) = self.disconnect_reason() {
+            if let ConnLifecycle::Disconnected(reason) = rx.borrow_and_update().clone() {
                 return reason;
             }
-            notified.await;
+            if rx.changed().await.is_err() {
+                return DisconnectReason::BotDropped;
+            }
         }
     }
 
@@ -197,7 +251,8 @@ impl BotCore {
             .any(|p| !p.is_empty() && trimmed.starts_with(p.as_str()))
     }
 
-    pub(crate) fn send_chat_with_receipt(
+    /// Enqueues a validated, line-wrapped outbound chat message and returns its [`WriteReceipt`].
+    pub(crate) fn send_chat(
         &self,
         kind: OutboundChatKind,
         target: &str,
@@ -205,18 +260,17 @@ impl BotCore {
     ) -> Result<WriteReceipt> {
         self.check_connected()?;
         validate_target(target, "message target")?;
-        let cmds = {
-            let ws = self.state.read().unwrap();
-            build_chat_commands(kind, target, text, &ws, self.max_payload_bytes)
-        };
+        let ws = self.state.read().unwrap();
+        let cmds = build_chat_commands(kind, target, text, &ws, self.max_payload_bytes);
+        drop(ws);
         Ok(self.outbound.enqueue_batch(Priority::Interactive, cmds))
     }
 }
 
 pub(crate) struct BotOwner {
     pub(crate) core: Arc<BotCore>,
-    pub(crate) pump_task: Mutex<Option<JoinHandle<()>>>,
-    pub(crate) outbound_task: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) pump_task: JoinHandle<()>,
+    pub(crate) outbound_task: Option<JoinHandle<()>>,
     /// Keeps `irc::client::Client` alive for the lifetime of live TCP/TLS sessions so its
     /// background outgoing writer task does not drop prematurely.
     pub(crate) _live_client: Mutex<Option<irc::client::Client>>,
@@ -232,19 +286,13 @@ impl std::fmt::Debug for BotOwner {
 
 impl Drop for BotOwner {
     fn drop(&mut self) {
-        self.core
-            .mark_disconnected_if_unset(DisconnectReason::BotDropped);
-        self.core.outbound.abort();
-
-        if let Some(handle) = self.pump_task.lock().unwrap().take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.outbound_task.lock().unwrap().take() {
+        self.core.mark_disconnected(DisconnectReason::BotDropped);
+        self.pump_task.abort();
+        if let Some(ref handle) = self.outbound_task {
             handle.abort();
         }
 
         self.core.state.write().unwrap().clear();
-        self.core.inboxes.clear();
         self.core.users.clear();
     }
 }
@@ -310,8 +358,8 @@ impl Bot {
         let bot = Self {
             owner: Arc::new(BotOwner {
                 core: Arc::clone(&core),
-                pump_task: Mutex::new(Some(pump_task)),
-                outbound_task: Mutex::new(outbound_task),
+                pump_task,
+                outbound_task,
                 _live_client: Mutex::new(Some(client)),
             }),
         };
@@ -349,39 +397,56 @@ impl Bot {
         Ok(bot)
     }
 
-    /// Awaits `CAP` completion + `376`/`422`, falling back to `handshake_timeout` if a non-standard
-    /// server omits them (propagating `Disconnected` if the stream closes early).
+    /// Awaits `CAP` completion + `376`/`422`, falling back to `handshake_timeout` only if `001`
+    /// (`RPL_WELCOME`) has already been received (propagating `Disconnected` or `HandshakeTimeout`
+    /// if registration fails or stalls before `001`).
     pub(crate) async fn wait_for_registration(&self) -> Result<()> {
         let core = &self.owner.core;
-        if core.registered_flag.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut reg_rx = core.registered_tx.subscribe();
+        let mut rx = core.lifecycle_tx.subscribe();
         let sleep = tokio::time::sleep(core.handshake_timeout);
         tokio::pin!(sleep);
 
         loop {
-            if *reg_rx.borrow_and_update() {
-                return Ok(());
+            let state = rx.borrow_and_update().clone();
+            match state {
+                ConnLifecycle::Active => return Ok(()),
+                ConnLifecycle::Disconnected(reason) => {
+                    return Err(Error::Disconnected(reason));
+                }
+                ConnLifecycle::Registering { .. } => {}
             }
+
             tokio::select! {
                 biased;
-                disc = core.wait_disconnected() => {
-                    return Err(Error::Disconnected(disc));
-                }
-                res = reg_rx.changed() => {
-                    if res.is_ok() && *reg_rx.borrow_and_update() {
-                        return Ok(());
+                res = rx.changed() => {
+                    if res.is_err() {
+                        return Err(Error::Disconnected(DisconnectReason::BotDropped));
                     }
                 }
                 _ = &mut sleep => {
-                    tracing::warn!("registration barrier timed out waiting for CAP/376/422; proceeding");
-                    let _ = core.outbound.enqueue_one(
-                        Priority::Interactive,
-                        Command::CAP(None, CapSubCommand::END, None, None),
-                    );
-                    core.mark_registered();
-                    return Ok(());
+                    let state = rx.borrow_and_update().clone();
+                    match state {
+                        ConnLifecycle::Active => return Ok(()),
+                        ConnLifecycle::Disconnected(reason) => {
+                            return Err(Error::Disconnected(reason));
+                        }
+                        ConnLifecycle::Registering { welcomed: true } => {
+                            tracing::warn!(
+                                "registration barrier timed out waiting for CAP/376/422 after 001 welcome; proceeding"
+                            );
+                            let _ = core.outbound.enqueue_one(
+                                Priority::Interactive,
+                                Command::CAP(None, CapSubCommand::END, None, None),
+                            );
+                            core.mark_registered();
+                            return Ok(());
+                        }
+                        ConnLifecycle::Registering { welcomed: false } => {
+                            return Err(Error::HandshakeTimeout {
+                                operation: "IRC registration",
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -557,7 +622,7 @@ impl Bot {
             Location::caller(),
         );
 
-        let _ = core.outbound.enqueue_one(
+        core.outbound.enqueue_one(
             Priority::Interactive,
             Command::JOIN(channel.to_owned(), key.map(str::to_owned), None),
         );
@@ -649,8 +714,7 @@ impl Bot {
             fn drop(&mut self) {
                 if let Some(ch) = self.channel.take() {
                     if self.core.check_connected().is_ok() {
-                        let _ = self
-                            .core
+                        self.core
                             .outbound
                             .enqueue_one(Priority::Background, Command::PART(ch, None));
                     }
@@ -708,7 +772,9 @@ impl Bot {
     pub fn send_raw(&self, cmd: impl Into<Command>) -> Result<()> {
         let core = &self.owner.core;
         core.check_connected()?;
-        let _ = core.outbound.enqueue_one(Priority::Interactive, cmd.into());
+        let _ = core
+            .outbound
+            .enqueue_one(Priority::Interactive, cmd.into());
         Ok(())
     }
 
@@ -809,19 +875,16 @@ impl Bot {
                 .map_err(|_| Error::HandshakeTimeout {
                     operation: "quit outbound drain",
                 })?;
-            core.mark_disconnected_if_unset(DisconnectReason::Quit);
-            core.inboxes.clear();
+            core.finalize_quit();
             return Ok(());
         }
 
         let drain_and_close = async {
             quit_receipt.wait().await;
-            core.mark_disconnected_if_unset(DisconnectReason::Quit);
             let _ = core.wait_disconnected().await;
         };
         let _ = tokio::time::timeout(timeout, drain_and_close).await;
-        core.mark_disconnected_if_unset(DisconnectReason::Quit);
-        core.inboxes.clear();
+        core.finalize_quit();
         Ok(())
     }
 }

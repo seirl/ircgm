@@ -445,17 +445,13 @@ impl User {
         }
     }
 
-    pub(crate) fn send_chat_with_receipt(
-        &self,
-        kind: OutboundChatKind,
-        text: Text,
-    ) -> Result<WriteReceipt> {
+    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
         let core = self.upgrade_core()?;
         if let Some(err) = self.quit_error() {
             return Err(err);
         }
         let nick = self.track.nick();
-        core.send_chat_with_receipt(kind, &nick, text)
+        core.send_chat(kind, &nick, text)
     }
 
     /// Current nickname (live, automatically updated on `NICK`).
@@ -479,18 +475,18 @@ impl User {
 
     /// Non-blocking one-way outbound DM (does NOT acquire `dm_mutex`).
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Privmsg, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Privmsg, text.into())
+            .map(|_| ())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Notice, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Notice, text.into())
+            .map(|_| ())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Action, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Action, text.into())
+            .map(|_| ())
     }
 
     /// Acquires this user's per-user DM mutex and opens a dedicated [`Inbox`] initialized with

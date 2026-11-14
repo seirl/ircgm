@@ -38,7 +38,7 @@ impl<'a> HuddleSender<'a> {
         let mut last_offline_err: Option<Error> = None;
 
         for g in self.guards {
-            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone()) {
+            match g.send_chat(OutboundChatKind::Privmsg, prompt.clone()) {
                 Ok(r) => last_receipt = Some(r),
                 Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
                 Err(e) => return Err(e),
@@ -59,7 +59,7 @@ impl<'a> HuddleSender<'a> {
     pub(crate) fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
         self.core.check_connected()?;
         for g in self.guards {
-            match g.send_chat_with_receipt(kind, text.clone()) {
+            match g.send_chat(kind, text.clone()) {
                 Ok(_) | Err(Error::UserLeft { .. }) => {}
                 Err(e) => return Err(e),
             }
@@ -80,7 +80,7 @@ impl<'a> HuddleSender<'a> {
             if g.user().id() == sender_id {
                 continue;
             }
-            match g.send_chat_with_receipt(OutboundChatKind::Privmsg, rendered.clone()) {
+            match g.send_chat(OutboundChatKind::Privmsg, rendered.clone()) {
                 Ok(_) | Err(Error::UserLeft { .. }) => {}
                 Err(e) => return Err(e),
             }

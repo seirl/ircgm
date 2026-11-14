@@ -141,10 +141,10 @@ impl ChatMessage {
                         });
                     }
                 }
-                let _ = core.send_chat_with_receipt(out_kind, ch, text.into())?;
+                core.send_chat(out_kind, ch, text.into())?;
             }
             Target::Dm => {
-                let _ = self.sender.send_chat_with_receipt(out_kind, text.into())?;
+                self.sender.send_chat(out_kind, text.into())?;
             }
         }
         Ok(())

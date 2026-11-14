@@ -166,8 +166,7 @@ impl Drop for Breakout {
         if self.armed {
             self.armed = false;
             let cmds = self.build_teardown_commands();
-            let _ = self
-                .room
+            self.room
                 .core()
                 .outbound
                 .enqueue_batch(Priority::Background, cmds);
@@ -335,8 +334,7 @@ impl Breakout {
         }
 
         if !invite_cmds.is_empty() {
-            let _ = core
-                .outbound
+            core.outbound
                 .enqueue_batch(Priority::Interactive, invite_cmds);
         }
 
@@ -430,7 +428,7 @@ impl Breakout {
                                         if let Some(new_nick) =
                                             u.track_arc().next_rename_retry_nick(target, cnt)
                                         {
-                                            let _ = core.outbound.enqueue_one(
+                                            core.outbound.enqueue_one(
                                                 Priority::Interactive,
                                                 Command::INVITE(
                                                     new_nick,
@@ -513,7 +511,7 @@ impl Breakout {
         );
 
         let cmds = self.build_teardown_commands();
-        let _ = core.outbound.enqueue_batch(Priority::Interactive, cmds);
+        core.outbound.enqueue_batch(Priority::Interactive, cmds);
 
         // If the channel wasn't even joined in WorldState anymore, return immediately:
         {

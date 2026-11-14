@@ -426,7 +426,7 @@ impl<'a> EndpointSender<'a> {
     fn send_dm(core: &Arc<BotCore>, user: &User, text: Text) {
         if core.check_connected().is_ok() && user.quit_error().is_none() {
             let nick = user.nick();
-            let _ = core.send_chat_with_receipt(OutboundChatKind::Privmsg, &nick, text);
+            let _ = core.send_chat(OutboundChatKind::Privmsg, &nick, text);
         }
     }
 
@@ -497,7 +497,7 @@ impl<'a> EndpointSender<'a> {
                         .track_arc()
                         .next_rename_retry_nick(target, &mut retries)
                     {
-                        let _ = core.send_chat_with_receipt(
+                        let _ = core.send_chat(
                             OutboundChatKind::Privmsg,
                             &new_nick,
                             prompt.clone(),
@@ -523,7 +523,7 @@ impl<'a> EndpointSender<'a> {
                         if let Some(new_nick) =
                             member.track_arc().next_rename_retry_nick(target, retries)
                         {
-                            let _ = sender.core().send_chat_with_receipt(
+                            let _ = sender.core().send_chat(
                                 OutboundChatKind::Privmsg,
                                 &new_nick,
                                 prompt.clone(),
@@ -843,7 +843,7 @@ where
         AskSource::RoomOpen { room, caller } => {
             room.ensure_bot_in_room_if_tracked()?;
             let mut inbox = room.inbox_at(caller);
-            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
             await_ask_loop(
                 &cfg,
                 &mut *matcher,
@@ -861,7 +861,7 @@ where
             }
             room.ensure_user_askable(user)?;
             let mut inbox = room.inbox_users_at(std::slice::from_ref(user), caller);
-            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
             await_ask_loop(
                 &cfg,
                 &mut *matcher,
@@ -878,7 +878,7 @@ where
         } => {
             room.ensure_any_user_askable(&users)?;
             let mut inbox = room.inbox_users_at(&users, caller);
-            let receipt = room.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt)?;
+            let receipt = room.send_chat(OutboundChatKind::Privmsg, prompt)?;
             await_ask_loop(
                 &cfg,
                 &mut *matcher,
@@ -897,7 +897,7 @@ where
                 }
             };
             dm.inbox().clear();
-            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone())?;
+            let receipt = dm.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,
@@ -919,7 +919,7 @@ where
                 return Err(err);
             }
             dm.inbox().clear();
-            let receipt = dm.send_chat_with_receipt(OutboundChatKind::Privmsg, prompt.clone())?;
+            let receipt = dm.send_chat(OutboundChatKind::Privmsg, prompt.clone())?;
             let (core, dm_user, inbox) = dm.split_for_ask();
             await_ask_loop(
                 &cfg,

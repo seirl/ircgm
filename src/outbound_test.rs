@@ -114,13 +114,13 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     );
 
     // Consume initial 2-message burst at t = 0:
-    let r1 = sink.enqueue_one(
+    let r1 = sink.enqueue_batch(
         Priority::Interactive,
-        Command::PRIVMSG("#lobby".into(), "m1".into()),
+        vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
     );
-    let r2 = sink.enqueue_one(
+    let r2 = sink.enqueue_batch(
         Priority::Interactive,
-        Command::PRIVMSG("#lobby".into(), "m2".into()),
+        vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
     );
     r1.wait().await;
     r2.wait().await;
@@ -134,7 +134,7 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     );
 
     // Enqueue Background KICK + PART on #vault and #other, followed by Interactive PRIVMSG and JOIN #VAULT:
-    let _ = sink.enqueue_batch(
+    sink.enqueue_batch(
         Priority::Background,
         vec![
             Command::KICK("#other".into(), "Bob".into(), None),
@@ -143,13 +143,13 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
             Command::PART("#vault".into(), None),
         ],
     );
-    let r_prompt = sink.enqueue_one(
+    let r_prompt = sink.enqueue_batch(
         Priority::Interactive,
-        Command::PRIVMSG("#lobby".into(), "urgent_prompt".into()),
+        vec![Command::PRIVMSG("#lobby".into(), "urgent_prompt".into())],
     );
-    let r_rejoin = sink.enqueue_one(
+    let r_rejoin = sink.enqueue_batch(
         Priority::Interactive,
-        Command::JOIN("#VAULT".into(), None, None),
+        vec![Command::JOIN("#VAULT".into(), None, None)],
     );
     let r_quit = sink.enqueue_quit(Some("bye"));
 
@@ -217,20 +217,23 @@ async fn join_followed_by_later_background_part_preserves_join_before_part() {
     );
 
     // Consume burst = 1 slot at t = 0:
-    sink.enqueue_one(
+    sink.enqueue_batch(
         Priority::Interactive,
-        Command::PRIVMSG("#lobby".into(), "warmup".into()),
+        vec![Command::PRIVMSG("#lobby".into(), "warmup".into())],
     )
     .wait()
     .await;
     let _ = rx.try_recv().unwrap();
 
     // Now rate-limited: enqueue `JOIN #c` (Interactive), THEN `PART #c` (Background):
-    let r_join = sink.enqueue_one(
+    let r_join = sink.enqueue_batch(
         Priority::Interactive,
-        Command::JOIN("#c".into(), None, None),
+        vec![Command::JOIN("#c".into(), None, None)],
     );
-    let r_part = sink.enqueue_one(Priority::Background, Command::PART("#c".into(), None));
+    let r_part = sink.enqueue_batch(
+        Priority::Background,
+        vec![Command::PART("#c".into(), None)],
+    );
 
     tokio::time::advance(Duration::from_secs(8)).await;
     r_join.wait().await;
@@ -242,4 +245,71 @@ async fn join_followed_by_later_background_part_preserves_join_before_part() {
     tokio::time::advance(Duration::from_secs(8)).await;
     r_part.wait().await;
     assert_eq!(rx.try_recv().unwrap(), Command::PART("#c".into(), None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unthrottled_sink_skips_pacer_and_receipts_skip_oneshot_when_flushed_synchronously() {
+    // `burst == usize::MAX` never throttles, so no pacer task is spawned and every batch is
+    // written synchronously without allocating a `oneshot`:
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, task) = OutboundSink::new(
+        RawTransport::Test(tx),
+        usize::MAX,
+        Duration::from_secs(8),
+        AtomicCaseMap::default(),
+    );
+    assert!(task.is_none());
+    let r = sink.enqueue_batch(
+        Priority::Interactive,
+        vec![
+            Command::PRIVMSG("#lobby".into(), "a".into()),
+            Command::PRIVMSG("#lobby".into(), "b".into()),
+        ],
+    );
+    assert!(r.rx.is_none());
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Command::PRIVMSG("#lobby".into(), "a".into())
+    );
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Command::PRIVMSG("#lobby".into(), "b".into())
+    );
+
+    // Throttled sink: synchronously flushed batches still skip the `oneshot`, while a batch left
+    // queued behind the rate limit gets a real receipt resolved by the pacer:
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (sink2, task2) = OutboundSink::new(
+        RawTransport::Test(tx2),
+        1,
+        Duration::from_secs(8),
+        AtomicCaseMap::default(),
+    );
+    assert!(task2.is_some());
+    let r_sync = sink2.enqueue_batch(
+        Priority::Interactive,
+        vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
+    );
+    assert!(r_sync.rx.is_none());
+    let r_queued = sink2.enqueue_batch(
+        Priority::Interactive,
+        vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
+    );
+    assert!(r_queued.rx.is_some());
+    sink2.enqueue_one(
+        Priority::Interactive,
+        Command::PRIVMSG("#lobby".into(), "m3".into()),
+    );
+
+    tokio::time::advance(Duration::from_secs(8)).await;
+    r_queued.wait().await;
+    assert_eq!(
+        rx2.try_recv().unwrap(),
+        Command::PRIVMSG("#lobby".into(), "m1".into())
+    );
+    assert_eq!(
+        rx2.try_recv().unwrap(),
+        Command::PRIVMSG("#lobby".into(), "m2".into())
+    );
+    assert!(rx2.try_recv().is_err());
 }

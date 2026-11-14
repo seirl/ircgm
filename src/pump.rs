@@ -153,8 +153,7 @@ pub(crate) async fn run_pump(
     };
 
     // Preserve `DisconnectReason::Quit` if `bot.quit(...)` initiated this shutdown:
-    core.mark_disconnected_if_unset(end_reason);
-    core.inboxes.clear();
+    core.mark_disconnected(end_reason);
 }
 
 fn process_message(
@@ -173,7 +172,7 @@ fn process_message(
             let is_multiline_cont = arg3.as_deref() == Some("*");
             if reg.cap_pending && !is_multiline_cont {
                 reg.cap_pending = false;
-                let _ = core.outbound.enqueue_one(
+                core.outbound.enqueue_one(
                     Priority::Interactive,
                     Command::CAP(None, CapSubCommand::END, None, None),
                 );
@@ -625,6 +624,7 @@ fn handle_numeric(
     match code {
         1 => {
             // 001 RPL_WELCOME
+            core.mark_welcomed();
             core.state.write().unwrap().handle_welcome(args);
             dispatch_raw(core, raw, seq, None);
         }

@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use super::*;
 use crate::bot::BotConfig;
 use crate::casemap::AtomicCaseMap;
@@ -74,13 +72,13 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
     process_message(&core, ack_part1, 1, &mut reg);
     assert!(reg.cap_pending);
     assert!(out_rx.try_recv().is_err());
-    assert!(!core.registered_flag.load(Ordering::Acquire));
+    assert!(!core.is_registered());
 
     // Final `CAP gm ACK :server-time` sends `CAP END`, still waiting on MOTD:
     let ack_part2 = parse_irc_message(":srv CAP gm ACK :server-time\r\n").unwrap();
     process_message(&core, ack_part2, 2, &mut reg);
     assert!(!reg.cap_pending);
-    assert!(!core.registered_flag.load(Ordering::Acquire));
+    assert!(!core.is_registered());
     assert_eq!(
         out_rx.try_recv().ok(),
         Some(Command::CAP(None, CapSubCommand::END, None, None))
@@ -90,7 +88,7 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
     let nomotd = parse_irc_message(":srv 422 gm :MOTD File is missing\r\n").unwrap();
     process_message(&core, nomotd, 3, &mut reg);
     assert!(reg.motd_done);
-    assert!(core.registered_flag.load(Ordering::Acquire));
+    assert!(core.is_registered());
 }
 
 #[tokio::test]

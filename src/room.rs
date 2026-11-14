@@ -171,14 +171,9 @@ impl Room {
         Ok(ws.max_modes.max(1))
     }
 
-    pub(crate) fn send_chat_with_receipt(
-        &self,
-        kind: OutboundChatKind,
-        text: Text,
-    ) -> Result<WriteReceipt> {
+    pub(crate) fn send_chat(&self, kind: OutboundChatKind, text: Text) -> Result<WriteReceipt> {
         self.ensure_bot_in_room_if_tracked()?;
-        self.core
-            .send_chat_with_receipt(kind, &self.channel_name, text)
+        self.core.send_chat(kind, &self.channel_name, text)
     }
 
     pub fn name(&self) -> &str {
@@ -199,18 +194,18 @@ impl Room {
     }
 
     pub fn say(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Privmsg, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Privmsg, text.into())
+            .map(|_| ())
     }
 
     pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Notice, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Notice, text.into())
+            .map(|_| ())
     }
 
     pub fn action(&self, text: impl Into<Text>) -> Result<()> {
-        let _ = self.send_chat_with_receipt(OutboundChatKind::Action, text.into())?;
-        Ok(())
+        self.send_chat(OutboundChatKind::Action, text.into())
+            .map(|_| ())
     }
 
     /// Sends `INVITE <user> <channel>`. Fails immediately with `Err(Error::UserLeft { .. })`
@@ -227,7 +222,7 @@ impl Room {
         }
         let nick = user.nick();
         validate_target(&nick, "invite target")?;
-        let _ = self.core.outbound.enqueue_one(
+        self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::INVITE(nick, self.channel_name.clone()),
         );
@@ -237,7 +232,7 @@ impl Room {
     pub fn part(&self, reason: Option<&str>) -> Result<()> {
         self.core.check_connected()?;
         let clean = reason.map(sanitize_reason);
-        let _ = self.core.outbound.enqueue_one(
+        self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::PART(self.channel_name.clone(), clean),
         );
@@ -344,7 +339,7 @@ impl Room {
         let nick = user.nick();
         validate_target(&nick, "kick target")?;
         let clean = reason.map(sanitize_reason);
-        let _ = self.core.outbound.enqueue_one(
+        self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::KICK(self.channel_name.clone(), nick, clean),
         );
@@ -363,8 +358,7 @@ impl Room {
         for arg in args {
             raw_args.push((*arg).to_owned());
         }
-        let _ = self
-            .core
+        self.core
             .outbound
             .enqueue_one(Priority::Interactive, Command::Raw("MODE".into(), raw_args));
         Ok(())
@@ -433,7 +427,7 @@ impl Room {
             cmds.push(Command::Raw("MODE".into(), raw_args));
         }
 
-        let _ = self.core.outbound.enqueue_batch(Priority::Interactive, cmds);
+        self.core.outbound.enqueue_batch(Priority::Interactive, cmds);
         Ok(())
     }
 
@@ -455,7 +449,7 @@ impl Room {
                 chunks.remove(0).to_irc_string()
             }
         };
-        let _ = self.core.outbound.enqueue_one(
+        self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::TOPIC(self.channel_name.clone(), Some(wire_topic)),
         );

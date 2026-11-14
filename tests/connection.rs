@@ -68,6 +68,16 @@ async fn acyclic_bot_drop_releases_bot_core_with_surviving_user_and_member() {
 
 #[tokio::test]
 async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
+    async fn recv_line<R: tokio::io::AsyncBufRead + Unpin>(
+        lines: &mut tokio::io::Lines<R>,
+        step: &'static str,
+    ) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for line at {step}"))
+            .unwrap()
+    }
+
     // 1. Full `CAP REQ` -> `CAP ACK` -> `CAP END` + multi-line `005` + `422` barrier before initial `JOIN`:
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -81,7 +91,7 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         let mut saw_nick = false;
         let mut saw_user = false;
         while !(saw_cap_req && saw_nick && saw_user) {
-            let line = lines.next_line().await.unwrap().unwrap();
+            let line = recv_line(&mut lines, "step1 init").await.unwrap();
             assert!(
                 !line.starts_with("JOIN"),
                 "Bot sent JOIN before registration barrier: {line}"
@@ -99,7 +109,7 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         wr.write_all(b":mock.irc CAP GM ACK :account-tag server-time\r\n")
             .await
             .unwrap();
-        let cap_end = lines.next_line().await.unwrap().unwrap();
+        let cap_end = recv_line(&mut lines, "step1 CAP END").await.unwrap();
         assert_eq!(cap_end, "CAP END");
 
         // Send 001 + multi-line 005s (changing CASEMAPPING to ascii!) + 422 ERR_NOMOTD:
@@ -113,7 +123,7 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         .unwrap();
 
         // Now Bot::connect_with unblocks and sends initial channel JOIN!
-        let join_line = lines.next_line().await.unwrap().unwrap();
+        let join_line = recv_line(&mut lines, "step1 JOIN").await.unwrap();
         assert_eq!(join_line, "JOIN #[Init]");
         wr.write_all(
             b":GM!~gm@127.0.0.1 JOIN #[Init]\r\n\
@@ -123,8 +133,14 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         .await
         .unwrap();
 
-        // Keep socket open until bot drops/quits:
-        let _ = lines.next_line().await;
+        // Await live-TCP `QUIT :bye now` flush (skipping any `irc`-crate keepalive `PING`) before closing the server socket:
+        loop {
+            let line = recv_line(&mut lines, "step1 QUIT").await.unwrap();
+            if !line.starts_with("PING ") {
+                assert_eq!(line, "QUIT :bye now");
+                break;
+            }
+        }
     });
 
     let irc_cfg = irc::client::data::Config {
@@ -135,21 +151,44 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         channels: vec!["#[Init]".into()],
         ..Default::default()
     };
-    let bot = Bot::connect_with(BotConfig::new(irc_cfg)).await.unwrap();
+    let bot = tokio::time::timeout(Duration::from_secs(2), Bot::connect_with(BotConfig::new(irc_cfg)))
+        .await
+        .expect("step1 connect_with timed out")
+        .unwrap();
     assert_eq!(bot.casemap(), CaseMap::Ascii);
     assert_eq!(bot.room("#[init]").unwrap().members().len(), 2);
     assert!(bot.room("#{init}").unwrap().members().is_empty());
+    let init_room = bot.room("#[init]").unwrap();
+    bot.quit(Some("bye now")).await.unwrap();
+    assert!(bot.is_shutting_down());
+    assert!(matches!(
+        init_room.say("after quit"),
+        Err(Error::Disconnected(DisconnectReason::Quit))
+    ));
     drop(bot);
     server_task.await.unwrap();
 
-    // 2. Non-standard server omitting `376`/`422` falls back cleanly after `handshake_timeout`:
+    // 2. Non-standard server welcoming (`001`) while omitting `CAP ACK` and `376`/`422` falls back cleanly after `handshake_timeout`:
     let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = listener2.local_addr().unwrap();
     let server_task2 = tokio::spawn(async move {
         let (sock, _) = listener2.accept().await.unwrap();
-        let (rd, _wr) = sock.into_split();
+        let (rd, mut wr) = sock.into_split();
         let mut lines = BufReader::new(rd).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut saw_nick = false;
+        let mut saw_user = false;
+        while !(saw_nick && saw_user) {
+            let line = recv_line(&mut lines, "step2 init").await.unwrap();
+            if line.starts_with("NICK ") {
+                saw_nick = true;
+            } else if line.starts_with("USER ") {
+                saw_user = true;
+            }
+        }
+        wr.write_all(b":mock.irc 001 GM2 :Welcome GM2!~gm2@127.0.0.1\r\n")
+            .await
+            .unwrap();
+        while let Some(line) = recv_line(&mut lines, "step2 CAP END").await {
             if line == "CAP END" {
                 break;
             }
@@ -164,10 +203,76 @@ async fn loopback_tcp_connect_cap_motd_barrier_and_timeout_fallback() {
         ..Default::default()
     });
     cfg2.handshake_timeout = Duration::from_millis(40);
-    let bot2 = Bot::connect_with(cfg2).await.unwrap();
+    let bot2 = tokio::time::timeout(Duration::from_secs(2), Bot::connect_with(cfg2))
+        .await
+        .expect("step 2 connect_with timed out")
+        .unwrap();
     assert_eq!(bot2.nick(), "GM2");
     drop(bot2);
     server_task2.await.unwrap();
+
+    // 3. Registration rejection (`433` / `464`) without `001` welcome never returns `Ok(bot)`:
+    for (code, err_line) in [
+        (
+            433_u16,
+            &b":mock.irc 433 * GM3 :Nickname is already in use\r\n"[..],
+        ),
+        (464_u16, &b":mock.irc 464 * :Password incorrect\r\n"[..]),
+    ] {
+        let listener3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr3 = listener3.local_addr().unwrap();
+        let server_task3 = tokio::spawn(async move {
+            let (sock, _) = listener3.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            let mut saw_nick = false;
+            let mut saw_user = false;
+            while !(saw_nick && saw_user) {
+                let line = recv_line(&mut lines, "step3 init").await.unwrap();
+                if line.starts_with("NICK ") {
+                    saw_nick = true;
+                } else if line.starts_with("USER ") {
+                    saw_user = true;
+                }
+            }
+            wr.write_all(err_line).await.unwrap();
+            // Keep socket open past `handshake_timeout` (40ms) without sending `001`:
+            let _ = tokio::time::timeout(Duration::from_millis(500), lines.next_line()).await;
+        });
+
+        let mut cfg3 = BotConfig::new(irc::client::data::Config {
+            nickname: Some("GM3".into()),
+            password: Some("wrong".into()),
+            server: Some("127.0.0.1".into()),
+            port: Some(addr3.port()),
+            use_tls: Some(false),
+            ..Default::default()
+        });
+        cfg3.handshake_timeout = Duration::from_millis(40);
+        let res3 = tokio::time::timeout(Duration::from_secs(2), Bot::connect_with(cfg3))
+            .await
+            .expect("step 3 connect_with timed out");
+        match code {
+            433 => assert!(
+                matches!(res3, Err(Error::Disconnected(DisconnectReason::Transport(_)))),
+                "expected 433 Disconnected(Transport), got {res3:?}"
+            ),
+            464 => assert!(
+                matches!(
+                    res3,
+                    Err(Error::HandshakeTimeout {
+                        operation: "IRC registration"
+                    })
+                ),
+                "expected 464 registration HandshakeTimeout, got {res3:?}"
+            ),
+            _ => unreachable!(),
+        }
+        tokio::time::timeout(Duration::from_secs(2), server_task3)
+            .await
+            .expect("step 3 server_task3 timed out")
+            .unwrap();
+    }
 }
 
 #[tokio::test]
