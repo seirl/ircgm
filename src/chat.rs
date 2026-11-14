@@ -39,7 +39,7 @@ impl DerefMut for InboxRef<'_> {
     }
 }
 
-/// Any open conversation scope (`Room`, `Breakout`, `Huddle`, `ExclusiveDm`, or custom wrapper)
+/// Any open conversation scope (`Room`, `Huddle`, `ExclusiveDm`, or custom wrapper)
 /// that can send messages and expose a scoped [`Inbox`].
 pub trait Chat: Send + Sync {
     fn say(&self, text: impl Into<Text>) -> Result<()>;
@@ -52,13 +52,13 @@ pub trait Chat: Send + Sync {
     fn target(&self) -> Target;
 
     /// Fixed participant roster when closed ([`crate::ExclusiveDm`] / [`crate::Huddle`]), or
-    /// `None` when open to anyone in the channel ([`crate::Room`] / [`crate::Breakout`]).
+    /// `None` when open to anyone in the channel ([`crate::Room`]).
     fn participants(&self) -> Option<Vec<User>> {
         None
     }
 }
 
-/// Multi-party [`Chat`] scope (`Room`, `Breakout`, `Huddle`, or custom wrapper).
+/// Multi-party [`Chat`] scope (`Room`, `Huddle`, or custom wrapper).
 pub trait GroupChat: Chat {
     /// Returns `true` if `user` is currently a member/occupant of this group.
     fn has_user(&self, user: &User) -> bool;

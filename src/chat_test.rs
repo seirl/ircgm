@@ -104,7 +104,7 @@ async fn free_ask_and_ask_many_work_across_refs_handles_and_custom_wrappers() {
     drop(dm);
 
     // 3. `ready_roll_call(impl GroupChat)` works with `&Room` directly (no `.clone()`!),
-    //    `TaggedGroup<&Room>`, `&mut Huddle`, and `&Breakout` (no `mut`!):
+    //    `TaggedGroup<&Room>`, `&mut Huddle`, and `vault.room()`:
     let players = vec![alice.clone(), bob.clone()];
 
     let room_task = tokio::spawn({
@@ -175,8 +175,8 @@ async fn free_ask_and_ask_many_work_across_refs_handles_and_custom_wrappers() {
                 .invite_and_wait(&players, Duration::from_secs(5))
                 .await
                 .unwrap();
-            // Immutable `&Breakout` works directly as `impl GroupChat`!
-            let ready = ready_roll_call(&vault, &players).await.unwrap();
+            // `vault.room()` borrows `&Room` (`impl GroupChat`) without moving `Breakout`:
+            let ready = ready_roll_call(vault.room(), &players).await.unwrap();
             (vault, ready)
         }
     });

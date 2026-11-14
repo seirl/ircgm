@@ -355,8 +355,8 @@ impl AskConfig {
     }
 }
 
-/// Sends `prompt` to any [`Chat`] (such as `&room`, `&breakout`, `&mut huddle`, `&mut dm`, or
-/// `&mut generic_chat`) and returns a lazy [`Ask`] future awaiting one reply.
+/// Sends `prompt` to any [`Chat`] (such as `&room`, `breakout.room()`, `&mut huddle`, `&mut dm`,
+/// or `&mut generic_chat`) and returns a lazy [`Ask`] future awaiting one reply.
 #[track_caller]
 pub fn ask<'a, C, F, R>(chat: C, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
 where
@@ -368,7 +368,7 @@ where
     Ask::from_chat(chat, prompt.into(), matcher)
 }
 
-/// Sends `prompt` to any [`GroupChat`] (such as `&room`, `&breakout`, `&mut huddle`, or
+/// Sends `prompt` to any [`GroupChat`] (such as `&room`, `breakout.room()`, `&mut huddle`, or
 /// `&mut generic_group`) and returns a lazy [`AskMany`] future collecting `0..=N` replies.
 #[track_caller]
 pub fn ask_many<'a, G, F, R>(group: G, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
