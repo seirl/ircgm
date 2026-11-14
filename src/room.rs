@@ -56,6 +56,14 @@ impl Room {
         &self.core
     }
 
+    pub(crate) fn belongs_to(&self, core: &Arc<BotCore>) -> bool {
+        Arc::ptr_eq(&self.core, core)
+    }
+
+    pub(crate) fn into_name(self) -> String {
+        self.channel_name
+    }
+
     fn self_occupant<'a>(
         ws: &'a crate::state::WorldState,
         chan: &'a crate::state::ChannelState,
@@ -63,7 +71,7 @@ impl Room {
         if let Some(self_id) = ws.self_track_id {
             chan.members.get(&self_id)
         } else {
-            chan.member_by_nick(&ws.current_nick, ws.casemap)
+            chan.member_by_nick(&ws.current_nick)
         }
     }
 
@@ -135,7 +143,7 @@ impl Room {
         Err(last_offline_err.expect("non-empty users with no askable user must have UserLeft"))
     }
 
-    fn ensure_can_moderate(&self) -> Result<(CaseMap, usize)> {
+    fn ensure_can_moderate(&self) -> Result<usize> {
         self.core.check_connected()?;
         let ws = self.core.state.read().unwrap();
         let key = ws.casemap.fold(&self.channel_name);
@@ -160,7 +168,7 @@ impl Room {
                 }
             }
         }
-        Ok((ws.casemap, ws.max_modes.max(1)))
+        Ok(ws.max_modes.max(1))
     }
 
     pub(crate) fn send_chat_with_receipt(
@@ -219,11 +227,9 @@ impl Room {
         }
         let nick = user.nick();
         validate_target(&nick, "invite target")?;
-        let cm = self.core.casemap();
         let _ = self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::INVITE(nick, self.channel_name.clone()),
-            cm,
         );
         Ok(())
     }
@@ -231,11 +237,9 @@ impl Room {
     pub fn part(&self, reason: Option<&str>) -> Result<()> {
         self.core.check_connected()?;
         let clean = reason.map(sanitize_reason);
-        let cm = self.core.casemap();
         let _ = self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::PART(self.channel_name.clone(), clean),
-            cm,
         );
         Ok(())
     }
@@ -309,7 +313,7 @@ impl Room {
         let chan_key = ws.casemap.fold(&self.channel_name);
         ws.channels
             .get(&chan_key)
-            .is_some_and(|chan| chan.member_by_nick(nick, ws.casemap).is_some())
+            .is_some_and(|chan| chan.member_by_nick(nick).is_some())
     }
 
     pub fn bot_is_op(&self) -> bool {
@@ -333,7 +337,7 @@ impl Room {
                 "User handle belongs to a different Bot session",
             ));
         }
-        let (cm, _) = self.ensure_can_moderate()?;
+        self.ensure_can_moderate()?;
         if let Some(err) = user.quit_error() {
             return Err(err);
         }
@@ -343,13 +347,12 @@ impl Room {
         let _ = self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::KICK(self.channel_name.clone(), nick, clean),
-            cm,
         );
         Ok(())
     }
 
     pub fn set_mode(&self, modes: &str, args: &[&str]) -> Result<()> {
-        let (cm, _) = self.ensure_can_moderate()?;
+        self.ensure_can_moderate()?;
         validate_param(modes, "mode flags")?;
         for arg in args {
             validate_param(arg, "mode argument")?;
@@ -360,11 +363,10 @@ impl Room {
         for arg in args {
             raw_args.push((*arg).to_owned());
         }
-        let _ = self.core.outbound.enqueue_one(
-            Priority::Interactive,
-            Command::Raw("MODE".into(), raw_args),
-            cm,
-        );
+        let _ = self
+            .core
+            .outbound
+            .enqueue_one(Priority::Interactive, Command::Raw("MODE".into(), raw_args));
         Ok(())
     }
 
@@ -397,7 +399,7 @@ impl Room {
         I: IntoIterator<Item = U>,
         U: Borrow<User>,
     {
-        let (cm, max_modes) = self.ensure_can_moderate()?;
+        let max_modes = self.ensure_can_moderate()?;
         let mut nicks = Vec::new();
         for u_item in users {
             let u = u_item.borrow();
@@ -431,15 +433,12 @@ impl Room {
             cmds.push(Command::Raw("MODE".into(), raw_args));
         }
 
-        let _ = self
-            .core
-            .outbound
-            .enqueue_batch(Priority::Interactive, cmds, cm);
+        let _ = self.core.outbound.enqueue_batch(Priority::Interactive, cmds);
         Ok(())
     }
 
     pub fn set_topic(&self, topic: impl Into<Text>) -> Result<()> {
-        let (cm, _) = self.ensure_can_moderate()?;
+        self.ensure_can_moderate()?;
         let cleaned = sanitize_text(topic.into());
         let wire_topic = {
             let ws = self.core.state.read().unwrap();
@@ -459,7 +458,6 @@ impl Room {
         let _ = self.core.outbound.enqueue_one(
             Priority::Interactive,
             Command::TOPIC(self.channel_name.clone(), Some(wire_topic)),
-            cm,
         );
         Ok(())
     }
@@ -589,17 +587,15 @@ impl Room {
         if !all_belong {
             return Inbox::invalid_session(filter, caller);
         }
-        let cm = self.core.casemap();
         let mut inbox = self
             .core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller, cm);
+            .subscribe(Arc::clone(&self.core), filter, caller);
         self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
     }
 
     pub(crate) fn inbox_at(&self, caller: &'static Location<'static>) -> Inbox {
-        let cm = self.core.casemap();
         let filter = Filter::Scoped {
             rooms: vec![self.channel_name.clone()],
             dm_users: Vec::new(),
@@ -607,7 +603,7 @@ impl Room {
         let mut inbox = self
             .core
             .inboxes
-            .subscribe(Arc::clone(&self.core), filter, caller, cm);
+            .subscribe(Arc::clone(&self.core), filter, caller);
         self.ask_config.apply_flags_to_inbox(&mut inbox);
         inbox
     }

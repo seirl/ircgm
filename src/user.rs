@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::panic::Location;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use irc_colors::Text;
@@ -11,7 +11,7 @@ use tracing::Instrument as _;
 
 use crate::ask::{Ask, AskSource, IntoAskMatch};
 use crate::bot::BotCore;
-use crate::casemap::{CaseMap, FoldedStr};
+use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::exclusive_dm::{acquire_single_dm_guard, ExclusiveDm};
 use crate::inbox::{Filter, Inbox};
@@ -50,11 +50,11 @@ pub(crate) struct UserTrack {
     pub(crate) status_tx: watch::Sender<UserStatus>,
     pub(crate) dm_mutex: Arc<tokio::sync::Mutex<()>>,
     pub(crate) lock_holder: Mutex<Option<&'static Location<'static>>>,
-    pub(crate) casemap: Arc<AtomicU8>,
+    pub(crate) casemap: AtomicCaseMap,
 }
 
 impl UserTrack {
-    fn new(id: u64, nick: String, casemap: Arc<AtomicU8>) -> Self {
+    fn new(id: u64, nick: String, casemap: AtomicCaseMap) -> Self {
         let (status_tx, _) = watch::channel(UserStatus::Online);
         Self {
             id,
@@ -84,7 +84,7 @@ impl UserTrack {
     }
 
     pub(crate) fn casemap(&self) -> CaseMap {
-        CaseMap::from_u8(self.casemap.load(Ordering::Relaxed))
+        self.casemap.load()
     }
 
     pub(crate) fn is_online(&self) -> bool {
@@ -118,6 +118,7 @@ impl UserTrack {
 
 #[derive(Default)]
 struct RegistryState {
+    casemap: CaseMap,
     tracks: HashMap<FoldedStr, Weak<UserTrack>>,
     /// Vacated pre-rename nicks (`folded -> (raw_old_nick, Weak<UserTrack>)`) so in-flight
     /// bounces (`401`, `486`, `716`, etc.) crossing with `NICK` still resolve `target_user_id`.
@@ -147,42 +148,40 @@ impl RegistryState {
 
 pub(crate) struct UserRegistry {
     state: Mutex<RegistryState>,
-    casemap: Arc<AtomicU8>,
+    casemap: AtomicCaseMap,
 }
 
 impl Default for UserRegistry {
     fn default() -> Self {
-        Self::new(CaseMap::default())
+        Self::new(AtomicCaseMap::default())
     }
 }
 
 impl UserRegistry {
-    pub(crate) fn new(initial_casemap: CaseMap) -> Self {
+    pub(crate) fn new(casemap: AtomicCaseMap) -> Self {
+        let initial = casemap.load();
         Self {
-            state: Mutex::new(RegistryState::default()),
-            casemap: Arc::new(AtomicU8::new(initial_casemap.to_u8())),
+            state: Mutex::new(RegistryState {
+                casemap: initial,
+                ..RegistryState::default()
+            }),
+            casemap,
         }
-    }
-
-    pub(crate) fn casemap(&self) -> CaseMap {
-        CaseMap::from_u8(self.casemap.load(Ordering::Relaxed))
     }
 
     /// Looks up an already-live `UserTrack` without allocating a new one.
     pub(crate) fn get_existing(&self, nick: &str) -> Option<Arc<UserTrack>> {
-        let cm = self.casemap();
-        let folded = cm.fold(nick);
         let mut state = self.state.lock().unwrap();
         state.maybe_sweep();
+        let folded = state.casemap.fold(nick);
         state.tracks.get(&folded).and_then(Weak::upgrade)
     }
 
     /// Resolves `nick` to an existing live `UserTrack`, or allocates a new online track.
     pub(crate) fn get_or_create(&self, nick: &str) -> Arc<UserTrack> {
-        let cm = self.casemap();
-        let folded = cm.fold(nick);
         let mut state = self.state.lock().unwrap();
         state.maybe_sweep();
+        let folded = state.casemap.fold(nick);
 
         if let Some(existing) = state.tracks.get(&folded).and_then(Weak::upgrade) {
             return existing;
@@ -190,7 +189,7 @@ impl UserRegistry {
 
         state.former_tracks.remove(&folded);
         let id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
-        let track = Arc::new(UserTrack::new(id, nick.to_owned(), Arc::clone(&self.casemap)));
+        let track = Arc::new(UserTrack::new(id, nick.to_owned(), self.casemap.clone()));
         state.tracks.insert(folded, Arc::downgrade(&track));
         track
     }
@@ -198,11 +197,10 @@ impl UserRegistry {
     /// Re-keys `old_nick -> new_nick` on `NICK` and updates the track's live nickname.
     /// Returns the affected `Arc<UserTrack>`.
     pub(crate) fn rename(&self, old_nick: &str, new_nick: &str) -> Arc<UserTrack> {
-        let cm = self.casemap();
-        let old_folded = cm.fold(old_nick);
-        let new_folded = cm.fold(new_nick);
         let mut state = self.state.lock().unwrap();
         state.maybe_sweep();
+        let old_folded = state.casemap.fold(old_nick);
+        let new_folded = state.casemap.fold(new_nick);
 
         let track = if let Some(existing) = state.tracks.remove(&old_folded).and_then(|w| w.upgrade())
         {
@@ -214,7 +212,7 @@ impl UserRegistry {
             Arc::new(UserTrack::new(
                 id,
                 new_nick.to_owned(),
-                Arc::clone(&self.casemap),
+                self.casemap.clone(),
             ))
         };
 
@@ -245,11 +243,10 @@ impl UserRegistry {
         at_seq: u64,
         reason: Option<String>,
     ) -> Option<Arc<UserTrack>> {
-        let cm = self.casemap();
-        let folded = cm.fold(nick);
         let track = {
             let mut state = self.state.lock().unwrap();
             state.maybe_sweep();
+            let folded = state.casemap.fold(nick);
             state.tracks.remove(&folded).and_then(|w| w.upgrade())
         }?;
 
@@ -275,12 +272,11 @@ impl UserRegistry {
         at_seq: u64,
         message: &str,
     ) -> (Option<u64>, Option<u64>) {
-        let cm = self.casemap();
-        let folded = cm.fold(target);
         if code == 401 {
             let (active, former_id) = {
                 let mut state = self.state.lock().unwrap();
                 state.maybe_sweep();
+                let folded = state.casemap.fold(target);
                 if let Some(track) = state.tracks.remove(&folded).and_then(|w| w.upgrade()) {
                     (Some(track), None)
                 } else {
@@ -307,6 +303,7 @@ impl UserRegistry {
         } else {
             let mut state = self.state.lock().unwrap();
             state.maybe_sweep();
+            let folded = state.casemap.fold(target);
             let id = state
                 .tracks
                 .get(&folded)
@@ -325,8 +322,9 @@ impl UserRegistry {
 
     /// Rebuilds all `FoldedStr` keys when `005 CASEMAPPING` changes dynamically.
     pub(crate) fn rekey_casemap(&self, new_map: CaseMap) {
-        self.casemap.store(new_map.to_u8(), Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
+        state.casemap = new_map;
+        self.casemap.store(new_map);
         let old_tracks = std::mem::take(&mut state.tracks);
         let mut rebuilt = HashMap::with_capacity(old_tracks.len());
         for (_, weak) in old_tracks {
@@ -555,10 +553,7 @@ impl User {
             dm_users: vec![Arc::clone(&self.track)],
         };
         match self.core.upgrade() {
-            Some(core) => {
-                let cm = core.casemap();
-                core.inboxes.subscribe(core.clone(), filter, caller, cm)
-            }
+            Some(core) => core.inboxes.subscribe(core.clone(), filter, caller),
             None => Inbox::disconnected_bot_dropped(filter, caller),
         }
     }

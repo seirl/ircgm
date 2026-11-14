@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn rfc1459_identity_rename_and_quit_rejoin() {
-    let reg = UserRegistry::new(CaseMap::Rfc1459);
+    let reg = UserRegistry::new(AtomicCaseMap::new(CaseMap::Rfc1459));
     let t1 = reg.get_or_create("[Alice]");
     let t2 = reg.get_or_create("{alice}");
     assert_eq!(t1.id, t2.id);
@@ -72,7 +72,7 @@ fn account_transitions() {
 
 #[test]
 fn former_tracks_correlate_inflight_bounces_until_evicted_by_new_claimant() {
-    let reg = UserRegistry::new(CaseMap::Rfc1459);
+    let reg = UserRegistry::new(AtomicCaseMap::new(CaseMap::Rfc1459));
     let alice = reg.get_or_create("[Alice]");
 
     // Chained rename `[Alice]` -> `Alicia` -> `Ally` preserves both former nicks:
@@ -130,9 +130,17 @@ fn amortized_dead_weak_gc_without_drop_reentrancy() {
 
 #[test]
 fn dynamic_casemapping_rekey() {
-    let reg = UserRegistry::new(CaseMap::Rfc1459);
+    let shared = AtomicCaseMap::new(CaseMap::Rfc1459);
+    let reg = UserRegistry::new(shared.clone());
     let a = reg.get_or_create("[Alice]");
     assert_eq!(reg.get_or_create("{alice}").id, a.id);
+
+    // Simulate `WorldState::apply_isupport` flipping the shared `AtomicCaseMap` BEFORE
+    // `UserRegistry::rekey_casemap` runs: concurrent lookups must keep using `state.casemap`
+    // (`Rfc1459`) so `[Alice]`'s `UserTrack` is never split!
+    shared.store(CaseMap::Ascii);
+    assert_eq!(reg.get_or_create("[Alice]").id, a.id);
+    assert_eq!(reg.get_existing("[alice]").map(|t| t.id), Some(a.id));
 
     reg.rekey_casemap(CaseMap::Ascii);
     assert_eq!(a.casemap(), CaseMap::Ascii);

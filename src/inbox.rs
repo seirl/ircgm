@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use crate::ask::TimeLimit;
 use crate::bot::BotCore;
-use crate::casemap::{CaseMap, FoldedStr};
+use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
 use crate::room::Room;
@@ -23,7 +23,7 @@ use crate::user::{User, UserStatus, UserTrack};
 /// and/or DMs into one wire-ordered [`Inbox`]).
 #[derive(Clone, Debug, Default)]
 pub struct InboxScope {
-    pub(crate) rooms: Vec<(String, u64)>,
+    pub(crate) rooms: Vec<Room>,
     pub(crate) dm_users: Vec<User>,
 }
 
@@ -34,13 +34,12 @@ impl InboxScope {
 
     pub fn room(mut self, room: &Room) -> Self {
         let cm = room.casemap();
-        let sid = room.core().session_id;
         if !self
             .rooms
             .iter()
-            .any(|(r, existing_sid)| *existing_sid == sid && cm.str_eq(r, room.name()))
+            .any(|existing| existing.belongs_to(room.core()) && cm.str_eq(existing.name(), room.name()))
         {
-            self.rooms.push((room.name().to_owned(), sid));
+            self.rooms.push(room.clone());
         }
         self
     }
@@ -220,6 +219,7 @@ struct InboxSlot {
 
 #[derive(Default)]
 struct RegistryInner {
+    casemap: CaseMap,
     slots: HashMap<u64, InboxSlot>,
     all_ids: Vec<u64>,
     dm_ids: Vec<u64>,
@@ -234,20 +234,26 @@ pub(crate) struct InboxRegistry {
 
 impl Default for InboxRegistry {
     fn default() -> Self {
-        Self {
-            inner: Mutex::new(RegistryInner::default()),
-            next_slot_id: AtomicU64::new(1),
-        }
+        Self::new(AtomicCaseMap::default())
     }
 }
 
 impl InboxRegistry {
+    pub(crate) fn new(casemap: AtomicCaseMap) -> Self {
+        Self {
+            inner: Mutex::new(RegistryInner {
+                casemap: casemap.load(),
+                ..RegistryInner::default()
+            }),
+            next_slot_id: AtomicU64::new(1),
+        }
+    }
+
     pub(crate) fn subscribe(
         &self,
         core: Arc<BotCore>,
         filter: Filter,
         opened_at: &'static Location<'static>,
-        casemap: CaseMap,
     ) -> Inbox {
         let slot_id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
         let cap = core.inbox_capacity.max(1);
@@ -258,6 +264,7 @@ impl InboxRegistry {
 
         {
             let mut inner = self.inner.lock().unwrap();
+            let casemap = inner.casemap;
             // Only register if the connection is still live:
             if core.disconnect_reason().is_none() {
                 match &filter {
@@ -367,19 +374,21 @@ impl InboxRegistry {
         }
     }
 
-    /// Returns `true` if any active `Inbox` listens to `folded_chan` (either via `Bot::inbox`
+    /// Returns `true` if any active `Inbox` listens to `channel` (either via `Bot::inbox`
     /// or a channel-scoped subscription).
-    pub(crate) fn has_interest_in_channel(&self, folded_chan: &FoldedStr) -> bool {
+    pub(crate) fn has_interest_in_channel(&self, channel: &str) -> bool {
         let inner = self.inner.lock().unwrap();
         !inner.all_ids.is_empty()
-            || inner
-                .by_channel
-                .get(folded_chan)
-                .is_some_and(|v| !v.is_empty())
+            || (!inner.by_channel.is_empty()
+                && inner
+                    .by_channel
+                    .get(&inner.casemap.fold(channel))
+                    .is_some_and(|v| !v.is_empty()))
     }
 
     pub(crate) fn rekey_casemap(&self, new_map: CaseMap) {
         let mut inner = self.inner.lock().unwrap();
+        inner.casemap = new_map;
         let mut rebuilt: HashMap<FoldedStr, Vec<u64>> = HashMap::new();
         for (&slot_id, slot) in &inner.slots {
             match &slot.filter {
@@ -412,16 +421,12 @@ impl InboxRegistry {
         inner.by_user.clear();
     }
 
-    pub(crate) fn dispatch(
-        &self,
-        event: &Arc<WireEvent>,
-        channel_hint: Option<&str>,
-        casemap: CaseMap,
-    ) {
+    pub(crate) fn dispatch(&self, event: &Arc<WireEvent>, channel_hint: Option<&str>) {
         let mut inner = self.inner.lock().unwrap();
         if inner.slots.is_empty() {
             return;
         }
+        let casemap = inner.casemap;
 
         let mut candidates: Vec<u64> = Vec::with_capacity(inner.all_ids.len() + 4);
         candidates.extend_from_slice(&inner.all_ids);

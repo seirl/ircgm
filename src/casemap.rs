@@ -1,22 +1,21 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 /// Server-negotiated IRC case-folding rule (`005 CASEMAPPING=rfc1459 | strict-rfc1459 | ascii`;
 /// default `Rfc1459`).
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CaseMap {
     #[default]
-    Rfc1459,
-    StrictRfc1459,
-    Ascii,
+    Rfc1459 = 0,
+    StrictRfc1459 = 1,
+    Ascii = 2,
 }
 
 impl CaseMap {
     pub(crate) const fn to_u8(self) -> u8 {
-        match self {
-            CaseMap::Rfc1459 => 0,
-            CaseMap::StrictRfc1459 => 1,
-            CaseMap::Ascii => 2,
-        }
+        self as u8
     }
 
     pub(crate) const fn from_u8(val: u8) -> Self {
@@ -42,23 +41,10 @@ impl CaseMap {
 
     #[inline]
     fn fold_char(self, c: char) -> char {
-        match self {
-            CaseMap::Rfc1459 => match c {
-                'A'..='Z' => (c as u8 + 32) as char,
-                '[' => '{',
-                ']' => '}',
-                '\\' => '|',
-                '~' => '^',
-                _ => c,
-            },
-            CaseMap::StrictRfc1459 => match c {
-                'A'..='Z' => (c as u8 + 32) as char,
-                '[' => '{',
-                ']' => '}',
-                '\\' => '|',
-                _ => c,
-            },
-            CaseMap::Ascii => c.to_ascii_lowercase(),
+        if c.is_ascii() {
+            self.fold_byte(c as u8) as char
+        } else {
+            c
         }
     }
 
@@ -99,6 +85,33 @@ impl CaseMap {
             && a.bytes()
                 .zip(b.bytes())
                 .all(|(x, y)| self.fold_byte(x) == self.fold_byte(y))
+    }
+}
+
+/// Shared lock-free [`CaseMap`] cell owned by `BotCore` and shared across `WorldState`,
+/// `UserRegistry`, `UserTrack`, `InboxRegistry`, and `OutboundSink`.
+#[derive(Clone, Debug)]
+pub(crate) struct AtomicCaseMap(Arc<AtomicU8>);
+
+impl Default for AtomicCaseMap {
+    fn default() -> Self {
+        Self::new(CaseMap::default())
+    }
+}
+
+impl AtomicCaseMap {
+    pub(crate) fn new(initial: CaseMap) -> Self {
+        Self(Arc::new(AtomicU8::new(initial.to_u8())))
+    }
+
+    #[inline]
+    pub(crate) fn load(&self) -> CaseMap {
+        CaseMap::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(crate) fn store(&self, cm: CaseMap) {
+        self.0.store(cm.to_u8(), Ordering::Relaxed);
     }
 }
 

@@ -165,12 +165,12 @@ impl Drop for Breakout {
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
-            let (cmds, cm) = self.build_teardown_commands();
+            let cmds = self.build_teardown_commands();
             let _ = self
                 .room
                 .core()
                 .outbound
-                .enqueue_batch(Priority::Background, cmds, cm);
+                .enqueue_batch(Priority::Background, cmds);
         }
     }
 }
@@ -184,7 +184,7 @@ impl Breakout {
         }
     }
 
-    fn build_teardown_commands(&self) -> (Vec<Command>, crate::casemap::CaseMap) {
+    fn build_teardown_commands(&self) -> Vec<Command> {
         let core = self.room.core();
         let ws = core.state.read().unwrap();
         let cm = ws.casemap;
@@ -203,7 +203,9 @@ impl Breakout {
                 targets.sort();
 
                 if !targets.is_empty() {
-                    let raw_reason = sanitize_reason(&sanitize_text(self.opts.kick_reason.clone()).to_irc_string());
+                    let raw_reason = sanitize_reason(
+                        &sanitize_text(self.opts.kick_reason.clone()).to_irc_string(),
+                    );
                     let reason_opt = if raw_reason.is_empty() {
                         None
                     } else {
@@ -223,7 +225,7 @@ impl Breakout {
         }
 
         cmds.push(Command::PART(chan_name, None));
-        (cmds, cm)
+        cmds
     }
 
     /// Clones the underlying [`Room`] view without moving or disarming `Breakout`.
@@ -301,7 +303,6 @@ impl Breakout {
         }
 
         let dm_tracks = tracked_users.iter().map(User::track_arc).collect();
-        let cm = core.casemap();
         let mut inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
@@ -309,7 +310,6 @@ impl Breakout {
                 dm_users: dm_tracks,
             },
             Location::caller(),
-            cm,
         );
 
         let mut joined_ids: HashSet<u64> = HashSet::new();
@@ -337,7 +337,7 @@ impl Breakout {
         if !invite_cmds.is_empty() {
             let _ = core
                 .outbound
-                .enqueue_batch(Priority::Interactive, invite_cmds, cm);
+                .enqueue_batch(Priority::Interactive, invite_cmds);
         }
 
         if joined_ids.len() + gone_ids.len() >= tracked_users.len() {
@@ -436,7 +436,6 @@ impl Breakout {
                                                     new_nick,
                                                     self.room.name().to_owned(),
                                                 ),
-                                                live_cm,
                                             );
                                         } else if strict {
                                             return Err(Error::UserLeft {
@@ -504,7 +503,6 @@ impl Breakout {
         core.check_connected()?;
 
         // Subscribe before sending PART so we never miss the server's PART echo:
-        let cm = core.casemap();
         let mut inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
@@ -512,13 +510,10 @@ impl Breakout {
                 dm_users: Vec::new(),
             },
             Location::caller(),
-            cm,
         );
 
-        let (cmds, cmd_cm) = self.build_teardown_commands();
-        let _ = core
-            .outbound
-            .enqueue_batch(Priority::Interactive, cmds, cmd_cm);
+        let cmds = self.build_teardown_commands();
+        let _ = core.outbound.enqueue_batch(Priority::Interactive, cmds);
 
         // If the channel wasn't even joined in WorldState anymore, return immediately:
         {

@@ -178,7 +178,6 @@ pub(crate) async fn acquire_single_dm_guard(
 
     *user.track().lock_holder.lock().unwrap() = Some(caller);
 
-    let cm = core.casemap();
     let mut inbox = core.inboxes.subscribe(
         Arc::clone(&core),
         Filter::Scoped {
@@ -186,7 +185,6 @@ pub(crate) async fn acquire_single_dm_guard(
             dm_users: vec![user.track_arc()],
         },
         caller,
-        cm,
     );
     let ask_config = (*core.ask_config).clone();
     ask_config.apply_to_locked_inbox(&mut inbox);

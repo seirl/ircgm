@@ -75,20 +75,14 @@ async fn registry_tracks_channel_interest_and_deduplicates_multi_match_events() 
     let room_a = bot.room("#a").unwrap();
     let room_b = bot.room("#b").unwrap();
     let alice = bot.user("alice").unwrap();
-    let cm = bot.casemap();
 
     // Initially no inbox watches `#a`:
-    assert!(!room_a
-        .core()
-        .inboxes
-        .has_interest_in_channel(&cm.fold("#a")));
+    assert!(!room_a.core().inboxes.has_interest_in_channel("#a"));
 
     // Subscribe a combined scope watching `#a`, `#b`, and DMs from `alice`:
-    let mut combined = bot.inbox_scope(InboxScope::new().rooms([&room_a, &room_b]).dm_from(&alice));
-    assert!(room_a
-        .core()
-        .inboxes
-        .has_interest_in_channel(&cm.fold("#a")));
+    let mut combined =
+        bot.inbox_scope(InboxScope::new().rooms([&room_a, &room_b]).dm_from(&alice));
+    assert!(room_a.core().inboxes.has_interest_in_channel("#a"));
 
     // Put alice in both `#a` and `#b`, then have alice `/nick` so `candidates` hits `#a`, `#b`, AND `by_user`:
     server.send_line(":alice!~a@h JOIN #a\r\n");
@@ -121,10 +115,7 @@ async fn registry_tracks_channel_interest_and_deduplicates_multi_match_events() 
     }
 
     drop(combined);
-    assert!(!room_a
-        .core()
-        .inboxes
-        .has_interest_in_channel(&cm.fold("#a")));
+    assert!(!room_a.core().inboxes.has_interest_in_channel("#a"));
 }
 
 #[tokio::test]
@@ -213,4 +204,71 @@ async fn wait_combinators_and_lossy_on_triggers_resolve_cleanly() {
         scoped_burst.next_chat().await,
         Err(Error::BotLeftRoom { .. })
     ));
+}
+
+#[tokio::test]
+async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_after_rekey() {
+    let (bot, _server) = test_harness("gm");
+    let room = bot.room("#[Room]").unwrap();
+    let core = room.core();
+    let mut pre_inbox = room.inbox();
+
+    // Flip shared `AtomicCaseMap` to `Ascii` BEFORE `InboxRegistry::rekey_casemap` runs
+    // (simulating the mid-`005` window after `WorldState::apply_isupport` updated `core.casemap`):
+    core.casemap.store(CaseMap::Ascii);
+
+    // Subscribing a new `#[Room]` inbox in the pre-rekey window still indexes consistently under
+    // `inner.casemap` (`Rfc1459`) and receives dispatches both BEFORE and AFTER `rekey_casemap`:
+    let mut mid_window_inbox = room.inbox();
+    assert!(core.inboxes.has_interest_in_channel("#[room]"));
+    assert!(core.inboxes.has_interest_in_channel("#{room}"));
+
+    let sender = bot.user("[Alice]").unwrap();
+    let raw = Arc::new(
+        crate::state::parse_irc_message(":a!~u@h PRIVMSG #[Room] :before rekey\r\n").unwrap(),
+    );
+    let make_chat_wire = |seq: u64, chan: &str, text: &str| {
+        Arc::new(WireEvent {
+            seq,
+            raw: Arc::clone(&raw),
+            kind: WireKind::Event(Event::Chat(ChatMessage {
+                raw: Arc::clone(&raw),
+                received_at: Instant::now(),
+                sender: sender.clone(),
+                nick: "[Alice]".into(),
+                ident: Some("~u".into()),
+                host: Some("h".into()),
+                account: None,
+                target: Target::Channel(chan.to_owned()),
+                text: text.to_owned(),
+                raw_text: text.to_owned(),
+                kind: crate::MessageKind::Privmsg,
+            })),
+            meta: crate::message::WireMeta::None,
+        })
+    };
+
+    let w1 = make_chat_wire(1, "#[room]", "before rekey");
+    core.inboxes.dispatch(&w1, Some("#[room]"));
+    assert_eq!(pre_inbox.next_chat().await.unwrap().text, "before rekey");
+    assert_eq!(
+        mid_window_inbox.next_chat().await.unwrap().text,
+        "before rekey"
+    );
+
+    // Now rekey `InboxRegistry` to `Ascii`: `#[room]` stays routed while `#{room}` no longer aliases!
+    core.inboxes.rekey_casemap(CaseMap::Ascii);
+    assert!(core.inboxes.has_interest_in_channel("#[room]"));
+    assert!(!core.inboxes.has_interest_in_channel("#{room}"));
+
+    let w_brace = make_chat_wire(2, "#{room}", "curly");
+    let w_bracket = make_chat_wire(3, "#[room]", "after rekey");
+    core.inboxes.dispatch(&w_brace, Some("#{room}"));
+    core.inboxes.dispatch(&w_bracket, Some("#[room]"));
+
+    assert_eq!(pre_inbox.next_chat().await.unwrap().text, "after rekey");
+    assert_eq!(
+        mid_window_inbox.next_chat().await.unwrap().text,
+        "after rekey"
+    );
 }

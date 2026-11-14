@@ -7,7 +7,7 @@ use irc_colors::Text;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bot::{Bot, BotConfig, BotCore, BotOwner};
-use crate::casemap::CaseMap;
+use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::pump::{run_pump, PumpInput, PumpSource, RegistrationTracker};
 use crate::state::parse_irc_message;
@@ -29,12 +29,14 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
 
+    let casemap = AtomicCaseMap::default();
     let (outbound, outbound_task) = OutboundSink::new(
         RawTransport::Test(outbound_tx),
         config.outbound_burst,
         config.outbound_window,
+        casemap.clone(),
     );
-    let core = BotCore::new(initial_nick.clone(), outbound, true, &config);
+    let core = BotCore::new(initial_nick.clone(), casemap, outbound, true, &config);
     let reg = RegistrationTracker {
         cap_pending: false,
         motd_done: true,
@@ -77,7 +79,7 @@ impl TestServer {
     fn current_nick_and_casemap(&self) -> (String, CaseMap) {
         if let Some(core) = self.core.upgrade() {
             let ws = core.state.read().unwrap();
-            (ws.current_nick.clone(), ws.casemap)
+            (ws.current_nick.clone(), core.casemap())
         } else {
             (self.fallback_nick.clone(), CaseMap::default())
         }
@@ -174,7 +176,7 @@ impl TestServer {
             let uh = ws
                 .self_user_host()
                 .unwrap_or_else(|| format!("~{bn}@test.host"));
-            (bn, uh, ws.casemap)
+            (bn, uh, core.casemap())
         } else {
             let bn = self.fallback_nick.clone();
             let uh = format!("~{bn}@test.host");

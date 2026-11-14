@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::bot::BotConfig;
+use crate::casemap::AtomicCaseMap;
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::state::parse_irc_message;
 
@@ -54,8 +55,14 @@ async fn multiline_cap_ack_waits_for_final_ack_and_motd_before_marking_registere
         outbound_burst: usize::MAX,
         ..BotConfig::default()
     };
-    let (outbound, _task) = OutboundSink::new(RawTransport::Test(out_tx), usize::MAX, cfg.outbound_window);
-    let core = BotCore::new("gm".into(), outbound, true, &cfg);
+    let casemap = AtomicCaseMap::default();
+    let (outbound, _task) = OutboundSink::new(
+        RawTransport::Test(out_tx),
+        usize::MAX,
+        cfg.outbound_window,
+        casemap.clone(),
+    );
+    let core = BotCore::new("gm".into(), casemap, outbound, true, &cfg);
 
     let mut reg = RegistrationTracker {
         cap_pending: true,
@@ -93,9 +100,14 @@ async fn self_echo_notice_updates_tracked_account_without_emitting_chat_event() 
         outbound_burst: usize::MAX,
         ..BotConfig::default()
     };
-    let (outbound, _task) =
-        OutboundSink::new(RawTransport::Test(out_tx), usize::MAX, cfg.outbound_window);
-    let core = BotCore::new("gm".into(), outbound, true, &cfg);
+    let casemap = AtomicCaseMap::default();
+    let (outbound, _task) = OutboundSink::new(
+        RawTransport::Test(out_tx),
+        usize::MAX,
+        cfg.outbound_window,
+        casemap.clone(),
+    );
+    let core = BotCore::new("gm".into(), casemap, outbound, true, &cfg);
     let self_track = core.users.get_or_create("gm");
     assert_eq!(self_track.account(), None);
 

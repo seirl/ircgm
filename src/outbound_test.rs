@@ -4,7 +4,7 @@ use irc::proto::Response;
 
 #[tokio::test]
 async fn crlf_splitting_ctcp_sanitization_and_396_wire_budget() {
-    let mut ws = WorldState::new("GameBot");
+    let mut ws = WorldState::new("GameBot", AtomicCaseMap::default());
     ws.self_ident = Some("~gamebot".into());
     let cloak_msg: irc::proto::Message = format!(
         ":srv 396 GameBot {} :is now your displayed host\r\n",
@@ -106,19 +106,21 @@ async fn crlf_splitting_ctcp_sanitization_and_396_wire_budget() {
 #[tokio::test(start_paused = true)]
 async fn priority_scheduling_same_channel_flush_and_write_receipts() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _task) = OutboundSink::new(RawTransport::Test(tx), 2, Duration::from_secs(8));
-    let cm = CaseMap::Rfc1459;
+    let (sink, _task) = OutboundSink::new(
+        RawTransport::Test(tx),
+        2,
+        Duration::from_secs(8),
+        AtomicCaseMap::default(),
+    );
 
     // Consume initial 2-message burst at t = 0:
     let r1 = sink.enqueue_one(
         Priority::Interactive,
         Command::PRIVMSG("#lobby".into(), "m1".into()),
-        cm,
     );
     let r2 = sink.enqueue_one(
         Priority::Interactive,
         Command::PRIVMSG("#lobby".into(), "m2".into()),
-        cm,
     );
     r1.wait().await;
     r2.wait().await;
@@ -140,19 +142,16 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
             Command::KICK("#vault".into(), "Alice".into(), None),
             Command::PART("#vault".into(), None),
         ],
-        cm,
     );
     let r_prompt = sink.enqueue_one(
         Priority::Interactive,
         Command::PRIVMSG("#lobby".into(), "urgent_prompt".into()),
-        cm,
     );
     let r_rejoin = sink.enqueue_one(
         Priority::Interactive,
         Command::JOIN("#VAULT".into(), None, None),
-        cm,
     );
-    let r_quit = sink.enqueue_quit(Some("bye"), cm);
+    let r_quit = sink.enqueue_quit(Some("bye"));
 
     assert!(rx.try_recv().is_err());
 
@@ -210,14 +209,17 @@ async fn priority_scheduling_same_channel_flush_and_write_receipts() {
 #[tokio::test(start_paused = true)]
 async fn join_followed_by_later_background_part_preserves_join_before_part() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _task) = OutboundSink::new(RawTransport::Test(tx), 1, Duration::from_secs(8));
-    let cm = CaseMap::Rfc1459;
+    let (sink, _task) = OutboundSink::new(
+        RawTransport::Test(tx),
+        1,
+        Duration::from_secs(8),
+        AtomicCaseMap::default(),
+    );
 
     // Consume burst = 1 slot at t = 0:
     sink.enqueue_one(
         Priority::Interactive,
         Command::PRIVMSG("#lobby".into(), "warmup".into()),
-        cm,
     )
     .wait()
     .await;
@@ -227,13 +229,8 @@ async fn join_followed_by_later_background_part_preserves_join_before_part() {
     let r_join = sink.enqueue_one(
         Priority::Interactive,
         Command::JOIN("#c".into(), None, None),
-        cm,
     );
-    let r_part = sink.enqueue_one(
-        Priority::Background,
-        Command::PART("#c".into(), None),
-        cm,
-    );
+    let r_part = sink.enqueue_one(Priority::Background, Command::PART("#c".into(), None));
 
     tokio::time::advance(Duration::from_secs(8)).await;
     r_join.wait().await;

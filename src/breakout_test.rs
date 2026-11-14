@@ -72,7 +72,7 @@ async fn build_teardown_commands_honors_kick_on_drop_and_targmax_kick() {
     server.settle().await;
 
     let mut br = br_task.await.unwrap().unwrap();
-    let (cmds, _) = br.build_teardown_commands();
+    let cmds = br.build_teardown_commands();
     assert_eq!(
         cmds,
         vec![
@@ -93,6 +93,6 @@ async fn build_teardown_commands_honors_kick_on_drop_and_targmax_kick() {
         opts: BreakoutOptions::exact("#vault").kick_on_drop(false),
         armed: false,
     };
-    let (no_kick_cmds, _) = br_no_kick.build_teardown_commands();
+    let no_kick_cmds = br_no_kick.build_teardown_commands();
     assert_eq!(no_kick_cmds, vec![Command::PART("#vault".into(), None)]);
 }

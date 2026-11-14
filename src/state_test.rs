@@ -6,7 +6,7 @@ fn parse_msg(raw: &str) -> Message {
 
 #[test]
 fn isupport_parsing_and_targmax_variants() {
-    let mut ws = WorldState::new("Bot");
+    let mut ws = WorldState::new("Bot", AtomicCaseMap::default());
     let m1 = parse_msg(
         ":srv 005 Bot PREFIX=(qaohv)~&@%+ MODES=6 TARGMAX=PRIVMSG:4,KICK:1 CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz CASEMAPPING=strict-rfc1459 :are supported\r\n",
     );
@@ -33,8 +33,9 @@ fn isupport_parsing_and_targmax_variants() {
 
 #[test]
 fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
-    let users = UserRegistry::default();
-    let mut ws = WorldState::new("Bot");
+    let casemap = AtomicCaseMap::default();
+    let users = UserRegistry::new(casemap.clone());
+    let mut ws = WorldState::new("Bot", casemap);
 
     let j = parse_msg(":Bot!~bot@initial.host JOIN #c\r\n");
     let bot_track = users.get_or_create("Bot");
@@ -59,23 +60,23 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(chan.names_synced);
     assert_eq!(chan.members.len(), 4);
 
-    let alice = chan.member_by_nick("Alice", ws.casemap).unwrap();
+    let alice = chan.member_by_nick("Alice").unwrap();
     assert_eq!(alice.prefixes, vec!['@', '+']);
     assert!(ws.occupant_is_op(alice));
     assert!(ws.occupant_is_voiced(alice));
 
-    let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
+    let carol = chan.member_by_nick("Carol").unwrap();
     assert!(!ws.occupant_is_op(carol));
 
     // Direct interleaved multi-word mode-block parsing in `apply_channel_mode_tokens`:
     ws.apply_channel_mode_tokens("#c", &["+klo", "secret", "50", "Carol", "-v", "Bob"], &users);
 
     let chan = &ws.channels[&ws.casemap.fold("#c")];
-    let carol = chan.member_by_nick("Carol", ws.casemap).unwrap();
+    let carol = chan.member_by_nick("Carol").unwrap();
     assert!(ws.occupant_is_op(carol));
     assert_eq!(carol.prefixes, vec!['@']);
 
-    let bob = chan.member_by_nick("Bob", ws.casemap).unwrap();
+    let bob = chan.member_by_nick("Bob").unwrap();
     assert!(!ws.occupant_is_voiced(bob));
     assert!(bob.prefixes.is_empty());
 
@@ -84,8 +85,8 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(matches!(mode_msg.command, Command::ChannelMODE(..)));
     ws.apply_mode_message(&mode_msg, &users);
     let chan = &ws.channels[&ws.casemap.fold("#c")];
-    assert!(!ws.occupant_is_op(chan.member_by_nick("Carol", ws.casemap).unwrap()));
-    assert!(ws.occupant_is_voiced(chan.member_by_nick("Bob", ws.casemap).unwrap()));
+    assert!(!ws.occupant_is_op(chan.member_by_nick("Carol").unwrap()));
+    assert!(ws.occupant_is_voiced(chan.member_by_nick("Bob").unwrap()));
 
     let m_iso = parse_msg(":srv 005 Bot CHANMODES=eIbq,k,flj,imnpst :are supported\r\n");
     if let Command::Response(Response::RPL_ISUPPORT, args) = &m_iso.command {
@@ -94,7 +95,7 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     let custom_mode_324 = parse_msg(":srv 324 Bot #c +fo 5:2 Bob\r\n");
     ws.apply_mode_message(&custom_mode_324, &users);
     let bob = ws.channels[&ws.casemap.fold("#c")]
-        .member_by_nick("Bob", ws.casemap)
+        .member_by_nick("Bob")
         .unwrap();
     assert!(ws.occupant_is_op(bob));
 
@@ -103,15 +104,16 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
     assert!(matches!(live_parsed.command, Command::ChannelMODE(..)));
     ws.apply_mode_message(&live_parsed, &users);
     let bob = ws.channels[&ws.casemap.fold("#c")]
-        .member_by_nick("Bob", ws.casemap)
+        .member_by_nick("Bob")
         .unwrap();
     assert!(!ws.occupant_is_op(bob));
 }
 
 #[test]
 fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
-    let users = UserRegistry::default();
-    let mut ws = WorldState::new("Bot");
+    let casemap = AtomicCaseMap::default();
+    let users = UserRegistry::new(casemap.clone());
+    let mut ws = WorldState::new("Bot", casemap);
 
     let w = parse_msg(":srv 001 Bot :Welcome to IRC Bot!~bot@10.0.0.1\r\n");
     if let Command::Response(Response::RPL_WELCOME, args) = &w.command {
@@ -147,8 +149,8 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
     assert!(!ws.channels.contains_key(&CaseMap::Ascii.fold("#{room}")));
     let ch = &ws.channels[&CaseMap::Ascii.fold("#[room]")];
     assert!(ch.members.contains_key(&at.id));
-    assert!(ch.member_by_nick("[alice]", CaseMap::Ascii).is_some());
-    assert!(ch.member_by_nick("{alice}", CaseMap::Ascii).is_none());
+    assert!(ch.member_by_nick("[alice]").is_some());
+    assert!(ch.member_by_nick("{alice}").is_none());
 
     // Self-leave records `lost_channels`:
     assert!(ws.handle_part_or_kick("#[Room]", "Bot", bt.id, Some("kicked".into()), 10));
@@ -160,8 +162,9 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
 
 #[test]
 fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
-    let users = UserRegistry::default();
-    let mut ws = WorldState::new("Bot");
+    let casemap = AtomicCaseMap::default();
+    let users = UserRegistry::new(casemap.clone());
+    let mut ws = WorldState::new("Bot", casemap);
 
     let bot_track = users.get_or_create("Bot");
     let j = parse_msg(":Bot!~bot@h JOIN #c\r\n");
@@ -203,7 +206,7 @@ fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
 
     let chan = &ws.channels[&ws.casemap.fold("#c")];
     assert!(chan.names_synced);
-    assert!(chan.member_by_nick("Alice", ws.casemap).is_none());
+    assert!(chan.member_by_nick("Alice").is_none());
     assert!(!chan.members.contains_key(&bob_track.id));
     assert!(!chan.members.contains_key(&carol_track.id));
 

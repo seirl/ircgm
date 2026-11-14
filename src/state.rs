@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use irc::proto::{Command, Message, Prefix, Response};
 
-use crate::casemap::{CaseMap, FoldedStr};
+use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::user::{UserRegistry, UserTrack};
 
 /// Conservative `user@host` byte reserve (`76` bytes) used before the bot observes its own
@@ -62,10 +62,10 @@ impl ChannelState {
         }
     }
 
-    pub(crate) fn member_by_nick(&self, nick: &str, casemap: CaseMap) -> Option<&Occupant> {
+    pub(crate) fn member_by_nick(&self, nick: &str) -> Option<&Occupant> {
         self.members
             .values()
-            .find(|occ| casemap.str_eq(&occ.track.nick(), nick))
+            .find(|occ| occ.track.casemap().str_eq(&occ.track.nick(), nick))
     }
 
     fn for_each_map_mut(&mut self, mut f: impl FnMut(&mut HashMap<u64, Occupant>)) {
@@ -85,6 +85,7 @@ pub(crate) struct LostChannel {
 
 pub(crate) struct WorldState {
     pub(crate) casemap: CaseMap,
+    shared_casemap: AtomicCaseMap,
     pub(crate) chan_types: Vec<char>,
     /// `(mode_char, prefix_symbol)` ordered highest to lowest privilege.
     pub(crate) status_prefixes: Vec<(char, char)>,
@@ -100,9 +101,10 @@ pub(crate) struct WorldState {
 }
 
 impl WorldState {
-    pub(crate) fn new(initial_nick: impl Into<String>) -> Self {
+    pub(crate) fn new(initial_nick: impl Into<String>, shared_casemap: AtomicCaseMap) -> Self {
         Self {
-            casemap: CaseMap::default(),
+            casemap: shared_casemap.load(),
+            shared_casemap,
             chan_types: vec!['#', '&'],
             status_prefixes: vec![('o', '@'), ('v', '+')],
             chan_modes: ChanModes::default(),
@@ -329,6 +331,7 @@ impl WorldState {
     /// (`ChannelState::members` is keyed by immutable `UserTrack::id`, so no member re-keying is needed).
     pub(crate) fn rekey_casemap(&mut self, new_map: CaseMap) {
         self.casemap = new_map;
+        self.shared_casemap.store(new_map);
         let old_channels = std::mem::take(&mut self.channels);
         let mut new_channels = HashMap::with_capacity(old_channels.len());
         for (_, chan) in old_channels {

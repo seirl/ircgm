@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::casemap::{CaseMap, FoldedStr};
+use crate::casemap::{AtomicCaseMap, FoldedStr};
 use crate::error::{Error, Result};
 use crate::state::WorldState;
 
@@ -264,6 +264,7 @@ pub(crate) struct OutboundSink {
     state: Mutex<SchedulerState>,
     notify: Notify,
     enqueue_seq: AtomicU64,
+    casemap: AtomicCaseMap,
 }
 
 impl OutboundSink {
@@ -271,6 +272,7 @@ impl OutboundSink {
         transport: RawTransport,
         burst: usize,
         window: Duration,
+        casemap: AtomicCaseMap,
     ) -> (Arc<Self>, Option<JoinHandle<()>>) {
         let burst = burst.max(1);
         let sink = Arc::new(Self {
@@ -288,6 +290,7 @@ impl OutboundSink {
             }),
             notify: Notify::new(),
             enqueue_seq: AtomicU64::new(0),
+            casemap,
         });
 
         let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -332,16 +335,12 @@ impl OutboundSink {
 
     /// Enqueues a batch of commands under `priority` and returns a [`WriteReceipt`] resolved
     /// when the final command in `cmds` is written to the underlying sink.
-    pub(crate) fn enqueue_batch(
-        &self,
-        priority: Priority,
-        cmds: Vec<Command>,
-        casemap: CaseMap,
-    ) -> WriteReceipt {
+    pub(crate) fn enqueue_batch(&self, priority: Priority, cmds: Vec<Command>) -> WriteReceipt {
         if cmds.is_empty() {
             return WriteReceipt::immediate();
         }
 
+        let casemap = self.casemap.load();
         let (tx, rx) = oneshot::channel();
         let needs_wake = {
             let mut st = self.state.lock().unwrap();
@@ -409,18 +408,13 @@ impl OutboundSink {
         WriteReceipt::from_rx(rx)
     }
 
-    pub(crate) fn enqueue_one(
-        &self,
-        priority: Priority,
-        cmd: Command,
-        casemap: CaseMap,
-    ) -> WriteReceipt {
-        self.enqueue_batch(priority, vec![cmd], casemap)
+    pub(crate) fn enqueue_one(&self, priority: Priority, cmd: Command) -> WriteReceipt {
+        self.enqueue_batch(priority, vec![cmd])
     }
 
     /// Schedules `QUIT` after all currently queued `Interactive` and `Background` commands drain,
     /// returning a [`WriteReceipt`] resolved once `QUIT` has been written.
-    pub(crate) fn enqueue_quit(&self, reason: Option<&str>, _casemap: CaseMap) -> WriteReceipt {
+    pub(crate) fn enqueue_quit(&self, reason: Option<&str>) -> WriteReceipt {
         let clean_reason = reason.map(sanitize_reason);
         let (tx, rx) = oneshot::channel();
         let needs_wake = {

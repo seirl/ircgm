@@ -130,4 +130,11 @@ async fn user_ids_are_globally_unique_and_cross_bot_inbox_scope_is_rejected() {
         foreign_inbox.next_chat().await,
         Err(Error::InvalidInput(_))
     ));
+
+    let room1 = bot1.room("#lobby").unwrap();
+    let mut foreign_room_inbox = bot2.inbox_rooms([&room1]);
+    assert!(matches!(
+        foreign_room_inbox.next_chat().await,
+        Err(Error::InvalidInput(_))
+    ));
 }

@@ -173,11 +173,9 @@ fn process_message(
             let is_multiline_cont = arg3.as_deref() == Some("*");
             if reg.cap_pending && !is_multiline_cont {
                 reg.cap_pending = false;
-                let cm = core.casemap();
                 let _ = core.outbound.enqueue_one(
                     Priority::Interactive,
                     Command::CAP(None, CapSubCommand::END, None, None),
-                    cm,
                 );
                 if reg.is_ready() {
                     core.mark_registered();
@@ -231,13 +229,12 @@ fn process_message(
             handle_account(core, &raw, &args[0], seq);
         }
         Command::TOPIC(channel, topic) => {
-            let cm = {
+            {
                 let mut ws = core.state.write().unwrap();
                 ws.observe_self_prefix(raw.prefix.as_ref());
                 ws.handle_topic(channel, topic.clone());
-                ws.casemap
-            };
-            dispatch_raw(core, &raw, seq, Some(channel), cm);
+            }
+            dispatch_raw(core, &raw, seq, Some(channel));
         }
         Command::ChannelMODE(chan, _) => {
             handle_mode(core, &raw, chan, seq);
@@ -246,25 +243,24 @@ fn process_message(
             handle_mode(core, &raw, &args[0], seq);
         }
         _ => {
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                ws.observe_self_prefix(raw.prefix.as_ref());
-                ws.casemap
-            };
-            dispatch_raw(core, &raw, seq, None, cm);
+            core.state
+                .write()
+                .unwrap()
+                .observe_self_prefix(raw.prefix.as_ref());
+            dispatch_raw(core, &raw, seq, None);
         }
     }
 }
 
 fn handle_mode(core: &Arc<BotCore>, raw: &Arc<Message>, chan: &str, seq: u64) {
-    let (cm, is_chan) = {
+    let is_chan = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(raw.prefix.as_ref());
         let is_c = ws.is_channel_name(chan);
         ws.apply_mode_message(raw, &core.users);
-        (ws.casemap, is_c)
+        is_c
     };
-    dispatch_raw(core, raw, seq, is_chan.then_some(chan), cm);
+    dispatch_raw(core, raw, seq, is_chan.then_some(chan));
 }
 
 fn resolve_chat_sender(core: &Arc<BotCore>, nick: &str, tags: &ParsedTags) -> User {
@@ -291,21 +287,20 @@ fn handle_chat_like(
             Some((nick.as_str(), user.as_str(), host.as_str()))
         }
         _ if !is_notice => {
-            dispatch_raw(core, raw, seq, None, core.casemap());
+            dispatch_raw(core, raw, seq, None);
             return;
         }
         _ => None,
     };
 
     // Check self-echo & unwatched channel under WorldState read lock (upgrading only if self host needs recording):
-    let (cm, is_self, is_chan, chan_in_ws) = {
+    let (is_self, is_chan, chan_in_ws) = {
         let ws = core.state.read().unwrap();
         let is_self =
             nick_prefix.is_some_and(|(nick, _, _)| ws.casemap.str_eq(nick, &ws.current_nick));
         let needs_self_update = is_self && (ws.self_ident.is_none() || ws.self_host.is_none());
         let is_chan = ws.is_channel_name(target);
         let chan_in_ws = is_chan && ws.channels.contains_key(&ws.casemap.fold(target));
-        let cm = ws.casemap;
         drop(ws);
         if needs_self_update {
             core.state
@@ -313,18 +308,18 @@ fn handle_chat_like(
                 .unwrap()
                 .observe_self_prefix(raw.prefix.as_ref());
         }
-        (cm, is_self, is_chan, chan_in_ws)
+        (is_self, is_chan, chan_in_ws)
     };
 
     if is_self {
         if let (Some((nick, _, _)), Some(raw_acct)) = (nick_prefix, &tags.raw_account) {
             core.users.update_account(nick, raw_acct);
         }
-        dispatch_raw(core, raw, seq, is_chan.then_some(target), cm);
+        dispatch_raw(core, raw, seq, is_chan.then_some(target));
         return;
     }
 
-    if is_chan && !chan_in_ws && !core.inboxes.has_interest_in_channel(&cm.fold(target)) {
+    if is_chan && !chan_in_ws && !core.inboxes.has_interest_in_channel(target) {
         // Early unwatched-channel skip: zero `UserTrack` / `ChatMessage` allocations!
         if let (Some((nick, _, _)), Some(raw_acct)) = (nick_prefix, &tags.raw_account) {
             core.users.update_account(nick, raw_acct);
@@ -343,7 +338,7 @@ fn handle_chat_like(
         let (kind, raw_text) = parse_privmsg_body(body);
         if kind == MessageKind::Privmsg && body.starts_with('\x01') {
             // Non-ACTION CTCP request (`\x01VERSION\x01`, etc.) stays `RawOnly`:
-            dispatch_raw(core, raw, seq, is_chan.then_some(target), cm);
+            dispatch_raw(core, raw, seq, is_chan.then_some(target));
             return;
         }
 
@@ -369,7 +364,6 @@ fn handle_chat_like(
             WireKind::Event(Event::Chat(chat)),
             WireMeta::None,
             is_chan.then_some(target),
-            cm,
         );
     } else {
         let plain_text = Text::parse(body).plain();
@@ -417,7 +411,6 @@ fn handle_chat_like(
             WireKind::Event(event),
             meta,
             is_chan.then_some(target),
-            cm,
         );
     }
 }
@@ -439,11 +432,10 @@ fn handle_join(
         track.set_account(normalize_account(acct));
     }
 
-    let cm = {
-        let mut ws = core.state.write().unwrap();
-        ws.handle_join(channel, nick, Arc::clone(&track), raw.prefix.as_ref());
-        ws.casemap
-    };
+    core.state
+        .write()
+        .unwrap()
+        .handle_join(channel, nick, Arc::clone(&track), raw.prefix.as_ref());
 
     let sender = User::from_parts(Arc::downgrade(core), track);
     dispatch_wire(
@@ -459,7 +451,6 @@ fn handle_join(
         }),
         WireMeta::None,
         Some(channel),
-        cm,
     );
 }
 
@@ -479,11 +470,10 @@ fn handle_part(
         track.set_account(normalize_account(raw_acct));
     }
 
-    let (cm, self_left) = {
+    let self_left = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(raw.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq);
-        (ws.casemap, left)
+        ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq)
     };
 
     let kind = if self_left {
@@ -499,7 +489,7 @@ fn handle_part(
             reason,
         })
     };
-    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel), cm);
+    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel));
 }
 
 fn handle_kick(
@@ -517,11 +507,10 @@ fn handle_kick(
     };
     let track = core.users.get_or_create(target_nick);
 
-    let (cm, self_left) = {
+    let self_left = {
         let mut ws = core.state.write().unwrap();
         ws.observe_self_prefix(raw.prefix.as_ref());
-        let left = ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq);
-        (ws.casemap, left)
+        ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq)
     };
 
     let kind = if self_left {
@@ -538,7 +527,7 @@ fn handle_kick(
             reason,
         })
     };
-    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel), cm);
+    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel));
 }
 
 fn handle_quit(
@@ -558,11 +547,7 @@ fn handle_quit(
         ensured_track.set_account(normalize_account(raw_acct));
     }
 
-    let (cm, channels) = {
-        let mut ws = core.state.write().unwrap();
-        let chans = ws.handle_quit(ensured_track.id);
-        (ws.casemap, chans)
-    };
+    let channels = core.state.write().unwrap().handle_quit(ensured_track.id);
 
     let track = core
         .users
@@ -581,7 +566,6 @@ fn handle_quit(
         }),
         WireMeta::None,
         None,
-        cm,
     );
 }
 
@@ -601,11 +585,11 @@ fn handle_nick(
         track.set_account(normalize_account(raw_acct));
     }
 
-    let (cm, channels) = {
-        let mut ws = core.state.write().unwrap();
-        let chans = ws.handle_nick(track.id, old_nick, new_nick, raw.prefix.as_ref());
-        (ws.casemap, chans)
-    };
+    let channels =
+        core.state
+            .write()
+            .unwrap()
+            .handle_nick(track.id, old_nick, new_nick, raw.prefix.as_ref());
 
     dispatch_wire(
         core,
@@ -619,7 +603,6 @@ fn handle_nick(
         }),
         WireMeta::None,
         None,
-        cm,
     );
 }
 
@@ -628,7 +611,7 @@ fn handle_account(core: &Arc<BotCore>, raw: &Arc<Message>, acct: &str, seq: u64)
         return;
     };
     core.users.update_account(nick, acct);
-    dispatch_raw(core, raw, seq, None, core.casemap());
+    dispatch_raw(core, raw, seq, None);
 }
 
 fn handle_numeric(
@@ -642,84 +625,65 @@ fn handle_numeric(
     match code {
         1 => {
             // 001 RPL_WELCOME
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                ws.handle_welcome(args);
-                ws.casemap
-            };
-            dispatch_raw(core, raw, seq, None, cm);
+            core.state.write().unwrap().handle_welcome(args);
+            dispatch_raw(core, raw, seq, None);
         }
         5 => {
             // 005 RPL_ISUPPORT
-            let (changed_cm, cm) = {
-                let mut ws = core.state.write().unwrap();
-                let changed = ws.apply_isupport(args);
-                (changed, ws.casemap)
-            };
+            let changed_cm = core.state.write().unwrap().apply_isupport(args);
             if let Some(new_cm) = changed_cm {
                 core.users.rekey_casemap(new_cm);
                 core.inboxes.rekey_casemap(new_cm);
             }
-            dispatch_raw(core, raw, seq, None, cm);
+            dispatch_raw(core, raw, seq, None);
         }
         324 => {
             // RPL_CHANNELMODEIS: `<client> <channel> <modes> ...`
             let chan_hint = args.get(1).map(String::as_str);
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                ws.apply_mode_message(raw, &core.users);
-                ws.casemap
-            };
-            dispatch_raw(core, raw, seq, chan_hint, cm);
+            core.state
+                .write()
+                .unwrap()
+                .apply_mode_message(raw, &core.users);
+            dispatch_raw(core, raw, seq, chan_hint);
         }
         331 => {
             // RPL_NOTOPIC: `<client> <channel> :No topic is set`
             let chan_hint = args.get(1).map(String::as_str);
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                if let Some(ch) = chan_hint {
-                    ws.handle_topic(ch, None);
-                }
-                ws.casemap
-            };
-            dispatch_raw(core, raw, seq, chan_hint, cm);
+            if let Some(ch) = chan_hint {
+                core.state.write().unwrap().handle_topic(ch, None);
+            }
+            dispatch_raw(core, raw, seq, chan_hint);
         }
         332 => {
             // RPL_TOPIC: `<client> <channel> :<topic>`
             let chan_hint = args.get(1).map(String::as_str);
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                if args.len() >= 3 {
-                    ws.handle_topic(&args[1], Some(args[2].clone()));
-                }
-                ws.casemap
-            };
-            dispatch_raw(core, raw, seq, chan_hint, cm);
+            if args.len() >= 3 {
+                core.state
+                    .write()
+                    .unwrap()
+                    .handle_topic(&args[1], Some(args[2].clone()));
+            }
+            dispatch_raw(core, raw, seq, chan_hint);
         }
         353 => {
             // RPL_NAMREPLY
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                ws.handle_namreply(args, &core.users);
-                ws.casemap
-            };
+            core.state
+                .write()
+                .unwrap()
+                .handle_namreply(args, &core.users);
             let chan_hint = if args.len() >= 4 {
                 Some(args[2].as_str())
             } else {
                 args.get(1).map(String::as_str)
             };
-            dispatch_raw(core, raw, seq, chan_hint, cm);
+            dispatch_raw(core, raw, seq, chan_hint);
         }
         366 => {
             // RPL_ENDOFNAMES
-            let (synced_chan, cm) = {
-                let mut ws = core.state.write().unwrap();
-                let ch = ws.handle_endofnames(args);
-                (ch, ws.casemap)
-            };
+            let synced_chan = core.state.write().unwrap().handle_endofnames(args);
             let fallback = args.get(1).map(String::as_str);
             let hint = synced_chan.as_deref().or(fallback);
-            dispatch_raw(core, raw, seq, hint, cm);
+            dispatch_raw(core, raw, seq, hint);
         }
         376 | 422 => {
             // RPL_ENDOFMOTD / ERR_NOMOTD
@@ -727,16 +691,12 @@ fn handle_numeric(
             if reg.is_ready() {
                 core.mark_registered();
             }
-            dispatch_raw(core, raw, seq, None, core.casemap());
+            dispatch_raw(core, raw, seq, None);
         }
         396 => {
             // RPL_HOSTHIDDEN
-            let cm = {
-                let mut ws = core.state.write().unwrap();
-                ws.handle_host_hidden(args);
-                ws.casemap
-            };
-            dispatch_raw(core, raw, seq, None, cm);
+            core.state.write().unwrap().handle_host_hidden(args);
+            dispatch_raw(core, raw, seq, None);
         }
         482 => {
             // ERR_CHANOPRIVSNEEDED: `<client> <channel> :You're not channel operator`
@@ -747,17 +707,17 @@ fn handle_numeric(
                 message = reason,
                 "IRC server rejected moderation command with 482 ERR_CHANOPRIVSNEEDED"
             );
-            dispatch_raw(core, raw, seq, (!chan.is_empty()).then_some(chan), core.casemap());
+            dispatch_raw(core, raw, seq, (!chan.is_empty()).then_some(chan));
         }
         405 | 471 | 473 | 474 | 475 | 476 | 477 => {
             // Join-refusal numerics: `<client> <channel> :<reason>`
             let chan_hint = args.get(1).map(String::as_str);
-            dispatch_raw(core, raw, seq, chan_hint, core.casemap());
+            dispatch_raw(core, raw, seq, chan_hint);
         }
         401 | 403 | 404 | 442 | 486 | 492 | 531 | 716 => {
             // Send-refusal / PM-block numerics: `<client> <target> ... :<reason>`
             let Some(target) = args.get(1).cloned() else {
-                dispatch_raw(core, raw, seq, None, core.casemap());
+                dispatch_raw(core, raw, seq, None);
                 return;
             };
             let message = args
@@ -772,13 +732,9 @@ fn handle_numeric(
                 (None, None)
             };
 
-            let cm = if let Some(qid) = quit_track_id {
-                let mut ws = core.state.write().unwrap();
-                ws.handle_quit(qid);
-                ws.casemap
-            } else {
-                core.casemap()
-            };
+            if let Some(qid) = quit_track_id {
+                core.state.write().unwrap().handle_quit(qid);
+            }
 
             let meta = match target_user_id {
                 Some(uid) => WireMeta::BounceUser(uid),
@@ -791,18 +747,10 @@ fn handle_numeric(
                 message,
                 raw: Arc::clone(raw),
             };
-            dispatch_wire(
-                core,
-                raw,
-                seq,
-                WireKind::Event(event),
-                meta,
-                chan_hint,
-                cm,
-            );
+            dispatch_wire(core, raw, seq, WireKind::Event(event), meta, chan_hint);
         }
         _ => {
-            dispatch_raw(core, raw, seq, None, core.casemap());
+            dispatch_raw(core, raw, seq, None);
         }
     }
 }
@@ -814,7 +762,6 @@ fn dispatch_wire(
     kind: WireKind,
     meta: WireMeta,
     chan_hint: Option<&str>,
-    cm: crate::casemap::CaseMap,
 ) {
     let wire = Arc::new(WireEvent {
         seq,
@@ -822,17 +769,11 @@ fn dispatch_wire(
         kind,
         meta,
     });
-    core.inboxes.dispatch(&wire, chan_hint, cm);
+    core.inboxes.dispatch(&wire, chan_hint);
 }
 
-fn dispatch_raw(
-    core: &Arc<BotCore>,
-    raw: &Arc<Message>,
-    seq: u64,
-    chan_hint: Option<&str>,
-    cm: crate::casemap::CaseMap,
-) {
-    dispatch_wire(core, raw, seq, WireKind::RawOnly, WireMeta::None, chan_hint, cm);
+fn dispatch_raw(core: &Arc<BotCore>, raw: &Arc<Message>, seq: u64, chan_hint: Option<&str>) {
+    dispatch_wire(core, raw, seq, WireKind::RawOnly, WireMeta::None, chan_hint);
 }
 
 #[cfg(test)]

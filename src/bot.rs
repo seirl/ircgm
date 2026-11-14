@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 use std::future::Future;
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 
 use crate::ask::AskConfig;
 use crate::breakout::{Breakout, BreakoutOptions};
-use crate::casemap::CaseMap;
+use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::exclusive_dm::{acquire_available_dm_guards, acquire_many_dm_guards, ExclusiveDm};
 use crate::huddle::Huddle;
@@ -26,8 +26,6 @@ use crate::pump::{extract_numeric, run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
 use crate::state::WorldState;
 use crate::user::{User, UserRegistry, UserTrack};
-
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Configuration for [`Bot::connect_with`] and [`crate::testing::test_harness_with`].
 #[derive(Clone, Debug)]
@@ -94,7 +92,7 @@ impl BotConfig {
 }
 
 pub(crate) struct BotCore {
-    pub(crate) session_id: u64,
+    pub(crate) casemap: AtomicCaseMap,
     pub(crate) state: RwLock<WorldState>,
     pub(crate) users: UserRegistry,
     pub(crate) inboxes: InboxRegistry,
@@ -115,7 +113,7 @@ pub(crate) struct BotCore {
 impl std::fmt::Debug for BotCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BotCore")
-            .field("session_id", &self.session_id)
+            .field("ptr", &std::ptr::from_ref(self))
             .finish_non_exhaustive()
     }
 }
@@ -123,18 +121,18 @@ impl std::fmt::Debug for BotCore {
 impl BotCore {
     pub(crate) fn new(
         initial_nick: String,
+        casemap: AtomicCaseMap,
         outbound: Arc<OutboundSink>,
         is_test_transport: bool,
         config: &BotConfig,
     ) -> Arc<Self> {
-        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (shutdown_tx, _) = watch::channel(false);
         let (registered_tx, _) = watch::channel(false);
         Arc::new(Self {
-            session_id,
-            state: RwLock::new(WorldState::new(initial_nick)),
-            users: UserRegistry::new(CaseMap::default()),
-            inboxes: InboxRegistry::default(),
+            state: RwLock::new(WorldState::new(initial_nick, casemap.clone())),
+            users: UserRegistry::new(casemap.clone()),
+            inboxes: InboxRegistry::new(casemap.clone()),
+            casemap,
             outbound,
             is_test_transport,
             shutdown_tx,
@@ -151,7 +149,7 @@ impl BotCore {
     }
 
     pub(crate) fn casemap(&self) -> CaseMap {
-        self.users.casemap()
+        self.casemap.load()
     }
 
     pub(crate) fn disconnect_reason(&self) -> Option<DisconnectReason> {
@@ -207,12 +205,11 @@ impl BotCore {
     ) -> Result<WriteReceipt> {
         self.check_connected()?;
         validate_target(target, "message target")?;
-        let (cmds, cm) = {
+        let cmds = {
             let ws = self.state.read().unwrap();
-            let cmds = build_chat_commands(kind, target, text, &ws, self.max_payload_bytes);
-            (cmds, ws.casemap)
+            build_chat_commands(kind, target, text, &ws, self.max_payload_bytes)
         };
-        Ok(self.outbound.enqueue_batch(Priority::Interactive, cmds, cm))
+        Ok(self.outbound.enqueue_batch(Priority::Interactive, cmds))
     }
 }
 
@@ -228,7 +225,7 @@ pub(crate) struct BotOwner {
 impl std::fmt::Debug for BotOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BotOwner")
-            .field("session_id", &self.core.session_id)
+            .field("core", &Arc::as_ptr(&self.core))
             .finish_non_exhaustive()
     }
 }
@@ -290,12 +287,14 @@ impl Bot {
         let stream = client.stream()?;
         let sender = client.sender();
 
+        let casemap = AtomicCaseMap::default();
         let (outbound, outbound_task) = OutboundSink::new(
             RawTransport::Irc(sender),
             config.outbound_burst,
             config.outbound_window,
+            casemap.clone(),
         );
-        let core = BotCore::new(nick.clone(), outbound, false, &config);
+        let core = BotCore::new(nick.clone(), casemap, outbound, false, &config);
 
         let has_caps = !config.request_caps.is_empty();
         let reg = RegistrationTracker {
@@ -335,7 +334,7 @@ impl Bot {
         init_cmds.push(Command::USER(username, "0".into(), realname));
         let _ = core
             .outbound
-            .enqueue_batch(Priority::Interactive, init_cmds, core.casemap());
+            .enqueue_batch(Priority::Interactive, init_cmds);
 
         bot.wait_for_registration().await?;
 
@@ -380,18 +379,12 @@ impl Bot {
                     let _ = core.outbound.enqueue_one(
                         Priority::Interactive,
                         Command::CAP(None, CapSubCommand::END, None, None),
-                        core.casemap(),
                     );
                     core.mark_registered();
                     return Ok(());
                 }
             }
         }
-    }
-
-    /// Monotonic process-unique connection session ID (`1, 2, 3, ...`).
-    pub fn session_id(&self) -> u64 {
-        self.owner.core.session_id
     }
 
     pub fn nick(&self) -> String {
@@ -500,7 +493,6 @@ impl Bot {
     ) -> Huddle {
         let core = &self.owner.core;
         let dm_users: Vec<Arc<UserTrack>> = guards.iter().map(|g| g.user().track_arc()).collect();
-        let cm = core.casemap();
         let inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
@@ -508,7 +500,6 @@ impl Bot {
                 dm_users,
             },
             caller,
-            cm,
         );
         Huddle::new(
             Arc::clone(core),
@@ -557,7 +548,6 @@ impl Bot {
         }
 
         // Subscribe raw channel inbox BEFORE sending JOIN:
-        let cm = core.casemap();
         let mut inbox = core.inboxes.subscribe(
             Arc::clone(core),
             Filter::Scoped {
@@ -565,13 +555,11 @@ impl Bot {
                 dm_users: Vec::new(),
             },
             Location::caller(),
-            cm,
         );
 
         let _ = core.outbound.enqueue_one(
             Priority::Interactive,
             Command::JOIN(channel.to_owned(), key.map(str::to_owned), None),
-            cm,
         );
 
         let sleep = tokio::time::sleep(timeout);
@@ -593,7 +581,6 @@ impl Bot {
                 Err(Error::BotLeftRoom { .. }) => {
                     // Could happen if a previous `lost_channels` entry existed before our self `JOIN` arrived:
                     // keep waiting until our new `JOIN` + `366` or timeout!
-                    let cm_now = core.casemap();
                     inbox = core.inboxes.subscribe(
                         Arc::clone(core),
                         Filter::Scoped {
@@ -601,7 +588,6 @@ impl Bot {
                             dm_users: Vec::new(),
                         },
                         Location::caller(),
-                        cm_now,
                     );
                     continue;
                 }
@@ -663,11 +649,10 @@ impl Bot {
             fn drop(&mut self) {
                 if let Some(ch) = self.channel.take() {
                     if self.core.check_connected().is_ok() {
-                        let _ = self.core.outbound.enqueue_one(
-                            Priority::Background,
-                            Command::PART(ch, None),
-                            self.core.casemap(),
-                        );
+                        let _ = self
+                            .core
+                            .outbound
+                            .enqueue_one(Priority::Background, Command::PART(ch, None));
                     }
                 }
             }
@@ -723,9 +708,7 @@ impl Bot {
     pub fn send_raw(&self, cmd: impl Into<Command>) -> Result<()> {
         let core = &self.owner.core;
         core.check_connected()?;
-        let _ = core
-            .outbound
-            .enqueue_one(Priority::Interactive, cmd.into(), core.casemap());
+        let _ = core.outbound.enqueue_one(Priority::Interactive, cmd.into());
         Ok(())
     }
 
@@ -734,8 +717,7 @@ impl Bot {
     pub fn inbox(&self) -> Inbox {
         let caller = Location::caller();
         let core = &self.owner.core;
-        core.inboxes
-            .subscribe(Arc::clone(core), Filter::All, caller, core.casemap())
+        core.inboxes.subscribe(Arc::clone(core), Filter::All, caller)
     }
 
     /// Opens an [`Inbox`] receiving all DMs sent to the bot from any user.
@@ -744,7 +726,7 @@ impl Bot {
         let caller = Location::caller();
         let core = &self.owner.core;
         core.inboxes
-            .subscribe(Arc::clone(core), Filter::AllDms, caller, core.casemap())
+            .subscribe(Arc::clone(core), Filter::AllDms, caller)
     }
 
     /// Opens an [`Inbox`] receiving DMs sent to the bot from `users` (matching [`InboxScope::dms_from`]).
@@ -774,19 +756,15 @@ impl Bot {
 
     fn inbox_scope_at(&self, scope: InboxScope, caller: &'static Location<'static>) -> Inbox {
         let core = &self.owner.core;
-        let all_rooms_belong = scope
-            .rooms
-            .iter()
-            .all(|(_, sid)| *sid == core.session_id);
+        let all_rooms_belong = scope.rooms.iter().all(|r| r.belongs_to(core));
         let all_users_belong = scope.dm_users.iter().all(|u| u.belongs_to(core));
-        let rooms: Vec<String> = scope.rooms.into_iter().map(|(r, _)| r).collect();
+        let rooms: Vec<String> = scope.rooms.into_iter().map(Room::into_name).collect();
         let dm_users: Vec<Arc<UserTrack>> = scope.dm_users.iter().map(User::track_arc).collect();
         let filter = Filter::Scoped { rooms, dm_users };
         if !all_rooms_belong || !all_users_belong {
             return Inbox::invalid_session(filter, caller);
         }
-        core.inboxes
-            .subscribe(Arc::clone(core), filter, caller, core.casemap())
+        core.inboxes.subscribe(Arc::clone(core), filter, caller)
     }
 
     pub fn request_shutdown(&self) {
@@ -822,7 +800,7 @@ impl Bot {
         tokio::task::yield_now().await;
 
         // 2. Drain both Interactive and Background queues followed by QUIT:
-        let quit_receipt = core.outbound.enqueue_quit(reason, core.casemap());
+        let quit_receipt = core.outbound.enqueue_quit(reason);
 
         let timeout = core.handshake_timeout;
         if core.is_test_transport {
