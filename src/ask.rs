@@ -13,7 +13,6 @@ use tokio::time::Instant;
 use tracing::Instrument as _;
 
 use crate::casemap::CaseMap;
-use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::error::{Error, Result};
 use crate::exclusive_dm::ExclusiveDm;
 use crate::huddle::Huddle;
@@ -340,32 +339,6 @@ impl AskConfig {
     }
 }
 
-/// Sends `prompt` to any [`Chat`] (such as `&room`, `breakout.room()`, `&mut huddle`, `&mut dm`,
-/// or `&mut generic_chat`) and returns a lazy [`Ask`] future awaiting one reply.
-#[track_caller]
-pub fn ask<'a, C, F, R>(chat: C, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
-where
-    C: Chat + 'a,
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    Ask::from_chat(chat, prompt.into(), matcher)
-}
-
-/// Sends `prompt` to any [`GroupChat`] (such as `&room`, `breakout.room()`, `&mut huddle`, or
-/// `&mut generic_group`) and returns a lazy [`AskMany`] future collecting `0..=N` replies.
-#[track_caller]
-pub fn ask_many<'a, G, F, R>(group: G, prompt: impl Into<Text>, matcher: F) -> AskMany<'a, F, R>
-where
-    G: GroupChat + 'a,
-    F: FnMut(&ChatMessage) -> R + Send + 'a,
-    R: IntoAskMatch + 'a,
-    R::Output: Send + 'a,
-{
-    AskMany::from_group(group, prompt.into(), matcher)
-}
-
 impl Room {
     #[track_caller]
     pub fn ask<'a, F, R>(&'a self, prompt: impl Into<Text>, matcher: F) -> Ask<'a, F, R>
@@ -374,7 +347,7 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        Ask::from_group(self, prompt.into(), matcher)
+        Ask::from_endpoint(Endpoint::Room(self), Location::caller(), prompt.into(), matcher)
     }
 
     /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`TimeoutCtx::user`]
@@ -407,7 +380,7 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        ask_many(self, prompt, matcher)
+        AskMany::from_endpoint(Endpoint::Room(self), Location::caller(), prompt.into(), matcher)
     }
 }
 
@@ -419,7 +392,12 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        Ask::from_group(self, prompt.into(), matcher)
+        Ask::from_endpoint(
+            Endpoint::Huddle(self),
+            Location::caller(),
+            prompt.into(),
+            matcher,
+        )
     }
 
     /// Broadcasts `prompt` to all online huddle members and collects up to one answer per member
@@ -435,7 +413,12 @@ impl Huddle {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        ask_many(self, prompt, matcher)
+        AskMany::from_endpoint(
+            Endpoint::Huddle(self),
+            Location::caller(),
+            prompt.into(),
+            matcher,
+        )
     }
 }
 
@@ -447,7 +430,12 @@ impl ExclusiveDm {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        ask(self, prompt, matcher)
+        Ask::from_endpoint(
+            Endpoint::ExclusiveDm(self),
+            Location::caller(),
+            prompt.into(),
+            matcher,
+        )
     }
 }
 
@@ -464,63 +452,61 @@ impl User {
     }
 }
 
-trait PromptEndpoint: Send + Sync {
-    fn say_text(&self, text: Text) -> Result<()>;
-    fn notice_text(&self, text: Text) -> Result<()>;
-    fn target(&self) -> Target;
-    fn participants(&self) -> Option<Vec<User>>;
-    fn inbox(&mut self) -> InboxRef<'_>;
+enum Endpoint<'a> {
+    Room(&'a Room),
+    ExclusiveDm(&'a mut ExclusiveDm),
+    Huddle(&'a mut Huddle),
+}
+
+impl Endpoint<'_> {
+    fn say_text(&self, text: Text) -> Result<()> {
+        match self {
+            Self::Room(r) => r.say(text),
+            Self::ExclusiveDm(dm) => dm.say(text),
+            Self::Huddle(h) => h.say(text),
+        }
+    }
+
+    fn notice_text(&self, text: Text) -> Result<()> {
+        match self {
+            Self::Room(r) => r.notice(text),
+            Self::ExclusiveDm(dm) => dm.notice(text),
+            Self::Huddle(h) => h.notice(text),
+        }
+    }
+
+    fn target(&self) -> Target {
+        match self {
+            Self::Room(r) => Target::Channel(r.name().to_owned()),
+            Self::ExclusiveDm(_) | Self::Huddle(_) => Target::Dm,
+        }
+    }
+
     fn is_group(&self) -> bool {
-        false
+        matches!(self, Self::Room(_) | Self::Huddle(_))
     }
-    fn group_has_user(&self, _user: &User) -> Option<bool> {
-        None
+
+    fn participants(&self) -> Option<Vec<User>> {
+        match self {
+            Self::Room(_) => None,
+            Self::ExclusiveDm(dm) => Some(vec![dm.user().clone()]),
+            Self::Huddle(h) => Some(h.users()),
+        }
     }
-    fn inbox_for(&mut self, _users: Option<&[User]>) -> InboxRef<'_> {
-        self.inbox()
-    }
-}
 
-macro_rules! impl_endpoint_base {
-    () => {
-        fn say_text(&self, text: Text) -> Result<()> {
-            self.0.say(text)
-        }
-        fn notice_text(&self, text: Text) -> Result<()> {
-            self.0.notice(text)
-        }
-        fn target(&self) -> Target {
-            self.0.target()
-        }
-        fn participants(&self) -> Option<Vec<User>> {
-            self.0.participants()
-        }
-        fn inbox(&mut self) -> InboxRef<'_> {
-            self.0.inbox()
-        }
-    };
-}
-
-struct ChatEndpoint<C>(C);
-
-impl<C: Chat> PromptEndpoint for ChatEndpoint<C> {
-    impl_endpoint_base!();
-}
-
-struct GroupEndpoint<G>(G);
-
-impl<G: GroupChat> PromptEndpoint for GroupEndpoint<G> {
-    impl_endpoint_base!();
-    fn is_group(&self) -> bool {
-        true
-    }
     fn group_has_user(&self, user: &User) -> Option<bool> {
-        Some(self.0.has_user(user))
+        match self {
+            Self::Room(r) => Some(r.has_user(user)),
+            Self::Huddle(h) => Some(h.has_user(user)),
+            Self::ExclusiveDm(_) => None,
+        }
     }
-    fn inbox_for(&mut self, users: Option<&[User]>) -> InboxRef<'_> {
-        match users {
-            Some(us) => self.0.inbox_users(us),
-            None => self.0.inbox(),
+
+    fn borrowed_inbox(&mut self) -> Option<&mut Inbox> {
+        match self {
+            Self::Room(_) => None,
+            Self::ExclusiveDm(dm) => Some(dm.inbox()),
+            Self::Huddle(h) => Some(h.inbox()),
         }
     }
 }
@@ -571,7 +557,7 @@ impl<'a, U, Out> LazyState<'a, U, Out> {
 
 enum AskSource<'a> {
     Endpoint {
-        endpoint: Box<dyn PromptEndpoint + 'a>,
+        endpoint: Endpoint<'a>,
         restricted_users: Option<Vec<User>>,
         caller: &'static Location<'static>,
     },
@@ -589,7 +575,7 @@ struct AskUnstarted<'a, F> {
     matcher: F,
 }
 
-/// Lazy single-answer prompt future returned by [`ask`], [`crate::Room::ask`],
+/// Lazy single-answer prompt future returned by [`crate::Room::ask`],
 /// [`crate::Room::ask_user`], [`User::ask`], [`crate::ExclusiveDm::ask`], and
 /// [`crate::Huddle::ask`].
 ///
@@ -603,33 +589,24 @@ pub struct Ask<'a, F, R: IntoAskMatch> {
 }
 
 impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
-    #[track_caller]
-    pub(crate) fn from_chat<C: Chat + 'a>(chat: C, prompt: Text, matcher: F) -> Self {
+    fn from_endpoint(
+        endpoint: Endpoint<'a>,
+        caller: &'static Location<'static>,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
         Self::new(
             AskSource::Endpoint {
-                endpoint: Box::new(ChatEndpoint(chat)),
+                endpoint,
                 restricted_users: None,
-                caller: Location::caller(),
+                caller,
             },
             prompt,
             matcher,
         )
     }
 
-    #[track_caller]
-    pub(crate) fn from_group<G: GroupChat + 'a>(group: G, prompt: Text, matcher: F) -> Self {
-        Self::new(
-            AskSource::Endpoint {
-                endpoint: Box::new(GroupEndpoint(group)),
-                restricted_users: None,
-                caller: Location::caller(),
-            },
-            prompt,
-            matcher,
-        )
-    }
-
-    pub(crate) fn from_user_dm(
+    fn from_user_dm(
         user: &'a User,
         caller: &'static Location<'static>,
         prompt: Text,
@@ -703,7 +680,7 @@ where
     }
 }
 
-/// Collection of responses returned by [`ask_many`], [`crate::Room::ask_many`], and
+/// Collection of responses returned by [`crate::Room::ask_many`] and
 /// [`crate::Huddle::ask_many`].
 ///
 /// Iterating over `Answers<T>` or `&Answers<T>` yields accepted `(User, T)` pairs in order
@@ -926,7 +903,7 @@ impl<'a, T> IntoIterator for &'a Answers<T> {
 type StopPredicate<'a, O> = Box<dyn FnMut(&Answers<O>) -> bool + Send + 'a>;
 
 struct AskManyUnstarted<'a, F, O> {
-    endpoint: Box<dyn PromptEndpoint + 'a>,
+    endpoint: Endpoint<'a>,
     caller: &'static Location<'static>,
     restricted_users: Option<Vec<User>>,
     cfg: AskConfig,
@@ -937,20 +914,26 @@ struct AskManyUnstarted<'a, F, O> {
     invalid_max_zero: bool,
 }
 
-/// Lazy multi-responder prompt future returned by [`ask_many`], [`crate::Room::ask_many`], and
+type AskManyState<'a, F, O> = LazyState<'a, AskManyUnstarted<'a, F, O>, Result<Answers<O>>>;
+
+/// Lazy multi-responder prompt future returned by [`crate::Room::ask_many`] and
 /// [`crate::Huddle::ask_many`].
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct AskMany<'a, F, R: IntoAskMatch> {
-    state: LazyState<'a, AskManyUnstarted<'a, F, R::Output>, Result<Answers<R::Output>>>,
+    state: AskManyState<'a, F, R::Output>,
 }
 
 impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
-    #[track_caller]
-    pub(crate) fn from_group<G: GroupChat + 'a>(group: G, prompt: Text, matcher: F) -> Self {
+    fn from_endpoint(
+        endpoint: Endpoint<'a>,
+        caller: &'static Location<'static>,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
         Self {
             state: LazyState::new(AskManyUnstarted {
-                endpoint: Box::new(GroupEndpoint(group)),
-                caller: Location::caller(),
+                endpoint,
+                caller,
                 restricted_users: None,
                 cfg: AskConfig::default(),
                 prompt,
@@ -1146,7 +1129,7 @@ fn dedup_users(users: Vec<User>) -> Vec<User> {
     out
 }
 
-fn send_reply_to_msg(endpoint: &dyn PromptEndpoint, is_notice: bool, text: Text) {
+fn send_reply_to_msg(endpoint: &Endpoint<'_>, is_notice: bool, text: Text) {
     if is_notice {
         let _ = endpoint.notice_text(text);
     } else {
@@ -1181,7 +1164,7 @@ fn snapshot_all_departed<T>(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt<'a, F, R>(
-    endpoint: &mut (dyn PromptEndpoint + 'a),
+    mut endpoint: Endpoint<'_>,
     caller: &'static Location<'static>,
     restricted_users: Option<Vec<User>>,
     cfg: AskConfig,
@@ -1222,20 +1205,26 @@ where
     let mut last_terminal: Option<Answer<()>> = None;
 
     let (mut owned_inbox, inbox_core) = {
-        let initial_ref = endpoint.inbox_for(voters.as_deref());
-        if initial_ref.is_invalid_session() {
-            return Err(Error::InvalidInput(
-                "User handle belongs to a different Bot session",
-            ));
-        }
-        let inbox_core = initial_ref.core().cloned();
-        let is_owned = matches!(initial_ref, InboxRef::Owned(_));
-        let owned = match initial_ref {
-            InboxRef::Owned(mut ib) => {
-                ib.set_opened_at(caller);
+        let owned = match &endpoint {
+            Endpoint::Room(r) => {
+                let ib = match voters.as_deref() {
+                    Some(us) => r.inbox_users_at(us, caller),
+                    None => r.inbox_at(caller),
+                };
+                if ib.is_invalid_session() {
+                    return Err(Error::InvalidInput(
+                        "User handle belongs to a different Bot session",
+                    ));
+                }
                 Some(ib)
             }
-            InboxRef::Borrowed(_) => None,
+            Endpoint::ExclusiveDm(_) | Endpoint::Huddle(_) => None,
+        };
+        let inbox_core = match &owned {
+            Some(ib) => ib.core().cloned(),
+            None => endpoint
+                .borrowed_inbox()
+                .and_then(|ib| ib.core().cloned()),
         };
 
         if let Some(ref core) = inbox_core {
@@ -1281,8 +1270,8 @@ where
                 timed_out: false,
             });
         }
-        if !is_owned {
-            endpoint.inbox().clear();
+        if let Some(ib) = endpoint.borrowed_inbox() {
+            ib.clear();
         }
         (owned, inbox_core)
     };
@@ -1341,13 +1330,11 @@ where
 
     loop {
         let step = {
-            let mut borrowed_inbox;
             let active_inbox: &mut Inbox = match &mut owned_inbox {
                 Some(inbox) => inbox,
-                None => {
-                    borrowed_inbox = endpoint.inbox();
-                    &mut borrowed_inbox
-                }
+                None => endpoint
+                    .borrowed_inbox()
+                    .expect("non-Room endpoints always borrow an inbox"),
             };
             let next_warn_at = pending_warnings.front().map(|(at, _)| *at);
             tokio::select! {
@@ -1566,7 +1553,7 @@ where
                             // `PRIVMSG` (RFC 2812 §3.3.2).
                             AskMatchInner::Accept(val, ack) => {
                                 if let Some(ack_msg) = ack {
-                                    send_reply_to_msg(endpoint, msg.is_notice(), ack_msg);
+                                    send_reply_to_msg(&endpoint, msg.is_notice(), ack_msg);
                                 }
                                 answers.record_answer(&msg.sender, val);
                                 if let Some(ref mut pred) = stop_pred {
@@ -1579,7 +1566,7 @@ where
                                 }
                             }
                             AskMatchInner::Reject(feedback) => {
-                                send_reply_to_msg(endpoint, msg.is_notice(), feedback);
+                                send_reply_to_msg(&endpoint, msg.is_notice(), feedback);
                             }
                             AskMatchInner::Ignore => {}
                         }
@@ -1649,12 +1636,12 @@ where
     let res = match source {
         AskSource::Invalid(msg) => return Err(Error::InvalidInput(msg)),
         AskSource::Endpoint {
-            mut endpoint,
+            endpoint,
             restricted_users,
             caller,
         } => {
             run_prompt(
-                endpoint.as_mut(),
+                endpoint,
                 caller,
                 restricted_users,
                 cfg,
@@ -1666,10 +1653,9 @@ where
             .await
         }
         AskSource::UserDm { user, caller } => match user.exclusive_at(caller).await {
-            Ok(dm) => {
-                let mut endpoint = ChatEndpoint(dm);
+            Ok(mut dm) => {
                 run_prompt(
-                    &mut endpoint,
+                    Endpoint::ExclusiveDm(&mut dm),
                     caller,
                     None,
                     cfg,
@@ -1702,7 +1688,7 @@ where
     R::Output: Send + 'a,
 {
     let AskManyUnstarted {
-        mut endpoint,
+        endpoint,
         caller,
         restricted_users,
         cfg,
@@ -1734,7 +1720,7 @@ where
     }
 
     run_prompt(
-        endpoint.as_mut(),
+        endpoint,
         caller,
         restricted_users,
         cfg,

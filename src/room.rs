@@ -6,7 +6,6 @@ use irc::proto::Command;
 use irc_colors::Text;
 
 use crate::casemap::CaseMap;
-use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
@@ -384,74 +383,6 @@ impl Room {
         self.core
             .inboxes
             .subscribe(Arc::clone(&self.core), filter, caller)
-    }
-}
-
-impl Chat for Room {
-    fn say(&self, text: impl Into<Text>) -> Result<()> {
-        Room::say(self, text)
-    }
-
-    fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        Room::notice(self, text)
-    }
-
-    fn action(&self, text: impl Into<Text>) -> Result<()> {
-        Room::action(self, text)
-    }
-
-    #[track_caller]
-    fn inbox(&mut self) -> InboxRef<'_> {
-        InboxRef::Owned(Room::inbox(self))
-    }
-
-    fn target(&self) -> Target {
-        Target::Channel(self.channel_name.clone())
-    }
-}
-
-impl GroupChat for Room {
-    fn has_user(&self, user: &User) -> bool {
-        Room::has_user(self, user)
-    }
-
-    #[track_caller]
-    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
-        InboxRef::Owned(self.inbox_users_at(users, Location::caller()))
-    }
-}
-
-impl Chat for &Room {
-    fn say(&self, text: impl Into<Text>) -> Result<()> {
-        Room::say(self, text)
-    }
-
-    fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        Room::notice(self, text)
-    }
-
-    fn action(&self, text: impl Into<Text>) -> Result<()> {
-        Room::action(self, text)
-    }
-
-    #[track_caller]
-    fn inbox(&mut self) -> InboxRef<'_> {
-        InboxRef::Owned(Room::inbox(self))
-    }
-
-    fn target(&self) -> Target {
-        Target::Channel(self.channel_name.clone())
-    }
-}
-
-impl GroupChat for &Room {
-    fn has_user(&self, user: &User) -> bool {
-        Room::has_user(self, user)
-    }
-
-    #[track_caller]
-    fn inbox_users(&mut self, users: &[User]) -> InboxRef<'_> {
-        InboxRef::Owned(self.inbox_users_at(users, Location::caller()))
     }
 }
 

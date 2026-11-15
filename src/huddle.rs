@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
 
-use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::exclusive_dm::DmLease;
 use crate::inbox::{Filter, Inbox, OnChatHook};
-use crate::message::{ChatMessage, Target};
+use crate::message::ChatMessage;
 use crate::outbound::OutboundChatKind;
 use crate::user::{User, UserTrack};
 
@@ -146,38 +145,6 @@ impl Huddle {
 
     pub fn inbox(&mut self) -> &mut Inbox {
         &mut self.inbox
-    }
-}
-
-impl Chat for Huddle {
-    fn say(&self, text: impl Into<Text>) -> Result<()> {
-        Huddle::say(self, text)
-    }
-
-    fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        Huddle::notice(self, text)
-    }
-
-    fn action(&self, text: impl Into<Text>) -> Result<()> {
-        Huddle::action(self, text)
-    }
-
-    fn inbox(&mut self) -> InboxRef<'_> {
-        InboxRef::Borrowed(&mut self.inbox)
-    }
-
-    fn target(&self) -> Target {
-        Target::Dm
-    }
-
-    fn participants(&self) -> Option<Vec<User>> {
-        Some(self.users())
-    }
-}
-
-impl GroupChat for Huddle {
-    fn has_user(&self, user: &User) -> bool {
-        Huddle::has_user(self, user)
     }
 }
 

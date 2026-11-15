@@ -66,7 +66,6 @@ mod ask;
 mod bot;
 mod breakout;
 mod casemap;
-mod chat;
 mod core;
 mod error;
 mod exclusive_dm;
@@ -91,19 +90,17 @@ pub mod fmt {
 
 pub mod prelude {
     pub use crate::{
-        ask, ask_many, fmt::Colorize as _, irc_format, Answer, Answers, AskConfig, AskMatch, Bot,
-        Breakout, Chat, ChatMessage, Error, Event, ExclusiveDm, GameFutureExt as _, GroupChat,
-        Huddle, Inbox, InboxRef, InboxScope, MessageKind, ModerationGuard, Outcome, Result, Room,
-        Text, User, UserId,
+        fmt::Colorize as _, irc_format, Answer, Answers, AskConfig, AskMatch, Bot, Breakout,
+        ChatMessage, Error, Event, ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope,
+        MessageKind, ModerationGuard, Outcome, Result, Room, Text, User, UserId,
     };
 }
 
 pub use crate::{
-    ask::{ask, ask_many, Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch, TimeoutCtx},
+    ask::{Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch, TimeoutCtx},
     bot::{Bot, BotConfig, InboxScope},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
-    chat::{Chat, GroupChat, InboxRef},
     error::{DisconnectReason, Error, Result},
     exclusive_dm::ExclusiveDm,
     future::{race_all, GameFutureExt, Outcome},
@@ -132,7 +129,6 @@ const _: () = {
     assert_send_sync_debug::<ExclusiveDm>();
     assert_send_sync_debug::<Huddle>();
     assert_send_sync_debug::<Inbox>();
-    assert_send_sync_debug::<InboxRef<'static>>();
     assert_send_sync_debug::<Answer<()>>();
     assert_send_sync_debug::<Answers<()>>();
     assert_send_sync_debug::<AskMatch<()>>();

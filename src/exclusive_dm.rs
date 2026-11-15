@@ -9,11 +9,9 @@ use irc_colors::Text;
 use tokio::sync::OwnedMutexGuard;
 use tracing::Instrument as _;
 
-use crate::chat::{Chat, InboxRef};
 use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
-use crate::message::Target;
 use crate::user::{User, UserStatus, UserTrack};
 
 /// Held lock on a [`User`]'s interactive DM prompt slot (`UserTrack::dm_mutex`).
@@ -127,32 +125,6 @@ impl User {
             .instrument(span)
             .await?;
         Ok(ExclusiveDm::from_lease(core, lease, caller))
-    }
-}
-
-impl Chat for ExclusiveDm {
-    fn say(&self, text: impl Into<Text>) -> Result<()> {
-        ExclusiveDm::say(self, text)
-    }
-
-    fn notice(&self, text: impl Into<Text>) -> Result<()> {
-        ExclusiveDm::notice(self, text)
-    }
-
-    fn action(&self, text: impl Into<Text>) -> Result<()> {
-        ExclusiveDm::action(self, text)
-    }
-
-    fn inbox(&mut self) -> InboxRef<'_> {
-        InboxRef::Borrowed(&mut self.inbox)
-    }
-
-    fn target(&self) -> Target {
-        Target::Dm
-    }
-
-    fn participants(&self) -> Option<Vec<User>> {
-        Some(vec![self.user().clone()])
     }
 }
 

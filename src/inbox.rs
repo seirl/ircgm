@@ -686,16 +686,6 @@ impl Inbox {
         &self.scope_label
     }
 
-    pub(crate) fn set_opened_at(&mut self, opened_at: &'static Location<'static>) {
-        self.opened_at = opened_at;
-        if let InboxSub::Active { core, slot_id, .. } = &self.sub {
-            let mut inner = core.inboxes.inner.lock().unwrap();
-            if let Some(slot) = inner.slots.get_mut(slot_id) {
-                slot.opened_at = opened_at;
-            }
-        }
-    }
-
     pub(crate) fn disconnected_bot_dropped(
         filter: Filter,
         opened_at: &'static Location<'static>,
