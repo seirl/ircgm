@@ -4,7 +4,7 @@ use futures::future::try_join_all;
 use irc::proto::Command;
 use ircgm::prelude::*;
 use ircgm::testing::test_harness;
-use ircgm::{DisconnectReason, Target};
+use ircgm::DisconnectReason;
 
 #[tokio::test(start_paused = true)]
 async fn ask_match_reject_warn_remaining_clear_warnings_and_closure_inference() {
@@ -298,7 +298,7 @@ async fn ask_single_timer_and_combinator_table() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
+async fn room_ask_user_nick_tracking_timeout_and_part_kick_answer() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#r", &["Alice", "Bob", "Cara"]);
     server.settle().await;
@@ -309,11 +309,7 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     let room = bot.room("#r").unwrap();
     let turn_cfg = AskConfig::new()
         .reply_timeout(Duration::from_secs(30))
-        .timeout_message_fn(|ctx| {
-        assert_eq!(ctx.target, &Target::Channel("#r".into()));
-        let u = ctx.user.expect("room.ask_user sets TimeoutCtx::user");
-        format!("{} took too long (30s)!", u.nick())
-    });
+        .timeout_message("Took too long (30s)!");
 
     let r_turn = room.clone();
     let a_turn = alice.clone();
@@ -337,9 +333,10 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     server.advance(Duration::from_secs(30)).await;
     let outcome = turn_task.await.unwrap().unwrap();
     assert_eq!(outcome, Answer::TimedOut);
+    assert_eq!(alice.nick(), "Alice2");
     assert_eq!(
         server.take_messages_to("#r"),
-        vec!["Alice2 took too long (30s)!"]
+        vec!["Took too long (30s)!"]
     );
 
     let r_part = room.clone();

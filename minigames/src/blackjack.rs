@@ -7,7 +7,7 @@
 //!    `stand` (`30s` per decision):
 //!    - Aces count as `11` or `1` automatically to avoid busting when possible.
 //!    - Exceeding `21` busts immediately; taking longer than `30s` auto-stands (calling out the
-//!      player's live `/nick` via [`ircgm::TimeoutCtx`]); leaving or getting kicked mid-hand folds cleanly.
+//!      player's live `/nick`); leaving or getting kicked mid-hand folds cleanly.
 //! 3. Once all players finish, the dealer reveals its hole card, hits until `17+`, and settles
 //!    every surviving hand (`WIN`, `PUSH`, or `LOSE`).
 //!
@@ -18,10 +18,9 @@
 //! - **Timed lobby seat collection ([`ircgm::GameFutureExt::run_for`]):** Runs a `20s` join loop
 //!   that exits early at 4 players with zero `Ok::<_, Error>(())` turbofish ceremony.
 //! - **Fault-isolated player turns ([`Answer`]):** Default [`ircgm::Ask`] awaiting resolves to
-//!   `Result<Answer<Move>>`, distinguishing [`Answer::Ok`], [`Answer::TimedOut`] (auto-stand), and
-//!   [`Answer::Left`] (`PART` / `KICK` / `QUIT` mid-hand folds cleanly without aborting the table).
-//! - **Live `/nick`-aware timeout messages ([`ircgm::TimeoutCtx`]):** Renders each player's *current*
-//!   nickname if they renamed mid-turn before their `30s` clock expired.
+//!   `Result<Answer<Move>>`, distinguishing [`Answer::Ok`], [`Answer::TimedOut`] (auto-stand with
+//!   live `/nick` callout), and [`Answer::Left`] (`PART` / `KICK` / `QUIT` mid-hand folds cleanly
+//!   without aborting the table).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -74,19 +73,14 @@ pub async fn run_round_with_shoe(
     players: &[User],
     mut shoe: VecDeque<u8>,
 ) -> Result<()> {
-    let turn_cfg = AskConfig::new()
-        .reply_timeout(Duration::from_secs(30))
-        .timeout_message_fn(|ctx| match ctx.user {
-            Some(u) => irc_format!("{}: ⏳ too slow, auto-standing!", u.nick().bold().yellow()),
-            None => "⏳ Time's up!".yellow(),
-        });
+    let turn_cfg = AskConfig::new().reply_timeout(Duration::from_secs(30));
 
     room.ask(
         "Seated players: anyone type `!deal` to cut the deck!",
         |m| m.is_cmd("!deal").then_some(()),
     )
     .from_users(players)
-    .config(&turn_cfg)
+    .config(turn_cfg.clone().timeout_message("⏳ Time's up!".yellow()))
     .await?
     .required()?;
 
@@ -139,7 +133,15 @@ pub async fn run_round_with_shoe(
                         hand_value(&cards),
                     ))?;
                 }
-                Answer::Ok(Move::Stand) | Answer::TimedOut => {
+                Answer::Ok(Move::Stand) => {
+                    standing_hands.push((player.clone(), total));
+                    break;
+                }
+                Answer::TimedOut => {
+                    room.say(irc_format!(
+                        "{}: ⏳ too slow, auto-standing!",
+                        player.nick().bold().yellow(),
+                    ))?;
                     standing_hands.push((player.clone(), total));
                     break;
                 }

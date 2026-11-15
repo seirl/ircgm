@@ -5,7 +5,7 @@
 //!   [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
 //! - [`Ask`], [`AskMany`], and [`AskConfig`] provide ergonomic prompts with reply clocks,
 //!   inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations, countdown
-//!   warnings, per-player timeout callouts, and explicit [`Answer`] outcomes by default.
+//!   warnings, timeout messages, and explicit [`Answer`] outcomes by default.
 //! - [`GameFutureExt`] composes any prompt or multi-step `async fn` with `.until()`, `.or_until()`,
 //!   `.with_timeout()`, `.with_deadline()`, `.run_for()`, and `.run_until_deadline()`.
 //!
@@ -97,7 +97,7 @@ pub mod prelude {
 }
 
 pub use crate::{
-    ask::{Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch, TimeoutCtx},
+    ask::{Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch},
     bot::{Bot, BotConfig, InboxScope},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},

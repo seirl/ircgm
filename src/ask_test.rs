@@ -123,42 +123,13 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
     assert_eq!(warns[0].0, now + Duration::from_secs(10));
 }
 
-#[tokio::test]
-async fn timeout_handler_renders_static_and_dynamic_messages() {
-    let (bot, _server) = test_harness("gm");
-    let alice = bot.user("Alice").unwrap();
-    let target = Target::Channel("#blackjack".into());
-
-    let ctx = TimeoutCtx {
-        target: &target,
-        user: Some(&alice),
-    };
-
+#[test]
+fn timeout_message_can_be_configured_and_cleared() {
     let stat = AskConfig::new().timeout_message("Time's up!");
-    assert_eq!(
-        stat.timeout_handler.as_ref().unwrap().render(&ctx).plain(),
-        "Time's up!"
-    );
+    assert_eq!(stat.timeout_message.as_ref().unwrap().plain(), "Time's up!");
 
-    let dyn_cfg = AskConfig::new().timeout_message_fn(|c| {
-        format!(
-            "{} timed out in {:?}",
-            c.user.map(User::nick).unwrap_or_default(),
-            c.target
-        )
-    });
-    assert_eq!(
-        dyn_cfg
-            .timeout_handler
-            .as_ref()
-            .unwrap()
-            .render(&ctx)
-            .plain(),
-        "Alice timed out in Channel(\"#blackjack\")"
-    );
-
-    let cleared = dyn_cfg.clear_warnings().no_timeout_message();
-    assert!(cleared.timeout_handler.is_none());
+    let cleared = stat.clear_warnings().no_timeout_message();
+    assert!(cleared.timeout_message.is_none());
 }
 
 #[tokio::test]
@@ -359,15 +330,8 @@ async fn ask_many_from_users_locks_in_deduplicates_warns_and_finishes_early_on_d
     let answers = poll_task.await.unwrap().unwrap();
     assert_eq!(answers.len(), 2);
     assert_eq!(answers.get(&alice), Some(&"!ready".to_owned()));
-    let per_user = answers.into_per_user();
-    assert_eq!(per_user.len(), 3);
-    assert_eq!(per_user[0], (alice, Answer::Ok("!ready".into())));
-    assert_eq!(per_user[1], (bob, Answer::Ok("!ready".into())));
-    assert_eq!(per_user[2].0, carol);
-    assert!(matches!(
-        &per_user[2].1,
-        Answer::Left { nick, reason } if nick == "carol" && reason.as_deref() == Some("gtg")
-    ));
+    assert_eq!(answers.get(&bob), Some(&"!ready".to_owned()));
+    assert!(!answers.contains_user(&carol));
     assert!(server.take_messages_to("#town").is_empty());
 }
 
@@ -412,10 +376,7 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
             .config(
                 AskConfig::new()
                     .reply_timeout(Duration::from_secs(10))
-                    .timeout_message_fn(|ctx| match ctx.user {
-                        Some(u) => Text::from(format!("{} didn't vote!", u.nick())),
-                        None => Text::from("Multiple non-voters!"),
-                    }),
+                    .timeout_message("Voting closed!"),
             )
             .await
         }
@@ -444,11 +405,12 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
     assert!(!poll_task.is_finished());
 
     server.advance(Duration::from_secs(10)).await;
-    let per_user = poll_task.await.unwrap().unwrap().into_per_user();
-    assert_eq!(per_user[0], (alice.clone(), Answer::Ok("carol".into())));
-    assert_eq!(per_user[1], (bob.clone(), Answer::Ok("carol".into())));
-    assert_eq!(per_user[2], (carol.clone(), Answer::TimedOut));
-    assert_eq!(server.take_messages_to("#town"), vec!["carol didn't vote!"]);
+    let answers = poll_task.await.unwrap().unwrap();
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers.get(&alice), Some(&"carol".to_owned()));
+    assert_eq!(answers.get(&bob), Some(&"carol".to_owned()));
+    assert!(!answers.contains_user(&carol));
+    assert_eq!(server.take_messages_to("#town"), vec!["Voting closed!"]);
 
     // 3. Open `room.ask_many` welcomes newcomers joining mid-prompt, handles `!join` / `!leave`
     // via `bool` + `allow_change(true)`, evicts `PART`ed users, and stops on `stop_when`:

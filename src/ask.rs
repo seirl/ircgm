@@ -1,6 +1,5 @@
 use std::borrow::Borrow;
 use std::collections::{HashSet, VecDeque};
-use std::fmt;
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
@@ -205,15 +204,6 @@ impl<T> Answer<T> {
     }
 }
 
-/// Context passed to [`AskConfig::timeout_message_fn`] when a prompt's reply timer expires.
-pub struct TimeoutCtx<'a> {
-    /// Where the prompt was sent: `Target::Channel("#blackjack")` or `Target::Dm`.
-    pub target: &'a Target,
-    /// The single remaining player being waited on (`Some(user)` when waiting on one responder;
-    /// `None` when waiting on an open room or multiple unanswered responders).
-    pub user: Option<&'a User>,
-}
-
 pub(crate) const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug)]
@@ -233,36 +223,12 @@ impl TimeLimit {
     }
 }
 
-#[derive(Clone)]
-pub(crate) enum TimeoutHandler {
-    Static(Text),
-    Dynamic(Arc<dyn Fn(&TimeoutCtx<'_>) -> Text + Send + Sync + 'static>),
-}
-
-impl TimeoutHandler {
-    fn render(&self, ctx: &TimeoutCtx<'_>) -> Text {
-        match self {
-            TimeoutHandler::Static(t) => t.clone(),
-            TimeoutHandler::Dynamic(f) => f(ctx),
-        }
-    }
-}
-
-impl fmt::Debug for TimeoutHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TimeoutHandler::Static(t) => f.debug_tuple("Static").field(t).finish(),
-            TimeoutHandler::Dynamic(_) => f.write_str("Dynamic(<fn>)"),
-        }
-    }
-}
-
 /// Prompt configuration passed to [`Ask::config`] and [`AskMany::config`].
 #[derive(Clone, Debug)]
 pub struct AskConfig {
     time_limit: TimeLimit,
     pub(crate) warnings: Vec<(Duration, Text)>,
-    pub(crate) timeout_handler: Option<TimeoutHandler>,
+    pub(crate) timeout_message: Option<Text>,
     pub(crate) ignore_commands: bool,
     pub(crate) accept_notices: bool,
 }
@@ -272,7 +238,7 @@ impl Default for AskConfig {
         Self {
             time_limit: TimeLimit::Duration(DEFAULT_REPLY_TIMEOUT),
             warnings: Vec::new(),
-            timeout_handler: None,
+            timeout_message: None,
             ignore_commands: false,
             accept_notices: false,
         }
@@ -320,21 +286,12 @@ impl AskConfig {
     }
 
     pub fn timeout_message(mut self, msg: impl Into<Text>) -> Self {
-        self.timeout_handler = Some(TimeoutHandler::Static(msg.into()));
-        self
-    }
-
-    pub fn timeout_message_fn<F, M>(mut self, f: F) -> Self
-    where
-        F: Fn(&TimeoutCtx<'_>) -> M + Send + Sync + 'static,
-        M: Into<Text>,
-    {
-        self.timeout_handler = Some(TimeoutHandler::Dynamic(Arc::new(move |ctx| f(ctx).into())));
+        self.timeout_message = Some(msg.into());
         self
     }
 
     pub fn no_timeout_message(mut self) -> Self {
-        self.timeout_handler = None;
+        self.timeout_message = None;
         self
     }
 }
@@ -347,11 +304,15 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        Ask::from_endpoint(Endpoint::Room(self), Location::caller(), prompt.into(), matcher)
+        Ask::from_endpoint(
+            Endpoint::Room(self),
+            Location::caller(),
+            prompt.into(),
+            matcher,
+        )
     }
 
-    /// Shorthand for `self.ask(prompt, matcher).from_user(user)` (sets [`TimeoutCtx::user`]
-    /// to `Some(user)`).
+    /// Shorthand for `self.ask(prompt, matcher).from_user(user)`.
     #[track_caller]
     pub fn ask_user<'a, F, R>(
         &'a self,
@@ -380,7 +341,12 @@ impl Room {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
-        AskMany::from_endpoint(Endpoint::Room(self), Location::caller(), prompt.into(), matcher)
+        AskMany::from_endpoint(
+            Endpoint::Room(self),
+            Location::caller(),
+            prompt.into(),
+            matcher,
+        )
     }
 }
 
@@ -511,6 +477,182 @@ impl Endpoint<'_> {
     }
 }
 
+/// Collection of accepted `(User, T)` responses returned by [`crate::Room::ask_many`] and
+/// [`crate::Huddle::ask_many`], ordered by first accepted response.
+#[derive(Clone, Debug)]
+pub struct Answers<T> {
+    entries: Vec<(User, T)>,
+}
+
+impl<T> Default for Answers<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> Answers<T> {
+    fn has_answered(&self, uid: UserId) -> bool {
+        self.entries.iter().any(|(u, _)| u.id() == uid)
+    }
+
+    fn record(&mut self, user: &User, val: T) {
+        if let Some((_, slot)) = self.entries.iter_mut().find(|(u, _)| u.id() == user.id()) {
+            *slot = val;
+        } else {
+            self.entries.push((user.clone(), val));
+        }
+    }
+
+    fn evict(&mut self, uid: UserId) -> bool {
+        let Some(idx) = self.entries.iter().position(|(u, _)| u.id() == uid) else {
+            return false;
+        };
+        self.entries.remove(idx);
+        true
+    }
+
+    /// Number of accepted answers currently stored.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if no accepted answers are stored.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns `true` if `user` has an accepted answer.
+    pub fn contains_user(&self, user: &User) -> bool {
+        self.has_answered(user.id())
+    }
+
+    /// Borrows `user`'s accepted answer, if any.
+    pub fn get(&self, user: &User) -> Option<&T> {
+        self.entries
+            .iter()
+            .find(|(u, _)| u.id() == user.id())
+            .map(|(_, v)| v)
+    }
+
+    /// Iterates over accepted `(&User, &T)` pairs in order.
+    pub fn iter(&self) -> AnswersIter<'_, T> {
+        AnswersIter(self.entries.iter())
+    }
+
+    /// Iterates over every [`User`] who submitted an accepted answer.
+    pub fn users(&self) -> impl Iterator<Item = &User> {
+        self.iter().map(|(u, _)| u)
+    }
+
+    /// Iterates over accepted answer values in order.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.iter().map(|(_, v)| v)
+    }
+}
+
+/// Borrowing iterator over accepted `(&User, &T)` pairs in [`Answers`].
+pub struct AnswersIter<'a, T>(std::slice::Iter<'a, (User, T)>);
+
+impl<'a, T> Iterator for AnswersIter<'a, T> {
+    type Item = (&'a User, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(u, v)| (u, v))
+    }
+}
+
+impl<T> IntoIterator for Answers<T> {
+    type Item = (User, T);
+    type IntoIter = std::vec::IntoIter<(User, T)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Answers<T> {
+    type Item = (&'a User, &'a T);
+    type IntoIter = AnswersIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+type StopPredicate<'a, O> = Box<dyn FnMut(&Answers<O>) -> bool + Send + 'a>;
+
+enum PromptSource<'a> {
+    Endpoint(Endpoint<'a>),
+    UserDm(&'a User),
+}
+
+struct PromptParams<'a, F, O> {
+    caller: &'static Location<'static>,
+    restricted_users: Option<Vec<User>>,
+    cfg: AskConfig,
+    prompt: Text,
+    matcher: F,
+    allow_change: bool,
+    stop_pred: Option<StopPredicate<'a, O>>,
+}
+
+struct PromptSpec<'a, F, O> {
+    source: PromptSource<'a>,
+    params: PromptParams<'a, F, O>,
+    invalid_arg: Option<&'static str>,
+}
+
+impl<'a, F, O> PromptSpec<'a, F, O> {
+    fn new(
+        source: PromptSource<'a>,
+        caller: &'static Location<'static>,
+        prompt: Text,
+        matcher: F,
+    ) -> Self {
+        Self {
+            source,
+            params: PromptParams {
+                caller,
+                restricted_users: None,
+                cfg: AskConfig::default(),
+                prompt,
+                matcher,
+                allow_change: false,
+                stop_pred: None,
+            },
+            invalid_arg: None,
+        }
+    }
+
+    fn set_from_users(&mut self, users: Vec<User>) {
+        match &self.source {
+            PromptSource::Endpoint(ep) if ep.is_group() => {
+                self.params.restricted_users = Some(users);
+            }
+            PromptSource::Endpoint(_) | PromptSource::UserDm(_) => {
+                self.invalid_arg = Some("from_user / from_users requires a group prompt");
+            }
+        }
+    }
+
+    fn make_span(&self, name: &'static str) -> tracing::Span {
+        let target = match &self.source {
+            PromptSource::Endpoint(ep) => match ep.target() {
+                Target::Channel(ch) => ch,
+                Target::Dm => "DM".to_owned(),
+            },
+            PromptSource::UserDm(_) => "DM".to_owned(),
+        };
+        let timeout_ms = match self.params.cfg.time_limit {
+            TimeLimit::Duration(d) => Some(d.as_millis() as u64),
+            TimeLimit::Deadline(_) | TimeLimit::None => None,
+        };
+        tracing::debug_span!("ircgm::prompt", kind = name, %target, timeout_ms)
+    }
+}
+
 enum LazyState<'a, U, Out> {
     Unstarted(Box<U>),
     Running(Pin<Box<dyn Future<Output = Out> + Send + 'a>>),
@@ -555,25 +697,8 @@ impl<'a, U, Out> LazyState<'a, U, Out> {
     }
 }
 
-enum AskSource<'a> {
-    Endpoint {
-        endpoint: Endpoint<'a>,
-        restricted_users: Option<Vec<User>>,
-        caller: &'static Location<'static>,
-    },
-    UserDm {
-        user: &'a User,
-        caller: &'static Location<'static>,
-    },
-    Invalid(&'static str),
-}
-
-struct AskUnstarted<'a, F> {
-    cfg: AskConfig,
-    source: AskSource<'a>,
-    prompt: Text,
-    matcher: F,
-}
+type AskState<'a, F, O> = LazyState<'a, PromptSpec<'a, F, O>, Result<Answer<O>>>;
+type AskManyState<'a, F, O> = LazyState<'a, PromptSpec<'a, F, O>, Result<Answers<O>>>;
 
 /// Lazy single-answer prompt future returned by [`crate::Room::ask`],
 /// [`crate::Room::ask_user`], [`User::ask`], [`crate::ExclusiveDm::ask`], and
@@ -585,7 +710,7 @@ struct AskUnstarted<'a, F> {
 /// promote non-answers into `Err(Error::...)`.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Ask<'a, F, R: IntoAskMatch> {
-    state: LazyState<'a, AskUnstarted<'a, F>, Result<Answer<R::Output>>>,
+    state: AskState<'a, F, R::Output>,
 }
 
 impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
@@ -595,15 +720,14 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
         prompt: Text,
         matcher: F,
     ) -> Self {
-        Self::new(
-            AskSource::Endpoint {
-                endpoint,
-                restricted_users: None,
+        Self {
+            state: LazyState::new(PromptSpec::new(
+                PromptSource::Endpoint(endpoint),
                 caller,
-            },
-            prompt,
-            matcher,
-        )
+                prompt,
+                matcher,
+            )),
+        }
     }
 
     fn from_user_dm(
@@ -612,22 +736,17 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
         prompt: Text,
         matcher: F,
     ) -> Self {
-        Self::new(AskSource::UserDm { user, caller }, prompt, matcher)
-    }
-
-    fn new(source: AskSource<'a>, prompt: Text, matcher: F) -> Self {
         Self {
-            state: LazyState::new(AskUnstarted {
-                cfg: AskConfig::default(),
-                source,
+            state: LazyState::new(PromptSpec::new(
+                PromptSource::UserDm(user),
+                caller,
                 prompt,
                 matcher,
-            }),
+            )),
         }
     }
 
-    /// Restricts a group prompt so only `user` may answer (and sets [`TimeoutCtx::user`] to
-    /// `Some(user)`).
+    /// Restricts a group prompt so only `user` may answer.
     pub fn from_user(self, user: &User) -> Self {
         self.from_users(std::iter::once(user))
     }
@@ -640,26 +759,14 @@ impl<'a, F, R: IntoAskMatch> Ask<'a, F, R> {
         U: Borrow<User>,
     {
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
-        self.state.map_unstarted(|u| match &mut u.source {
-            AskSource::Endpoint {
-                endpoint,
-                restricted_users,
-                ..
-            } if endpoint.is_group() => {
-                *restricted_users = Some(collected);
-            }
-            AskSource::Endpoint { .. } | AskSource::UserDm { .. } => {
-                u.source = AskSource::Invalid("from_user / from_users requires a group prompt");
-            }
-            AskSource::Invalid(_) => {}
-        });
+        self.state.map_unstarted(|s| s.set_from_users(collected));
         self
     }
 
     /// Applies an [`AskConfig`] (by value or `&AskConfig`) to this prompt.
     pub fn config(mut self, cfg: impl Borrow<AskConfig>) -> Self {
         let cloned = cfg.borrow().clone();
-        self.state.map_unstarted(|u| u.cfg = cloned);
+        self.state.map_unstarted(|s| s.params.cfg = cloned);
         self
     }
 }
@@ -673,248 +780,14 @@ where
     type Output = Result<Answer<R::Output>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().state.poll_with(cx, |u| {
-            let span = make_ask_span(&u.cfg, &u.source);
-            run_ask(u.cfg, u.source, u.prompt, u.matcher).instrument(span)
+        self.get_mut().state.poll_with(cx, |mut spec| {
+            spec.params.stop_pred =
+                Some(Box::new(|answers: &Answers<R::Output>| !answers.is_empty()));
+            let span = spec.make_span("ask");
+            run_ask(spec).instrument(span)
         })
     }
 }
-
-/// Collection of responses returned by [`crate::Room::ask_many`] and
-/// [`crate::Huddle::ask_many`].
-///
-/// Iterating over `Answers<T>` or `&Answers<T>` yields accepted `(User, T)` pairs in order
-/// (input order for closed rosters via [`AskMany::from_users`] or [`crate::Huddle::ask_many`], and
-/// first-response order for open [`crate::Room::ask_many`] prompts). For closed-roster prompts,
-/// [`Answers::answer_for`] and [`Answers::into_per_user`] also inspect per-player
-/// [`Answer::TimedOut`], [`Answer::Left`], and [`Answer::Unreachable`] outcomes.
-#[derive(Clone, Debug)]
-pub struct Answers<T> {
-    entries: Vec<(User, Option<Answer<T>>)>,
-}
-
-impl<T> Default for Answers<T> {
-    fn default() -> Self {
-        Self::new_open()
-    }
-}
-
-impl<T> Answers<T> {
-    fn new_open() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn new_closed(voters: Vec<User>) -> Self {
-        Self {
-            entries: dedup_users(voters).into_iter().map(|u| (u, None)).collect(),
-        }
-    }
-
-    fn find_idx(&self, uid: UserId) -> Option<usize> {
-        self.entries.iter().position(|(u, _)| u.id() == uid)
-    }
-
-    fn record_answer(&mut self, user: &User, val: T) {
-        if let Some(idx) = self.find_idx(user.id()) {
-            self.entries[idx].1 = Some(Answer::Ok(val));
-        } else {
-            self.entries.push((user.clone(), Some(Answer::Ok(val))));
-        }
-    }
-
-    fn has_answered(&self, uid: UserId) -> bool {
-        self.find_idx(uid)
-            .is_some_and(|idx| matches!(self.entries[idx].1, Some(Answer::Ok(_))))
-    }
-
-    fn record_left_if_pending(
-        &mut self,
-        idx: usize,
-        nick: String,
-        reason: Option<String>,
-        last_terminal: &mut Option<Answer<()>>,
-    ) {
-        if self.entries[idx].1.is_none() {
-            *last_terminal = Some(Answer::Left {
-                nick: nick.clone(),
-                reason: reason.clone(),
-            });
-            self.entries[idx].1 = Some(Answer::Left { nick, reason });
-        }
-    }
-
-    fn record_unreachable_if_pending(
-        &mut self,
-        idx: usize,
-        nick: String,
-        code: u16,
-        message: String,
-        last_terminal: &mut Option<Answer<()>>,
-    ) {
-        if self.entries[idx].1.is_none() {
-            *last_terminal = Some(Answer::Unreachable {
-                nick: nick.clone(),
-                code,
-                message: message.clone(),
-            });
-            self.entries[idx].1 = Some(Answer::Unreachable {
-                nick,
-                code,
-                message,
-            });
-        }
-    }
-
-    fn evict_open(&mut self, uid: UserId) -> bool {
-        let Some(idx) = self.find_idx(uid) else {
-            return false;
-        };
-        self.entries.remove(idx);
-        true
-    }
-
-    /// Number of accepted answers currently stored.
-    pub fn len(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|(_, a)| matches!(a, Some(Answer::Ok(_))))
-            .count()
-    }
-
-    /// Returns `true` if no accepted answers are stored.
-    pub fn is_empty(&self) -> bool {
-        !self
-            .entries
-            .iter()
-            .any(|(_, a)| matches!(a, Some(Answer::Ok(_))))
-    }
-
-    /// Returns `true` if `user` has an accepted answer.
-    pub fn contains_user(&self, user: &User) -> bool {
-        self.get(user).is_some()
-    }
-
-    /// Borrows `user`'s accepted answer, if any.
-    pub fn get(&self, user: &User) -> Option<&T> {
-        let idx = self.find_idx(user.id())?;
-        self.entries[idx].1.as_ref()?.as_ok()
-    }
-
-    /// Iterates over accepted `(&User, &T)` pairs in order.
-    pub fn iter(&self) -> AnswersIter<'_, T> {
-        AnswersIter(self.entries.iter())
-    }
-
-    /// Iterates over every [`User`] who submitted an accepted answer.
-    pub fn users(&self) -> impl Iterator<Item = &User> {
-        self.iter().map(|(u, _)| u)
-    }
-
-    /// Iterates over accepted answer values in order.
-    pub fn values(&self) -> impl Iterator<Item = &T> {
-        self.iter().map(|(_, v)| v)
-    }
-
-    /// Borrows `user`'s full [`Answer`] outcome (`Ok`, `TimedOut`, `Left`, or `Unreachable`) when
-    /// `user` was part of this prompt's roster or submitted an answer.
-    pub fn answer_for(&self, user: &User) -> Option<Answer<&T>> {
-        let idx = self.find_idx(user.id())?;
-        Some(match &self.entries[idx].1 {
-            Some(Answer::Ok(val)) => Answer::Ok(val),
-            None | Some(Answer::TimedOut) => Answer::TimedOut,
-            Some(Answer::Left { nick, reason }) => Answer::Left {
-                nick: nick.clone(),
-                reason: reason.clone(),
-            },
-            Some(Answer::Unreachable {
-                nick,
-                code,
-                message,
-            }) => Answer::Unreachable {
-                nick: nick.clone(),
-                code: *code,
-                message: message.clone(),
-            },
-        })
-    }
-
-    /// Consumes `self` into per-user `(User, Answer<T>)` outcomes in deduplicated roster order
-    /// (including `TimedOut`, `Left`, and `Unreachable` entries for closed-roster prompts).
-    pub fn into_per_user(self) -> Vec<(User, Answer<T>)> {
-        self.entries
-            .into_iter()
-            .map(|(u, ans)| (u, ans.unwrap_or(Answer::TimedOut)))
-            .collect()
-    }
-}
-
-/// Borrowing iterator over accepted `(&User, &T)` pairs in [`Answers`].
-pub struct AnswersIter<'a, T>(std::slice::Iter<'a, (User, Option<Answer<T>>)>);
-
-impl<'a, T> Iterator for AnswersIter<'a, T> {
-    type Item = (&'a User, &'a T);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for (u, ans) in self.0.by_ref() {
-            if let Some(Answer::Ok(val)) = ans {
-                return Some((u, val));
-            }
-        }
-        None
-    }
-}
-
-/// Owning iterator over accepted `(User, T)` pairs in [`Answers`].
-pub struct AnswersIntoIter<T>(std::vec::IntoIter<(User, Option<Answer<T>>)>);
-
-impl<T> Iterator for AnswersIntoIter<T> {
-    type Item = (User, T);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for (u, ans) in self.0.by_ref() {
-            if let Some(Answer::Ok(val)) = ans {
-                return Some((u, val));
-            }
-        }
-        None
-    }
-}
-
-impl<T> IntoIterator for Answers<T> {
-    type Item = (User, T);
-    type IntoIter = AnswersIntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        AnswersIntoIter(self.entries.into_iter())
-    }
-}
-
-impl<'a, T> IntoIterator for &'a Answers<T> {
-    type Item = (&'a User, &'a T);
-    type IntoIter = AnswersIter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-type StopPredicate<'a, O> = Box<dyn FnMut(&Answers<O>) -> bool + Send + 'a>;
-
-struct AskManyUnstarted<'a, F, O> {
-    endpoint: Endpoint<'a>,
-    caller: &'static Location<'static>,
-    restricted_users: Option<Vec<User>>,
-    cfg: AskConfig,
-    prompt: Text,
-    matcher: F,
-    allow_change: bool,
-    stop_pred: Option<StopPredicate<'a, O>>,
-    invalid_max_zero: bool,
-}
-
-type AskManyState<'a, F, O> = LazyState<'a, AskManyUnstarted<'a, F, O>, Result<Answers<O>>>;
 
 /// Lazy multi-responder prompt future returned by [`crate::Room::ask_many`] and
 /// [`crate::Huddle::ask_many`].
@@ -931,17 +804,12 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
         matcher: F,
     ) -> Self {
         Self {
-            state: LazyState::new(AskManyUnstarted {
-                endpoint,
+            state: LazyState::new(PromptSpec::new(
+                PromptSource::Endpoint(endpoint),
                 caller,
-                restricted_users: None,
-                cfg: AskConfig::default(),
                 prompt,
                 matcher,
-                allow_change: false,
-                stop_pred: None,
-                invalid_max_zero: false,
-            }),
+            )),
         }
     }
 
@@ -952,15 +820,14 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
         U: Borrow<User>,
     {
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
-        self.state
-            .map_unstarted(|u| u.restricted_users = Some(collected));
+        self.state.map_unstarted(|s| s.set_from_users(collected));
         self
     }
 
     /// Allows responders to overwrite an already-accepted answer until the deadline or
     /// [`AskMany::stop_when`] / [`AskMany::max_answers`] completes the prompt.
     pub fn allow_change(mut self, allow: bool) -> Self {
-        self.state.map_unstarted(|u| u.allow_change = allow);
+        self.state.map_unstarted(|s| s.params.allow_change = allow);
         self
     }
 
@@ -969,12 +836,12 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
     where
         R::Output: 'a,
     {
-        self.state.map_unstarted(|u| {
+        self.state.map_unstarted(|s| {
             if max == 0 {
-                u.invalid_max_zero = true;
+                s.invalid_arg = Some("AskMany::max_answers requires max >= 1");
             } else {
-                u.invalid_max_zero = false;
-                u.stop_pred = Some(Box::new(move |answers: &Answers<R::Output>| {
+                s.invalid_arg = None;
+                s.params.stop_pred = Some(Box::new(move |answers: &Answers<R::Output>| {
                     answers.len() >= max
                 }));
             }
@@ -988,9 +855,9 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
     where
         P: FnMut(&Answers<R::Output>) -> bool + Send + 'a,
     {
-        self.state.map_unstarted(|u| {
-            u.invalid_max_zero = false;
-            u.stop_pred = Some(Box::new(predicate));
+        self.state.map_unstarted(|s| {
+            s.invalid_arg = None;
+            s.params.stop_pred = Some(Box::new(predicate));
         });
         self
     }
@@ -998,7 +865,7 @@ impl<'a, F, R: IntoAskMatch> AskMany<'a, F, R> {
     /// Applies an [`AskConfig`] (by value or `&AskConfig`) to this prompt.
     pub fn config(mut self, cfg: impl Borrow<AskConfig>) -> Self {
         let cloned = cfg.borrow().clone();
-        self.state.map_unstarted(|u| u.cfg = cloned);
+        self.state.map_unstarted(|s| s.params.cfg = cloned);
         self
     }
 }
@@ -1012,68 +879,17 @@ where
     type Output = Result<Answers<R::Output>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().state.poll_with(cx, |u| {
-            let timeout_ms = match u.cfg.time_limit {
-                TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-                TimeLimit::Deadline(_) | TimeLimit::None => None,
-            };
-            let target = u.endpoint.target();
-            let span = tracing::debug_span!(
-                "ircgm::ask_many",
-                target = %target_span_label(&target),
-                restricted = u.restricted_users.as_ref().map(Vec::len),
-                timeout_ms = timeout_ms,
-            );
-            run_ask_many(u).instrument(span)
+        self.get_mut().state.poll_with(cx, |spec| {
+            let span = spec.make_span("ask_many");
+            run_ask_many(spec).instrument(span)
         })
     }
 }
 
-fn target_span_label(target: &Target) -> &str {
-    match target {
-        Target::Channel(ch) => ch.as_str(),
-        Target::Dm => "DM",
-    }
-}
-
-fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
-    let timeout_ms = match cfg.time_limit {
-        TimeLimit::Duration(d) => Some(d.as_millis() as u64),
-        TimeLimit::Deadline(_) | TimeLimit::None => None,
-    };
-    match source {
-        AskSource::Endpoint {
-            endpoint,
-            restricted_users,
-            ..
-        } => {
-            let target = endpoint.target();
-            let single_nick = match restricted_users.as_deref() {
-                Some([only]) => Some(only.nick()),
-                None => match endpoint.participants().as_deref() {
-                    Some([only]) if !endpoint.is_group() => Some(only.nick()),
-                    _ => None,
-                },
-                Some(_) => None,
-            };
-            tracing::debug_span!(
-                "ircgm::ask",
-                target = %target_span_label(&target),
-                user = single_nick.as_deref(),
-                timeout_ms = timeout_ms
-            )
-        }
-        AskSource::UserDm { user, .. } => tracing::debug_span!(
-            "ircgm::ask",
-            target = "DM",
-            user = %user.nick(),
-            timeout_ms = timeout_ms
-        ),
-        AskSource::Invalid(_) => tracing::debug_span!("ircgm::ask", timeout_ms = timeout_ms),
-    }
-}
-
-fn compute_schedule(cfg: &AskConfig, sent_at: Instant) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
+fn compute_schedule(
+    cfg: &AskConfig,
+    sent_at: Instant,
+) -> (Option<Instant>, VecDeque<(Instant, Text)>) {
     let Some(deadline) = cfg.time_limit.deadline_from(sent_at) else {
         return (None, VecDeque::new());
     };
@@ -1137,47 +953,24 @@ fn send_reply_to_msg(endpoint: &Endpoint<'_>, is_notice: bool, text: Text) {
     }
 }
 
-fn snapshot_all_departed<T>(
-    voters: &Option<Vec<User>>,
-    owned_inbox: Option<&Inbox>,
-    answers: &mut Answers<T>,
-    departed: &mut HashSet<UserId>,
-    last_terminal: &mut Option<Answer<()>>,
-) -> bool {
-    let Some(vs) = voters.as_deref() else {
-        return false;
-    };
-    if vs.is_empty() {
-        return false;
-    }
-    for (idx, u) in vs.iter().enumerate() {
-        if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
-            answers.record_left_if_pending(idx, nick, reason, last_terminal);
-            departed.insert(u.id());
-        } else if owned_inbox.is_some_and(|ib| ib.is_departed_in_room(u.track_id())) {
-            answers.record_left_if_pending(idx, u.nick(), None, last_terminal);
-            departed.insert(u.id());
-        }
-    }
-    departed.len() == vs.len()
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_prompt<'a, F, R>(
     mut endpoint: Endpoint<'_>,
-    caller: &'static Location<'static>,
-    restricted_users: Option<Vec<User>>,
-    cfg: AskConfig,
-    prompt: Text,
-    mut matcher: F,
-    allow_change: bool,
-    mut stop_pred: Option<StopPredicate<'a, R::Output>>,
+    params: PromptParams<'a, F, R::Output>,
 ) -> Result<PromptRunOutcome<R::Output>>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
+    let PromptParams {
+        caller,
+        restricted_users,
+        cfg,
+        prompt,
+        mut matcher,
+        allow_change,
+        mut stop_pred,
+    } = params;
     if let Some(ref users) = restricted_users {
         if users.is_empty() {
             return Err(Error::InvalidInput(
@@ -1196,11 +989,7 @@ where
         Some(users) => Some(dedup_users(users)),
         None => base_participants.clone().map(dedup_users),
     };
-    let mut answers = match &voters {
-        Some(vs) if !vs.is_empty() => Answers::new_closed(vs.clone()),
-        _ => Answers::new_open(),
-    };
-
+    let mut answers = Answers::default();
     let mut departed: HashSet<UserId> = HashSet::new();
     let mut last_terminal: Option<Answer<()>> = None;
 
@@ -1222,9 +1011,7 @@ where
         };
         let inbox_core = match &owned {
             Some(ib) => ib.core().cloned(),
-            None => endpoint
-                .borrowed_inbox()
-                .and_then(|ib| ib.core().cloned()),
+            None => endpoint.borrowed_inbox().and_then(|ib| ib.core().cloned()),
         };
 
         if let Some(ref core) = inbox_core {
@@ -1257,18 +1044,32 @@ where
             }
         }
 
-        if snapshot_all_departed(
-            &voters,
-            owned.as_ref(),
-            &mut answers,
-            &mut departed,
-            &mut last_terminal,
-        ) {
-            return Ok(PromptRunOutcome {
-                answers,
-                last_terminal,
-                timed_out: false,
-            });
+        if let Some(ref vs) = voters {
+            if !vs.is_empty() {
+                for u in vs {
+                    if let Some(Error::UserLeft { nick, reason }) = u.quit_error() {
+                        if departed.insert(u.id()) {
+                            last_terminal = Some(Answer::Left { nick, reason });
+                        }
+                    } else if owned
+                        .as_ref()
+                        .is_some_and(|ib| ib.is_departed_in_room(u.track_id()))
+                        && departed.insert(u.id())
+                    {
+                        last_terminal = Some(Answer::Left {
+                            nick: u.nick(),
+                            reason: None,
+                        });
+                    }
+                }
+                if departed.len() == vs.len() {
+                    return Ok(PromptRunOutcome {
+                        answers,
+                        last_terminal,
+                        timed_out: false,
+                    });
+                }
+            }
         }
         if let Some(ib) = endpoint.borrowed_inbox() {
             ib.clear();
@@ -1276,32 +1077,19 @@ where
         (owned, inbox_core)
     };
 
-    match endpoint.say_text(prompt.clone()) {
+    match endpoint.say_text(prompt) {
         Ok(()) => {}
         Err(Error::UserLeft { nick, reason }) => {
-            last_terminal = Some(Answer::Left {
-                nick: nick.clone(),
-                reason: reason.clone(),
-            });
-            for idx in 0..answers.entries.len() {
-                answers.record_left_if_pending(
-                    idx,
-                    nick.clone(),
-                    reason.clone(),
-                    &mut last_terminal,
-                );
-            }
             return Ok(PromptRunOutcome {
                 answers,
-                last_terminal,
+                last_terminal: Some(Answer::Left { nick, reason }),
                 timed_out: false,
             });
         }
         Err(fatal) => return Err(fatal),
     }
 
-    let sent_at = Instant::now();
-    let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at);
+    let (deadline, mut pending_warnings) = compute_schedule(&cfg, Instant::now());
     let endpoint_target = endpoint.target();
     let casemap = inbox_core
         .as_ref()
@@ -1365,30 +1153,15 @@ where
             }
             LoopStep::Deadline => {
                 timed_out = true;
-                let (should_notify, single_user) = match voters.as_deref() {
-                    Some(vs) => {
-                        let mut timed_out_indices = Vec::new();
-                        for (idx, (_, slot)) in answers.entries.iter_mut().enumerate() {
-                            if slot.is_none() {
-                                *slot = Some(Answer::TimedOut);
-                                timed_out_indices.push(idx);
-                            }
-                        }
-                        let user = match timed_out_indices.as_slice() {
-                            [only] => Some(&vs[*only]),
-                            _ => None,
-                        };
-                        (!timed_out_indices.is_empty(), user)
-                    }
-                    None => (answers.is_empty(), None),
+                let any_unanswered = match voters.as_deref() {
+                    Some(vs) => vs
+                        .iter()
+                        .any(|u| !answers.has_answered(u.id()) && !departed.contains(&u.id())),
+                    None => answers.is_empty(),
                 };
-                if should_notify {
-                    if let Some(handler) = &cfg.timeout_handler {
-                        let ctx = TimeoutCtx {
-                            target: &endpoint_target,
-                            user: single_user,
-                        };
-                        let _ = endpoint.say_text(handler.render(&ctx));
+                if any_unanswered {
+                    if let Some(ref msg) = cfg.timeout_message {
+                        let _ = endpoint.say_text(msg.clone());
                     }
                 }
                 break;
@@ -1397,34 +1170,13 @@ where
                 let wire = match wire_res {
                     Ok(w) => w,
                     Err(Error::UserLeft { nick, reason }) => {
-                        last_terminal = Some(Answer::Left {
-                            nick: nick.clone(),
-                            reason: reason.clone(),
-                        });
-                        for idx in 0..answers.entries.len() {
-                            answers.record_left_if_pending(
-                                idx,
-                                nick.clone(),
-                                reason.clone(),
-                                &mut last_terminal,
-                            );
-                        }
+                        last_terminal = Some(Answer::Left { nick, reason });
                         break;
                     }
                     Err(fatal) => return Err(fatal),
                 };
 
                 match &wire.kind {
-                    WireKind::BotLeftRoom { channel, reason } => {
-                        if let Target::Channel(ref expected_chan) = endpoint_target {
-                            if casemap.str_eq(channel, expected_chan) {
-                                return Err(Error::BotLeftRoom {
-                                    channel: channel.clone(),
-                                    reason: reason.clone(),
-                                });
-                            }
-                        }
-                    }
                     WireKind::Event(Event::DeliveryFailed {
                         target,
                         code,
@@ -1440,77 +1192,62 @@ where
                                 });
                             }
                         }
-                        if voters.is_some() {
-                            if let Some(tid) = wire.bounce_user_id() {
-                                if let Some(idx) =
-                                    answers.entries.iter().position(|(u, _)| u.track_id() == tid)
-                                {
-                                    departed.insert(answers.entries[idx].0.id());
-                                    answers.record_unreachable_if_pending(
-                                        idx,
-                                        target.clone(),
-                                        *code,
-                                        message.clone(),
-                                        &mut last_terminal,
-                                    );
-                                    if is_naturally_complete(&voters, &answers, &departed) {
-                                        break;
-                                    }
+                        if let (Some(vs), Some(tid)) = (voters.as_deref(), wire.bounce_user_id()) {
+                            if let Some(u) = vs.iter().find(|u| u.track_id() == tid) {
+                                if !answers.has_answered(u.id()) && departed.insert(u.id()) {
+                                    last_terminal = Some(Answer::Unreachable {
+                                        nick: target.clone(),
+                                        code: *code,
+                                        message: message.clone(),
+                                    });
+                                }
+                                if is_naturally_complete(&voters, &answers, &departed) {
+                                    break;
                                 }
                             }
                         }
                     }
                     WireKind::Event(
                         Event::Parted {
-                            channel,
-                            user,
-                            nick,
-                            reason,
-                            ..
+                            user, nick, reason, ..
                         }
                         | Event::Kicked {
-                            channel,
-                            user,
-                            nick,
-                            reason,
-                            ..
+                            user, nick, reason, ..
                         },
-                    ) => {
-                        if let Target::Channel(ref expected_chan) = endpoint_target {
-                            if casemap.str_eq(channel, expected_chan)
-                                && on_user_departure(
-                                    &voters,
-                                    user.id(),
-                                    nick.clone(),
-                                    reason.clone(),
-                                    &mut answers,
-                                    &mut departed,
-                                    &mut last_terminal,
-                                    &mut stop_pred,
-                                    allow_change,
-                                )
+                    ) if !matches!(endpoint_target, Target::Channel(_)) => {}
+                    WireKind::Event(
+                        Event::Parted {
+                            user, nick, reason, ..
+                        }
+                        | Event::Kicked {
+                            user, nick, reason, ..
+                        }
+                        | Event::Quit {
+                            user, nick, reason, ..
+                        },
+                    ) => match voters.as_deref() {
+                        Some(vs) => {
+                            if vs.iter().any(|v| v.id() == user.id()) {
+                                if !answers.has_answered(user.id()) && departed.insert(user.id()) {
+                                    last_terminal = Some(Answer::Left {
+                                        nick: nick.clone(),
+                                        reason: reason.clone(),
+                                    });
+                                }
+                                if is_naturally_complete(&voters, &answers, &departed) {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            if answers.evict(user.id())
+                                && !answers.is_empty()
+                                && stop_pred.as_mut().is_some_and(|p| p(&answers))
                             {
                                 break;
                             }
                         }
-                    }
-                    WireKind::Event(Event::Quit {
-                        user, nick, reason, ..
-                    }) => {
-                        if on_user_departure(
-                            &voters,
-                            user.id(),
-                            nick.clone(),
-                            reason.clone(),
-                            &mut answers,
-                            &mut departed,
-                            &mut last_terminal,
-                            &mut stop_pred,
-                            allow_change,
-                        ) {
-                            break;
-                        }
-                    }
+                    },
                     _ => {
                         let candidate = match &wire.kind {
                             WireKind::Event(Event::Chat(msg)) => Some(msg),
@@ -1522,22 +1259,12 @@ where
                         let Some(msg) = candidate else {
                             continue;
                         };
-
-                        let target_matches = match (&endpoint_target, &msg.target) {
-                            (Target::Dm, Target::Dm) => true,
-                            (Target::Channel(expected), Target::Channel(actual)) => {
-                                casemap.str_eq(expected, actual)
+                        if let Some(ref vs) = voters {
+                            if !vs.iter().any(|u| u.id() == msg.sender.id())
+                                || departed.contains(&msg.sender.id())
+                            {
+                                continue;
                             }
-                            _ => false,
-                        };
-                        if !target_matches {
-                            continue;
-                        }
-                        if voters.is_some()
-                            && (answers.find_idx(msg.sender.id()).is_none()
-                                || departed.contains(&msg.sender.id()))
-                        {
-                            continue;
                         }
                         if (!allow_change && answers.has_answered(msg.sender.id()))
                             || (cfg.ignore_commands
@@ -1555,13 +1282,10 @@ where
                                 if let Some(ack_msg) = ack {
                                     send_reply_to_msg(&endpoint, msg.is_notice(), ack_msg);
                                 }
-                                answers.record_answer(&msg.sender, val);
-                                if let Some(ref mut pred) = stop_pred {
-                                    if pred(&answers) {
-                                        break;
-                                    }
-                                }
-                                if is_naturally_complete(&voters, &answers, &departed) {
+                                answers.record(&msg.sender, val);
+                                if stop_pred.as_mut().is_some_and(|p| p(&answers))
+                                    || is_naturally_complete(&voters, &answers, &departed)
+                                {
                                     break;
                                 }
                             }
@@ -1583,89 +1307,23 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn on_user_departure<O>(
-    voters: &Option<Vec<User>>,
-    uid: UserId,
-    nick: String,
-    reason: Option<String>,
-    answers: &mut Answers<O>,
-    departed: &mut HashSet<UserId>,
-    last_terminal: &mut Option<Answer<()>>,
-    stop_pred: &mut Option<StopPredicate<'_, O>>,
-    allow_change: bool,
-) -> bool {
-    let Some(vs) = voters.as_deref() else {
-        if answers.evict_open(uid) && !answers.is_empty() {
-            if let Some(ref mut pred) = stop_pred {
-                return pred(answers);
-            }
-        }
-        return false;
-    };
-    let Some(idx) = answers.find_idx(uid) else {
-        return false;
-    };
-    departed.insert(uid);
-    answers.record_left_if_pending(idx, nick, reason, last_terminal);
-    if allow_change {
-        departed.len() == vs.len()
-    } else {
-        vs.iter()
-            .all(|u| answers.has_answered(u.id()) || departed.contains(&u.id()))
-    }
-}
-
-async fn run_ask<'a, F, R>(
-    cfg: AskConfig,
-    source: AskSource<'a>,
-    prompt: Text,
-    matcher: F,
-) -> Result<Answer<R::Output>>
+async fn run_ask<'a, F, R>(spec: PromptSpec<'a, F, R::Output>) -> Result<Answer<R::Output>>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    if prompt.is_empty() {
+    if let Some(msg) = spec.invalid_arg {
+        return Err(Error::InvalidInput(msg));
+    }
+    if spec.params.prompt.is_empty() {
         return Err(Error::InvalidInput("Ask prompt cannot be empty"));
     }
-    let stop_at_one: Option<StopPredicate<'a, R::Output>> =
-        Some(Box::new(|answers: &Answers<R::Output>| !answers.is_empty()));
 
-    let res = match source {
-        AskSource::Invalid(msg) => return Err(Error::InvalidInput(msg)),
-        AskSource::Endpoint {
-            endpoint,
-            restricted_users,
-            caller,
-        } => {
-            run_prompt(
-                endpoint,
-                caller,
-                restricted_users,
-                cfg,
-                prompt,
-                matcher,
-                false,
-                stop_at_one,
-            )
-            .await
-        }
-        AskSource::UserDm { user, caller } => match user.exclusive_at(caller).await {
-            Ok(mut dm) => {
-                run_prompt(
-                    Endpoint::ExclusiveDm(&mut dm),
-                    caller,
-                    None,
-                    cfg,
-                    prompt,
-                    matcher,
-                    false,
-                    stop_at_one,
-                )
-                .await
-            }
+    let res = match spec.source {
+        PromptSource::Endpoint(endpoint) => run_prompt(endpoint, spec.params).await,
+        PromptSource::UserDm(user) => match user.exclusive_at(spec.params.caller).await {
+            Ok(mut dm) => run_prompt(Endpoint::ExclusiveDm(&mut dm), spec.params).await,
             Err(e) => {
                 tracing::debug!(error = %e, "ask aborted before DM prompt write");
                 return Answer::from_result(Err(e));
@@ -1679,35 +1337,25 @@ where
     }
 }
 
-async fn run_ask_many<'a, F, R>(
-    unstarted: AskManyUnstarted<'a, F, R::Output>,
-) -> Result<Answers<R::Output>>
+async fn run_ask_many<'a, F, R>(spec: PromptSpec<'a, F, R::Output>) -> Result<Answers<R::Output>>
 where
     F: FnMut(&ChatMessage) -> R + Send + 'a,
     R: IntoAskMatch + 'a,
     R::Output: Send + 'a,
 {
-    let AskManyUnstarted {
-        endpoint,
-        caller,
-        restricted_users,
-        cfg,
-        prompt,
-        matcher,
-        allow_change,
-        stop_pred,
-        invalid_max_zero,
-    } = unstarted;
-
-    if prompt.is_empty() {
+    if let Some(msg) = spec.invalid_arg {
+        return Err(Error::InvalidInput(msg));
+    }
+    if spec.params.prompt.is_empty() {
         return Err(Error::InvalidInput("Ask prompt cannot be empty"));
     }
-    if invalid_max_zero {
-        return Err(Error::InvalidInput("AskMany::max_answers requires max >= 1"));
-    }
-    let is_open_group = endpoint.participants().is_none() && restricted_users.is_none();
-    if matches!(cfg.time_limit, TimeLimit::None) && stop_pred.is_none() {
-        if allow_change {
+    let PromptSource::Endpoint(endpoint) = spec.source else {
+        unreachable!("AskMany is only constructed from Endpoint")
+    };
+    let is_open_group =
+        endpoint.participants().is_none() && spec.params.restricted_users.is_none();
+    if matches!(spec.params.cfg.time_limit, TimeLimit::None) && spec.params.stop_pred.is_none() {
+        if spec.params.allow_change {
             return Err(Error::InvalidInput(
                 "AskMany::allow_change(true) without stop_when/max_answers requires a reply_timeout or reply_deadline",
             ));
@@ -1719,18 +1367,9 @@ where
         }
     }
 
-    run_prompt(
-        endpoint,
-        caller,
-        restricted_users,
-        cfg,
-        prompt,
-        matcher,
-        allow_change,
-        stop_pred,
-    )
-    .await
-    .map(|out| out.answers)
+    run_prompt(endpoint, spec.params)
+        .await
+        .map(|out| out.answers)
 }
 
 #[cfg(test)]
