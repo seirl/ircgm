@@ -100,6 +100,9 @@ pub struct BotConfig {
     pub handshake_timeout: Duration,
     /// Upper ceiling on payload bytes per outbound `PRIVMSG`/`NOTICE` passed to `Text::wrap` (default: `450`).
     pub max_payload_bytes: usize,
+    /// Automatically set the server-advertised `005 BOT=<mode>` user mode (e.g. `+B`) upon
+    /// registration (default: `true`).
+    pub announce_bot: bool,
 }
 
 impl Default for BotConfig {
@@ -123,6 +126,7 @@ impl BotConfig {
             command_prefixes: vec!["!".into()],
             handshake_timeout: Duration::from_secs(15),
             max_payload_bytes: 450,
+            announce_bot: true,
         }
     }
 
@@ -132,6 +136,11 @@ impl BotConfig {
         S: Into<String>,
     {
         self.command_prefixes = prefixes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_announce_bot(mut self, announce: bool) -> Self {
+        self.announce_bot = announce;
         self
     }
 }
@@ -217,6 +226,7 @@ impl Bot {
             config.command_prefixes.clone(),
             config.handshake_timeout,
             config.max_payload_bytes,
+            config.announce_bot,
         );
 
         let has_caps = !config.request_caps.is_empty();

@@ -31,6 +31,7 @@ pub(crate) struct BotCore {
     pub(crate) command_prefixes: Vec<String>,
     pub(crate) handshake_timeout: Duration,
     pub(crate) max_payload_bytes: usize,
+    pub(crate) announce_bot: bool,
 }
 
 impl std::fmt::Debug for BotCore {
@@ -50,6 +51,7 @@ impl BotCore {
         command_prefixes: Vec<String>,
         handshake_timeout: Duration,
         max_payload_bytes: usize,
+        announce_bot: bool,
     ) -> Arc<Self> {
         let (lifecycle_tx, _) = watch::channel(ConnLifecycle::Registering { welcomed: false });
         let (shutdown_tx, _) = watch::channel(false);
@@ -65,6 +67,7 @@ impl BotCore {
             command_prefixes,
             handshake_timeout,
             max_payload_bytes: max_payload_bytes.max(1),
+            announce_bot,
         })
     }
 
@@ -102,13 +105,39 @@ impl BotCore {
     }
 
     pub(crate) fn mark_registered(&self) {
-        self.lifecycle_tx.send_if_modified(|state| match state {
+        let transitioned = self.lifecycle_tx.send_if_modified(|state| match state {
             ConnLifecycle::Registering { .. } => {
                 *state = ConnLifecycle::Active;
                 true
             }
             _ => false,
         });
+        if transitioned {
+            self.maybe_announce_bot();
+        }
+    }
+
+    /// Sends `MODE <nick> +<bot_mode>` once if `announce_bot` is enabled, the session is active,
+    /// and the server advertised a `005 BOT=<mode>` character.
+    pub(crate) fn maybe_announce_bot(&self) {
+        if !self.announce_bot || !matches!(*self.lifecycle_tx.borrow(), ConnLifecycle::Active) {
+            return;
+        }
+        let cmd = {
+            let mut ws = self.state.write().unwrap();
+            if ws.bot_mode_announced {
+                return;
+            }
+            let Some(mode) = ws.bot_mode else {
+                return;
+            };
+            ws.bot_mode_announced = true;
+            Command::Raw(
+                "MODE".into(),
+                vec![ws.current_nick.clone(), format!("+{mode}")],
+            )
+        };
+        self.outbound.enqueue_one(cmd);
     }
 
     /// Transitions to `Disconnected` at most once.

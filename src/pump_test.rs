@@ -5,7 +5,10 @@ use crate::casemap::AtomicCaseMap;
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::state::parse_irc_message;
 
-fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
+fn test_core_with_announce(
+    out_tx: mpsc::UnboundedSender<Command>,
+    announce_bot: bool,
+) -> Arc<BotCore> {
     let casemap = AtomicCaseMap::default();
     let outbound = OutboundSink::new(RawTransport::test_only(out_tx));
     BotCore::new(
@@ -16,7 +19,12 @@ fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
         vec!["!".into()],
         Duration::from_secs(15),
         450,
+        announce_bot,
     )
+}
+
+fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
+    test_core_with_announce(out_tx, true)
 }
 
 #[test]
@@ -115,4 +123,58 @@ async fn self_echo_notice_updates_tracked_account_without_emitting_chat_event() 
         core.state.read().unwrap().self_user_host().as_deref(),
         Some("~gm@cloak")
     );
+}
+
+#[tokio::test]
+async fn isupport_bot_mode_announces_on_registration() {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let core = test_core_with_announce(out_tx, true);
+    let mut reg = RegistrationTracker {
+        cap_pending: false,
+        motd_done: false,
+    };
+
+    // Server assigns `gm_` in 001 and advertises `BOT=B` in 005:
+    let welcome = parse_irc_message(":srv 001 gm_ :Welcome to IRC\r\n").unwrap();
+    process_message(&core, welcome, 1, &mut reg);
+    let isupport = parse_irc_message(":srv 005 gm_ BOT=B :are supported\r\n").unwrap();
+    process_message(&core, isupport, 2, &mut reg);
+
+    // Must not send `MODE` before registration finishes:
+    assert!(out_rx.try_recv().is_err());
+
+    // `376 RPL_ENDOFMOTD` completes registration and triggers `MODE gm_ +B` once:
+    let endmotd = parse_irc_message(":srv 376 gm_ :End of /MOTD\r\n").unwrap();
+    process_message(&core, endmotd, 3, &mut reg);
+    assert!(core.is_registered());
+    assert_eq!(
+        out_rx.try_recv().ok(),
+        Some(Command::Raw("MODE".into(), vec!["gm_".into(), "+B".into()]))
+    );
+    assert!(out_rx.try_recv().is_err());
+
+    // Subsequent `005` lines do not re-emit `MODE`:
+    let isupport2 = parse_irc_message(":srv 005 gm_ BOT=B :are supported\r\n").unwrap();
+    process_message(&core, isupport2, 4, &mut reg);
+    assert!(out_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn announce_bot_false_skips_bot_mode() {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let core = test_core_with_announce(out_tx, false);
+    let mut reg = RegistrationTracker {
+        cap_pending: false,
+        motd_done: false,
+    };
+
+    let welcome = parse_irc_message(":srv 001 gm :Welcome\r\n").unwrap();
+    process_message(&core, welcome, 1, &mut reg);
+    let isupport = parse_irc_message(":srv 005 gm BOT=B :are supported\r\n").unwrap();
+    process_message(&core, isupport, 2, &mut reg);
+    let nomotd = parse_irc_message(":srv 422 gm :No MOTD\r\n").unwrap();
+    process_message(&core, nomotd, 3, &mut reg);
+
+    assert!(core.is_registered());
+    assert!(out_rx.try_recv().is_err());
 }

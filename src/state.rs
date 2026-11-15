@@ -228,6 +228,8 @@ pub(crate) struct WorldState {
     pub(crate) chan_modes: ChanModes,
     pub(crate) max_modes: usize,
     pub(crate) targmax_kick: usize,
+    pub(crate) bot_mode: Option<char>,
+    pub(crate) bot_mode_announced: bool,
     pub(crate) current_nick: String,
     pub(crate) self_track_id: Option<u64>,
     pub(crate) self_ident: Option<String>,
@@ -256,6 +258,8 @@ impl WorldState {
             chan_modes: ChanModes::default(),
             max_modes: 4,
             targmax_kick: 1,
+            bot_mode: None,
+            bot_mode_announced: false,
             current_nick: initial_nick.into(),
             self_track_id: None,
             self_ident: None,
@@ -546,6 +550,8 @@ impl WorldState {
                     self.max_modes = 4;
                 } else if negated.eq_ignore_ascii_case("CHANMODES") {
                     self.chan_modes = ChanModes::default();
+                } else if negated.eq_ignore_ascii_case("BOT") {
+                    self.bot_mode = None;
                 }
                 continue;
             }
@@ -625,6 +631,14 @@ impl WorldState {
                         }
                     }
                 }
+            } else if key.eq_ignore_ascii_case("BOT") {
+                self.bot_mode = val_opt.and_then(|v| {
+                    let mut chars = v.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(ch), None) if ch.is_ascii_alphabetic() => Some(ch),
+                        _ => None,
+                    }
+                });
             }
         }
         changed_casemap

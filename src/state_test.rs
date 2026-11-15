@@ -24,11 +24,30 @@ fn isupport_parsing_and_targmax_variants() {
     );
     assert_eq!(ws.chan_modes.param_set_c, "flj");
 
-    let m2 = parse_msg(":srv 005 Bot TARGMAX=PRIVMSG:4,KICK:3 :are supported\r\n");
+    let m2 = parse_msg(":srv 005 Bot TARGMAX=PRIVMSG:4,KICK:3 BOT=B :are supported\r\n");
     if let Command::Response(Response::RPL_ISUPPORT, args) = &m2.command {
         assert_eq!(ws.apply_isupport(args), None);
     }
     assert_eq!(ws.targmax_kick, 3);
+    assert_eq!(ws.bot_mode, Some('B'));
+
+    let m3 = parse_msg(":srv 005 Bot -BOT :are supported\r\n");
+    if let Command::Response(Response::RPL_ISUPPORT, args) = &m3.command {
+        assert_eq!(ws.apply_isupport(args), None);
+    }
+    assert_eq!(ws.bot_mode, None);
+
+    let m4 = parse_msg(":srv 005 Bot BOT=b :are supported\r\n");
+    if let Command::Response(Response::RPL_ISUPPORT, args) = &m4.command {
+        assert_eq!(ws.apply_isupport(args), None);
+    }
+    assert_eq!(ws.bot_mode, Some('b'));
+
+    let m5 = parse_msg(":srv 005 Bot BOT= :are supported\r\n");
+    if let Command::Response(Response::RPL_ISUPPORT, args) = &m5.command {
+        assert_eq!(ws.apply_isupport(args), None);
+    }
+    assert_eq!(ws.bot_mode, None);
 }
 
 #[test]

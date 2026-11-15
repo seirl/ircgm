@@ -639,6 +639,7 @@ fn handle_numeric(
                 core.users.rekey_casemap(new_cm);
                 core.inboxes.rekey_casemap(new_cm);
             }
+            core.maybe_announce_bot();
             dispatch_raw(core, raw, seq, None);
         }
         324 => {

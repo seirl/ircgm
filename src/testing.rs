@@ -48,6 +48,7 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
         config.command_prefixes.clone(),
         config.handshake_timeout,
         config.max_payload_bytes,
+        config.announce_bot,
     );
     core.mark_registered();
     let reg = RegistrationTracker {
