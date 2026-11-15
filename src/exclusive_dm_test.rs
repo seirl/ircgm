@@ -75,3 +75,44 @@ async fn acquire_many_and_available_reject_foreign_and_duplicate_users() {
             .map(drop)
     ));
 }
+
+#[tokio::test]
+async fn user_exclusive_available_returns_none_on_offline_or_mid_wait_quit_and_propagates_disconnect()
+{
+    let (bot, server) = test_harness("gm");
+    let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+
+    // 1. Online user acquires `Some(dm)`:
+    let held = alice.exclusive_available().await.unwrap().unwrap();
+    assert_eq!(held.user(), &alice);
+
+    // 2. Queued waiter resolves to `Ok(None)` immediately if `alice` quits while `held` is locked:
+    let alice_wait = alice.clone();
+    let waiter = tokio::spawn(async move { alice_wait.exclusive_available().await });
+    server.flush().await;
+    server.quit_user("alice", Some("bye"));
+    server.settle().await;
+    assert!(waiter.await.unwrap().unwrap().is_none());
+    drop(held);
+
+    // 3. Already-offline user returns `Ok(None)`:
+    assert!(alice.exclusive_available().await.unwrap().is_none());
+
+    // 4. Fatal session disconnect still propagates as `Err(Error::Disconnected(..))` (both mid-wait
+    //    and once disconnected):
+    let held_bob = bob.exclusive().await.unwrap();
+    let bob_wait = bob.clone();
+    let disc_waiter = tokio::spawn(async move { bob_wait.exclusive_available().await });
+    server.flush().await;
+    server.disconnect();
+    assert!(matches!(
+        disc_waiter.await.unwrap(),
+        Err(Error::Disconnected(_))
+    ));
+    drop(held_bob);
+    assert!(matches!(
+        bob.exclusive_available().await,
+        Err(Error::Disconnected(_))
+    ));
+}

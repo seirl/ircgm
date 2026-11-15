@@ -111,6 +111,23 @@ impl User {
         self.exclusive_at(caller)
     }
 
+    /// Acquires this user's per-user DM mutex like [`User::exclusive`], returning `Ok(None)` if
+    /// the user is already offline or disconnects while waiting for the lock (1-on-1 counterpart
+    /// to [`crate::Bot::exclusive_available`] and [`crate::Bot::huddle_available`]).
+    #[track_caller]
+    pub fn exclusive_available(
+        &self,
+    ) -> impl Future<Output = Result<Option<ExclusiveDm>>> + Send + '_ {
+        let caller = Location::caller();
+        async move {
+            match self.exclusive_at(caller).await {
+                Ok(dm) => Ok(Some(dm)),
+                Err(Error::UserLeft { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
     pub(crate) async fn exclusive_at(
         &self,
         caller: &'static Location<'static>,
