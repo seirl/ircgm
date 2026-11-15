@@ -190,13 +190,13 @@ async fn exclusive_many_available_and_huddle_semantics() {
     let (g_forward, g_reverse) = tokio::join!(
         tokio::spawn(async move {
             let guards = b1.exclusive_many([&w1a, &w2a, &w3a]).await.unwrap();
-            let order: Vec<String> = guards.iter().map(|g| g.user().nick()).collect();
+            let order: Vec<String> = guards.users().into_iter().map(|u| u.nick()).collect();
             tokio::task::yield_now().await;
             order
         }),
         tokio::spawn(async move {
             let guards = b2.exclusive_many([&w3b, &w2b, &w1b]).await.unwrap();
-            let order: Vec<String> = guards.iter().map(|g| g.user().nick()).collect();
+            let order: Vec<String> = guards.into_iter().map(|g| g.user().nick()).collect();
             tokio::task::yield_now().await;
             order
         }),
@@ -211,7 +211,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
     assert!(matches!(err_many, Error::UserLeft { ref nick, .. } if nick == "Wolf3"));
 
     let avail = bot.exclusive_available([&w2, &w3, &w1]).await.unwrap();
-    let avail_nicks: Vec<String> = avail.iter().map(|g| g.user().nick()).collect();
+    let avail_nicks: Vec<String> = avail.users().into_iter().map(|u| u.nick()).collect();
     assert_eq!(avail_nicks, vec!["Wolf2", "Wolf1"]);
     drop(avail);
 
@@ -309,8 +309,8 @@ async fn locked_dm_inboxes_default_to_300s_read_timeout_while_unlocked_inboxes_d
         assert_eq!(start.elapsed(), Duration::from_secs(300));
     }
 
-    // 2. Raw `ExclusiveDm` / `Huddle` `inbox()` reads also default to a 300s safety timeout so an
-    // AFK bouncer cannot hold `dm_mutex` forever, unless explicitly disabled:
+    // 2. Raw `ExclusiveDm` / `ExclusiveDmGroup` / `Huddle` `inbox()` reads also default to a 300s
+    // safety timeout so an AFK bouncer cannot hold `dm_mutex` forever, unless explicitly disabled:
     {
         let start = tokio::time::Instant::now();
         let mut dm = bouncer.exclusive().await.unwrap();
@@ -324,6 +324,15 @@ async fn locked_dm_inboxes_default_to_300s_read_timeout_while_unlocked_inboxes_d
         };
         let (msg, ()) = tokio::join!(dm.inbox().next_chat(), wait_fut);
         assert_eq!(msg.unwrap().text, "back from dinner");
+    }
+    {
+        let start = tokio::time::Instant::now();
+        let mut group = bot.exclusive_many([&bouncer]).await.unwrap();
+        assert!(matches!(
+            group.inbox().next_chat().await,
+            Err(Error::TimedOut)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(300));
     }
 
     // 3. Unlocked `Room::inbox()` reads have no default timeout:

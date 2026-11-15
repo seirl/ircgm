@@ -12,13 +12,14 @@ use tracing::Instrument as _;
 use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
+use crate::outbound::OutboundChatKind;
 use crate::user::{User, UserStatus, UserTrack};
 
 /// Held lock on a [`User`]'s interactive DM prompt slot (`UserTrack::dm_mutex`).
 ///
 /// Records the holder's call site for contention warnings and clears it on `Drop`. Carries no
-/// [`Inbox`]: [`ExclusiveDm`] pairs one lease with its own inbox, while [`crate::Huddle`] pairs
-/// several leases with one shared inbox.
+/// [`Inbox`]: [`ExclusiveDm`] pairs one lease with its own inbox, while [`ExclusiveDmGroup`] and
+/// [`crate::Huddle`] pair several leases with one shared inbox.
 pub(crate) struct DmLease {
     user: User,
     _guard: OwnedMutexGuard<()>,
@@ -100,6 +101,182 @@ impl ExclusiveDm {
 
     pub fn inbox(&mut self) -> &mut Inbox {
         &mut self.inbox
+    }
+
+    pub(crate) fn user_and_inbox_mut(&mut self) -> (&User, &mut Inbox) {
+        (self.lease.user(), &mut self.inbox)
+    }
+}
+
+pub(crate) fn broadcast_dm_leases(
+    core: &Arc<BotCore>,
+    leases: &[DmLease],
+    initial_offline: &Option<(String, Option<String>)>,
+    empty_msg: &'static str,
+    kind: OutboundChatKind,
+    text: Text,
+) -> Result<()> {
+    core.check_connected()?;
+    let mut sent_any = false;
+    let mut last_offline_err: Option<Error> = None;
+
+    for lease in leases {
+        match lease.user().send_chat(kind, text.clone()) {
+            Ok(()) => sent_any = true,
+            Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+
+    if sent_any {
+        Ok(())
+    } else {
+        Err(last_offline_err
+            .or_else(|| {
+                initial_offline
+                    .clone()
+                    .map(|(nick, reason)| Error::UserLeft { nick, reason })
+            })
+            .unwrap_or(Error::InvalidInput(empty_msg)))
+    }
+}
+
+/// RAII guard holding exclusive access to multiple [`User`]s' interactive DM prompt slots
+/// (`bot.exclusive_many(&users)` / `bot.exclusive_available(&users)`) plus one wire-ordered
+/// [`Inbox`] over all members' DMs without cross-relaying member chat.
+///
+/// Use [`ExclusiveDmGroup::ask_each`] to run concurrent 1-on-1 DM prompts across all members,
+/// [`ExclusiveDmGroup::inbox`] + [`ExclusiveDmGroup::say`] for wire-fair DM buzz-in races, or
+/// [`ExclusiveDmGroup::into_vec`] / [`IntoIterator`] to split into individual [`ExclusiveDm`]
+/// guards. Releases all held locks on `Drop`.
+pub struct ExclusiveDmGroup {
+    core: Arc<BotCore>,
+    leases: Vec<DmLease>,
+    initial_offline: Option<(String, Option<String>)>,
+    opened_at: &'static Location<'static>,
+    inbox: Inbox,
+}
+
+impl fmt::Debug for ExclusiveDmGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExclusiveDmGroup")
+            .field("users", &self.leases)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExclusiveDmGroup {
+    pub(crate) fn new(
+        core: Arc<BotCore>,
+        leases: Vec<DmLease>,
+        initial_offline: Option<(String, Option<String>)>,
+        caller: &'static Location<'static>,
+    ) -> Self {
+        let dm_users: Vec<Arc<UserTrack>> = leases.iter().map(|l| l.user().track_arc()).collect();
+        let inbox = core
+            .inboxes
+            .subscribe(
+                Arc::clone(&core),
+                Filter::Scoped {
+                    rooms: Vec::new(),
+                    dm_users,
+                },
+                caller,
+            )
+            .read_timeout(crate::ask::DEFAULT_REPLY_TIMEOUT);
+        Self {
+            core,
+            leases,
+            initial_offline,
+            opened_at: caller,
+            inbox,
+        }
+    }
+
+    pub(crate) fn leases_and_inbox_mut(&mut self) -> (&Arc<BotCore>, &[DmLease], &mut Inbox) {
+        (&self.core, &self.leases, &mut self.inbox)
+    }
+
+    pub fn users(&self) -> Vec<User> {
+        self.leases.iter().map(|l| l.user().clone()).collect()
+    }
+
+    /// Returns `true` if `user` is a member of this `ExclusiveDmGroup`.
+    pub fn has_user(&self, user: &User) -> bool {
+        user.belongs_to(&self.core) && self.leases.iter().any(|l| l.user() == user)
+    }
+
+    pub fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Broadcasts to all currently-online members in DM (skipping any member who disconnected
+    /// mid-group).
+    pub fn say(&self, text: impl Into<Text>) -> Result<()> {
+        broadcast_dm_leases(
+            &self.core,
+            &self.leases,
+            &self.initial_offline,
+            "ExclusiveDmGroup has no members",
+            OutboundChatKind::Privmsg,
+            text.into(),
+        )
+    }
+
+    pub fn notice(&self, text: impl Into<Text>) -> Result<()> {
+        broadcast_dm_leases(
+            &self.core,
+            &self.leases,
+            &self.initial_offline,
+            "ExclusiveDmGroup has no members",
+            OutboundChatKind::Notice,
+            text.into(),
+        )
+    }
+
+    pub fn action(&self, text: impl Into<Text>) -> Result<()> {
+        broadcast_dm_leases(
+            &self.core,
+            &self.leases,
+            &self.initial_offline,
+            "ExclusiveDmGroup has no members",
+            OutboundChatKind::Action,
+            text.into(),
+        )
+    }
+
+    pub fn inbox(&mut self) -> &mut Inbox {
+        &mut self.inbox
+    }
+
+    /// Consumes this group and splits its held locks into individual 1-on-1 [`ExclusiveDm`]
+    /// guards in member order without releasing any per-user DM mutex.
+    pub fn into_vec(self) -> Vec<ExclusiveDm> {
+        let Self {
+            core,
+            leases,
+            opened_at,
+            inbox,
+            ..
+        } = self;
+        drop(inbox);
+        leases
+            .into_iter()
+            .map(|lease| ExclusiveDm::from_lease(Arc::clone(&core), lease, opened_at))
+            .collect()
+    }
+}
+
+impl IntoIterator for ExclusiveDmGroup {
+    type Item = ExclusiveDm;
+    type IntoIter = std::vec::IntoIter<ExclusiveDm>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
     }
 }
 

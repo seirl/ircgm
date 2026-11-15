@@ -458,3 +458,199 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
         .collect();
     assert_eq!(joined, vec![carol, dave]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn exclusive_dm_group_ask_each_runs_independent_per_user_prompts_concurrently() {
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#game", &["alice", "bob", "carol", "dan"]);
+    server.settle().await;
+
+    let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+    let carol = bot.user("carol").unwrap();
+    let dan = bot.user("dan").unwrap();
+
+    let mut dms = bot
+        .exclusive_many([&alice, &bob, &carol, &dan])
+        .await
+        .unwrap();
+
+    let ask_task = tokio::spawn({
+        async move {
+            let cfg = AskConfig::new()
+                .reply_timeout(Duration::from_secs(20))
+                .warn_remaining(Duration::from_secs(5), "5s left!")
+                .timeout_message("Time is up!");
+            let mut seen_calls = 0usize;
+            let res = dms
+                .ask_each(
+                    |u| format!("Hi {}, pick 1..=9:", u.nick()),
+                    |m| {
+                        seen_calls += 1;
+                        match m.text.trim().parse::<u8>() {
+                            Ok(n @ 1..=9) => AskMatch::accept_say(n, format!("Locked {n}!")),
+                            _ => AskMatch::reject("Enter 1..=9!"),
+                        }
+                    },
+                )
+                .config(&cfg)
+                .await?;
+            Ok::<_, Error>((dms, res, seen_calls))
+        }
+    });
+
+    server.flush().await;
+    assert_eq!(
+        server.take_messages_to("alice"),
+        vec!["Hi alice, pick 1..=9:"]
+    );
+    assert_eq!(server.take_messages_to("bob"), vec!["Hi bob, pick 1..=9:"]);
+    assert_eq!(
+        server.take_messages_to("carol"),
+        vec!["Hi carol, pick 1..=9:"]
+    );
+    assert_eq!(server.take_messages_to("dan"), vec!["Hi dan, pick 1..=9:"]);
+
+    // Alice sends invalid then valid; Bob bounces (`716`); Dan quits; Carol stays silent:
+    server.dm("alice", "nope");
+    server.dm("alice", "7");
+    server.dm("alice", "9"); // Ignored once Alice already answered!
+    server.bounce(716, "bob", "is in +g mode");
+    server.quit_user("dan", Some("bye"));
+    server.settle().await;
+
+    assert_eq!(
+        server.take_messages_to("alice"),
+        vec!["Enter 1..=9!", "Locked 7!"]
+    );
+    // Zero cross-leak to Carol or Bob:
+    assert!(server.take_messages_to("carol").is_empty());
+    assert!(server.take_messages_to("bob").is_empty());
+
+    // Advance 15s -> ONLY unanswered Carol gets the 5s warning!
+    server.advance(Duration::from_secs(15)).await;
+    assert_eq!(server.take_messages_to("carol"), vec!["5s left!"]);
+    assert!(server.take_messages_to("alice").is_empty());
+    assert!(server.take_messages_to("bob").is_empty());
+
+    // Advance remaining 5s -> ONLY Carol gets `timeout_message`:
+    server.advance(Duration::from_secs(5)).await;
+    let (_dms, results, seen_calls) = ask_task.await.unwrap().unwrap();
+    assert_eq!(seen_calls, 2);
+    assert_eq!(server.take_messages_to("carol"), vec!["Time is up!"]);
+    assert!(server.take_messages_to("alice").is_empty());
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0], (alice, Answer::Ok(7)));
+    assert!(matches!(
+        results[1],
+        (ref u, Answer::Unreachable { code: 716, .. }) if u == &bob
+    ));
+    assert_eq!(results[2], (carol, Answer::TimedOut));
+    assert!(matches!(
+        results[3],
+        (ref u, Answer::Left { ref nick, ref reason })
+            if u == &dan && nick == "dan" && reason.as_deref() == Some("bye")
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn exclusive_dm_group_ask_each_edge_cases_empty_validation_cleanup_and_disconnect() {
+    use crate::future::{GameFutureExt as _, Outcome};
+
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#game", &["alice", "bob", "offline"]);
+    server.settle().await;
+
+    let alice = bot.user("alice").unwrap();
+    let bob = bot.user("bob").unwrap();
+    let offline = bot.user("offline").unwrap();
+    server.quit_user("offline", None);
+    server.settle().await;
+
+    // 1. Empty group (`exclusive_available` with 0 online members) returns `Ok(vec![])` in 0ms:
+    let start = Instant::now();
+    let mut empty = bot.exclusive_available([&offline]).await.unwrap();
+    let empty_res = empty
+        .ask_each(|_| "Prompt?", |m| Some(m.text.clone()))
+        .config(AskConfig::new().reply_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert!(empty_res.is_empty());
+    assert_eq!(start.elapsed(), Duration::ZERO);
+
+    // 2. Empty prompt for any member fails upfront before sending to earlier members:
+    let mut dms = bot.exclusive_many([&alice, &bob]).await.unwrap();
+    let err = dms
+        .ask_each(
+            |u| if u == &bob { "" } else { "Valid prompt" },
+            |m| Some(m.text.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput("Ask prompt cannot be empty")
+    ));
+    server.flush().await;
+    assert!(server.take_messages_to("alice").is_empty());
+    assert!(server.take_messages_to("bob").is_empty());
+
+    // 3. Stale messages before `ask_each` and replies during a `.until(...)`-cancelled `ask_each`
+    // do not pollute `dms.inbox()` afterward:
+    server.dm("alice", "stale_before");
+    server.settle().await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel_task = tokio::spawn(async move {
+        let out = dms
+            .ask_each(|_| "First question?", |m| Some(m.text.clone()))
+            .until(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+        assert!(matches!(out, Outcome::Stopped(())));
+        dms
+    });
+    assert_eq!(server.recv_message_to("alice").await, "First question?");
+    assert_eq!(server.recv_message_to("bob").await, "First question?");
+    server.dm("alice", "answered_during_cancelled_ask_each");
+    server.settle().await;
+    let _ = stop_tx.send(());
+    let mut dms = cancel_task.await.unwrap();
+
+    server.dm("bob", "fresh_after_cancel");
+    server.settle().await;
+    assert_eq!(
+        dms.inbox().next_chat().await.unwrap().text,
+        "fresh_after_cancel"
+    );
+
+    // 4. Member quitting before `ask_each` begins resolves to `Answer::Left` while online member answers:
+    server.quit_user("bob", Some("gtg"));
+    server.settle().await;
+    let partial_task = tokio::spawn(async move {
+        let res = dms
+            .ask_each(|_| "Second question?", |m| Some(m.text.clone()))
+            .await?;
+        Ok::<_, Error>((dms, res))
+    });
+    assert_eq!(server.recv_message_to("alice").await, "Second question?");
+    server.dm("alice", "still_here");
+    let (mut dms, partial_res) = partial_task.await.unwrap().unwrap();
+    assert_eq!(partial_res[0], (alice, Answer::Ok("still_here".into())));
+    assert!(matches!(
+        partial_res[1],
+        (ref u, Answer::Left { ref nick, .. }) if u == &bob && nick == "bob"
+    ));
+
+    // 5. Session disconnect mid-`ask_each` aborts and propagates `Err(Error::Disconnected(_))`:
+    let disc_task =
+        tokio::spawn(async move { dms.ask_each(|_| "Third?", |m| Some(m.text.clone())).await });
+    assert_eq!(server.recv_message_to("alice").await, "Third?");
+    server.disconnect();
+    assert!(matches!(
+        disc_task.await.unwrap(),
+        Err(Error::Disconnected(_))
+    ));
+}

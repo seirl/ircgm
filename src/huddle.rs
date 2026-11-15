@@ -5,8 +5,8 @@ use std::sync::Arc;
 use irc_colors::{irc_format, Text};
 
 use crate::core::BotCore;
-use crate::error::{Error, Result};
-use crate::exclusive_dm::DmLease;
+use crate::error::Result;
+use crate::exclusive_dm::{broadcast_dm_leases, DmLease};
 use crate::inbox::{Filter, Inbox, OnChatHook};
 use crate::message::ChatMessage;
 use crate::outbound::OutboundChatKind;
@@ -84,29 +84,14 @@ impl Huddle {
     }
 
     fn broadcast_kind(&self, kind: OutboundChatKind, text: Text) -> Result<()> {
-        self.core.check_connected()?;
-        let mut sent_any = false;
-        let mut last_offline_err: Option<Error> = None;
-
-        for lease in &self.leases {
-            match lease.user().send_chat(kind, text.clone()) {
-                Ok(()) => sent_any = true,
-                Err(e @ Error::UserLeft { .. }) => last_offline_err = Some(e),
-                Err(e) => return Err(e),
-            }
-        }
-
-        if sent_any {
-            Ok(())
-        } else {
-            Err(last_offline_err
-                .or_else(|| {
-                    self.initial_offline
-                        .clone()
-                        .map(|(nick, reason)| Error::UserLeft { nick, reason })
-                })
-                .unwrap_or(Error::InvalidInput("Huddle has no members")))
-        }
+        broadcast_dm_leases(
+            &self.core,
+            &self.leases,
+            &self.initial_offline,
+            "Huddle has no members",
+            kind,
+            text,
+        )
     }
 
     pub fn name(&self) -> &Text {

@@ -2,10 +2,11 @@
 //!
 //! `ircgm` replaces state-machine enums and callback spaghetti with structured direct-style futures:
 //! - [`Bot`] manages the IRC connection pump, registration barrier, and session-scoped [`Room`],
-//!   [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
-//! - [`Ask`], [`AskMany`], and [`AskConfig`] provide ergonomic prompts with reply clocks,
-//!   inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations, countdown
-//!   warnings, timeout messages, and explicit [`Answer`] outcomes by default.
+//!   [`User`], [`ExclusiveDm`], [`ExclusiveDmGroup`], [`Huddle`], [`Breakout`], and [`Inbox`]
+//!   handles.
+//! - [`Ask`], [`AskMany`], [`AskEach`], and [`AskConfig`] provide ergonomic prompts with reply
+//!   clocks, inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations,
+//!   countdown warnings, timeout messages, and explicit [`Answer`] outcomes by default.
 //! - [`GameFutureExt`] composes any prompt or multi-step `async fn` with `.until()`, `.or_until()`,
 //!   `.with_timeout()`, `.with_deadline()`, `.run_for()`, and `.run_until_deadline()`.
 //!
@@ -91,18 +92,18 @@ pub mod fmt {
 pub mod prelude {
     pub use crate::{
         fmt::Colorize as _, irc_format, Answer, Answers, AskConfig, AskMatch, Bot, Breakout,
-        ChatMessage, Error, Event, ExclusiveDm, GameFutureExt as _, Huddle, Inbox, InboxScope,
-        MessageKind, ModerationGuard, Outcome, Result, Room, Text, User, UserId,
+        ChatMessage, Error, Event, ExclusiveDm, ExclusiveDmGroup, GameFutureExt as _, Huddle,
+        Inbox, InboxScope, MessageKind, ModerationGuard, Outcome, Result, Room, Text, User, UserId,
     };
 }
 
 pub use crate::{
-    ask::{Answer, Answers, Ask, AskConfig, AskMany, AskMatch, IntoAskMatch},
+    ask::{Answer, Answers, Ask, AskConfig, AskEach, AskMany, AskMatch, IntoAskMatch},
     bot::{Bot, BotConfig, InboxScope},
     breakout::{Breakout, BreakoutOptions},
     casemap::{CaseMap, FoldedStr},
     error::{DisconnectReason, Error, Result},
-    exclusive_dm::ExclusiveDm,
+    exclusive_dm::{ExclusiveDm, ExclusiveDmGroup},
     future::{race_all, GameFutureExt, Outcome},
     huddle::Huddle,
     inbox::Inbox,
@@ -127,6 +128,7 @@ const _: () = {
     assert_send_sync_debug::<Event>();
     assert_send_sync_debug::<Breakout>();
     assert_send_sync_debug::<ExclusiveDm>();
+    assert_send_sync_debug::<ExclusiveDmGroup>();
     assert_send_sync_debug::<Huddle>();
     assert_send_sync_debug::<Inbox>();
     assert_send_sync_debug::<Answer<()>>();

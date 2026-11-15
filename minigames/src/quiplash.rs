@@ -24,9 +24,9 @@
 //!   rejection numerics directly to [`Answer::Unreachable`].
 //! - **Identity-safe channel ballot collection:** [`Room::ask_many`] with `.allow_change(true)`
 //!   collects revocable per-user ballots while blocking self-votes across mid-round `/nick` changes.
-//! - **Drop-out tolerant [`Bot::exclusive_available`] + [`Bot::inbox_dms_from`] tiebreaker:**
+//! - **Drop-out tolerant [`Bot::exclusive_available`] (`ExclusiveDmGroup`) tiebreaker:**
 //!   Locks online finalists in canonical order without cross-relaying guesses and adjudicates
-//!   packet-burst ties strictly by wire arrival (`seq`).
+//!   packet-burst ties strictly by wire arrival (`seq`) via [`ExclusiveDmGroup::inbox`].
 
 use std::time::Duration;
 
@@ -138,11 +138,10 @@ pub async fn tiebreaker_buzz_in(
     room: &Room,
     finalists: &[User],
 ) -> Result<Option<User>> {
-    let dms = bot.exclusive_available(finalists).await?;
+    let mut dms = bot.exclusive_available(finalists).await?;
     if dms.is_empty() {
         return Ok(None);
     }
-    let mut inbox = bot.inbox_dms_from(dms.iter().map(ExclusiveDm::user));
 
     room.say(
         "⚡ TIEBREAKER! Finalists, check your DMs for a sudden-death math buzz-in!"
@@ -150,34 +149,25 @@ pub async fn tiebreaker_buzz_in(
             .bold(),
     )?;
 
-    let mut sent_any = false;
-    for dm in &dms {
-        match dm.say("⚡ Tiebreaker! What is 17 * 6? (20s)") {
-            Ok(()) => sent_any = true,
-            Err(Error::UserLeft { .. }) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    if !sent_any {
-        return Ok(None);
+    match dms.say("⚡ Tiebreaker! What is 17 * 6? (20s)") {
+        Ok(()) => {}
+        Err(Error::UserLeft { .. }) => return Ok(None),
+        Err(e) => return Err(e),
     }
 
     let race = async {
         loop {
-            let msg = match inbox.next_chat().await {
+            let msg = match dms.inbox().next_chat().await {
                 Ok(m) => m,
                 Err(Error::UserLeft { .. }) => return Ok(None),
                 Err(e) => return Err(e),
             };
             if msg.text.trim() == "102" {
-                let win_line = irc_format!(
+                let _ = dms.say(irc_format!(
                     "{} {} buzzed in first with 102!",
                     "⚡".yellow().bold(),
                     msg.sender.nick().bold().green(),
-                );
-                for dm in &dms {
-                    let _ = dm.say(win_line.clone());
-                }
+                ));
                 return Ok(Some(msg.sender));
             }
             let _ = msg.sender.say("Nope — try again! (17 * 6)".yellow());

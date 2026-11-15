@@ -723,8 +723,9 @@ impl Inbox {
     }
 
     /// Sets a per-read timeout (`Err(Error::TimedOut)`) applied to async `wait_*` / `next_*` calls
-    /// on this inbox (`None` by default; `Some(300s)` on [`crate::ExclusiveDm`] and
-    /// [`crate::Huddle`] inboxes so AFK bouncer clients cannot hold a DM lock forever).
+    /// on this inbox (`None` by default; `Some(300s)` on [`crate::ExclusiveDm`],
+    /// [`crate::ExclusiveDmGroup`], and [`crate::Huddle`] inboxes so AFK bouncer clients cannot
+    /// hold a DM lock forever).
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = Some(timeout);
         self

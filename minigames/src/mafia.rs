@@ -10,12 +10,12 @@
 //!      chat relay, [`AskMatch::reject`] target validation, and
 //!      [`AskMatch::accept_say`] pack-wide lock-in confirmation (`!kill <nick>`).
 //!    - Once the pack locks in a target, all `0..=N` online Bodyguards get a `5s` midnight reflex
-//!      prompt (concurrent [`User::ask`]s) to DM `!protect <nick>` — saving the victim if any of
-//!      them picks it!
+//!      prompt ([`ExclusiveDmGroup::ask_each`]) to DM `!protect <nick>` — saving the victim if any
+//!      of them picks it!
 //! 3. **Dawn, `#graveyard` & Secret Day Vote (`45s`):**
 //!    - Any unguarded victim is eliminated (`-v` devoiced) and non-blockingly invited to a dead-chat
 //!      `#graveyard-xxxxxx` [`Breakout`] via [`Breakout::invite_available`].
-//!    - All surviving players cast a simultaneous secret DM ballot ([`User::ask`] +
+//!    - All surviving players cast a simultaneous secret DM ballot ([`ExclusiveDmGroup::ask_each`] +
 //!      [`AskConfig::reply_deadline`] + [`AskMatch::accept_say`] / [`AskMatch::reject`]). Exiling a
 //!      Werewolf wins for **Town**; otherwise **Werewolves Win**!
 //!
@@ -25,15 +25,15 @@
 //! - **Drop-out resilient party primitives:** [`Bot::huddle_available`],
 //!   [`Bot::exclusive_available`], and [`Breakout::invite_available`] skip offline/AFK players
 //!   cleanly without stalling or aborting the session.
-//! - **Concurrent `0..=N` DM prompts:** Joins every online bodyguard's `!protect` prompt, so dawn
-//!   comes as soon as each has answered or timed out (immediately when `0` guards are online).
-//! - **Shared-deadline DM ballots:** Combines concurrent [`User::ask`] prompts with
+//! - **Concurrent `0..=N` DM prompts ([`ExclusiveDmGroup::ask_each`]):** Runs every online
+//!   bodyguard's `!protect` prompt in parallel without cross-relaying answers, so dawn comes as soon
+//!   as each has answered or timed out (immediately when `0` guards are online).
+//! - **Shared-deadline DM ballots:** Combines [`ExclusiveDmGroup::ask_each`] with
 //!   [`AskConfig::reply_deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures::future::try_join_all;
 use ircgm::prelude::*;
 use tokio::time::Instant;
 
@@ -136,6 +136,7 @@ pub async fn werewolf_pack_kill(
 /// Collects simultaneous secret `!vote <nick>` DMs from all `alive` players before a shared deadline,
 /// acknowledging valid ballots in DM and rejecting unknown/dead nicks without wasting the voter's turn.
 pub async fn collect_secret_votes(
+    bot: &Bot,
     room: &Room,
     alive: &[User],
 ) -> Result<Vec<(User, Option<User>)>> {
@@ -146,40 +147,45 @@ pub async fn collect_secret_votes(
         "🗳️ Secret Day Ballot — reply `!vote <nick>` within 45s (alive: {roster}):"
     );
 
-    try_join_all(alive.iter().map(|voter| {
-        let prompt = prompt.clone();
-        async move {
-            let pick = voter
-                .ask(prompt, |m| {
-                    let Some(target) = m.cmd_arg("!vote") else {
-                        if m.is_cmd("!vote") {
-                            return AskMatch::reject(
-                                "Usage: `!vote <nick>` (choose a living player).".yellow(),
-                            );
-                        }
-                        return AskMatch::ignore();
-                    };
-                    match alive.iter().find(|u| u.eq_nick(target)) {
-                        Some(target_user) => AskMatch::accept_say(
-                            target_user.clone(),
-                            irc_format!(
-                                "{} {}!",
-                                "✔ Secret ballot cast for".green(),
-                                target_user.nick().bold(),
-                            ),
-                        ),
-                        None => AskMatch::reject(
-                            "Pick a living player's nick with `!vote <nick>`!".yellow(),
-                        ),
+    let mut voter_dms = bot.exclusive_available(alive).await?;
+    let results = voter_dms
+        .ask_each(
+            |_| prompt.clone(),
+            |m| {
+                let Some(target) = m.cmd_arg("!vote") else {
+                    if m.is_cmd("!vote") {
+                        return AskMatch::reject(
+                            "Usage: `!vote <nick>` (choose a living player).".yellow(),
+                        );
                     }
-                })
-                .config(AskConfig::new().reply_deadline(deadline))
-                .await?
-                .ok();
-            Ok::<_, Error>((voter.clone(), pick))
-        }
-    }))
-    .await
+                    return AskMatch::ignore();
+                };
+                match alive.iter().find(|u| u.eq_nick(target)) {
+                    Some(target_user) => AskMatch::accept_say(
+                        target_user.clone(),
+                        irc_format!(
+                            "{} {}!",
+                            "✔ Secret ballot cast for".green(),
+                            target_user.nick().bold(),
+                        ),
+                    ),
+                    None => AskMatch::reject(
+                        "Pick a living player's nick with `!vote <nick>`!".yellow(),
+                    ),
+                }
+            },
+        )
+        .config(AskConfig::new().reply_deadline(deadline))
+        .await?;
+
+    let mut by_id: HashMap<UserId, User> = results
+        .into_iter()
+        .filter_map(|(u, ans)| ans.ok().map(|pick| (u.id(), pick)))
+        .collect();
+    Ok(alive
+        .iter()
+        .map(|u| (u.clone(), by_id.remove(&u.id())))
+        .collect())
 }
 
 /// Orchestrates Night (`+m`, wolf huddle, bodyguard prompts), `#graveyard`, and secret Day Vote.
@@ -206,47 +212,43 @@ pub async fn run_mafia_round(
     // Brief online Bodyguards without failing if one disconnected (`exclusive_available`):
     {
         let online_guards = bot.exclusive_available(guards).await?;
-        for dm in &online_guards {
-            let _ = dm.say("🛡️ Stand by — you'll be alerted when the Werewolves prowl!");
+        if !online_guards.is_empty() {
+            let _ = online_guards.say("🛡️ Stand by — you'll be alerted when the Werewolves prowl!");
         }
     }
 
     if let Some(victim) = werewolf_pack_kill(bot, wolves, &townsfolk).await? {
         // Every online Bodyguard gets the same 5s reflex window, and the night ends once each has
         // answered or timed out (at once if none is online). Any of them can save the victim:
-        let picks = try_join_all(guards.iter().filter(|g| g.is_online()).map(|guard| {
-            let townsfolk = townsfolk.clone();
-            async move {
-                let pick = guard
-                    .ask(
-                        "🛡️ Wolves are prowling! Reply `!protect <nick>` (5s):",
-                        |m| {
-                            let Some(target) = m.cmd_arg("!protect") else {
-                                return AskMatch::ignore();
-                            };
-                            match townsfolk.iter().find(|u| u.eq_nick(target)) {
-                                Some(protected) => AskMatch::accept_say(
-                                    protected.clone(),
-                                    irc_format!(
-                                        "{} {}!",
-                                        "🛡️ Moving to protect".cyan(),
-                                        protected.nick().bold(),
-                                    ),
-                                ),
-                                None => AskMatch::reject(
-                                    "Pick a living townsfolk with `!protect <nick>`!".yellow(),
-                                ),
-                            }
-                        },
-                    )
-                    .config(AskConfig::new().reply_timeout(Duration::from_secs(5)))
-                    .await?
-                    .ok();
-                Ok::<_, Error>(pick)
-            }
-        }))
-        .await?;
-        let saved_victim = picks.iter().flatten().any(|protected| *protected == victim);
+        let mut guard_dms = bot.exclusive_available(guards).await?;
+        let picks = guard_dms
+            .ask_each(
+                |_| "🛡️ Wolves are prowling! Reply `!protect <nick>` (5s):",
+                |m| {
+                    let Some(target) = m.cmd_arg("!protect") else {
+                        return AskMatch::ignore();
+                    };
+                    match townsfolk.iter().find(|u| u.eq_nick(target)) {
+                        Some(protected) => AskMatch::accept_say(
+                            protected.clone(),
+                            irc_format!(
+                                "{} {}!",
+                                "🛡️ Moving to protect".cyan(),
+                                protected.nick().bold(),
+                            ),
+                        ),
+                        None => AskMatch::reject(
+                            "Pick a living townsfolk with `!protect <nick>`!".yellow(),
+                        ),
+                    }
+                },
+            )
+            .config(AskConfig::new().reply_timeout(Duration::from_secs(5)))
+            .await?;
+        let saved_victim = picks
+            .into_iter()
+            .filter_map(|(_, ans)| ans.ok())
+            .any(|protected| protected == victim);
 
         if saved_victim {
             room.say("☀️ Dawn breaks! 🛡️ A Bodyguard thwarted the Werewolves' attack!".cyan().bold())?;
@@ -270,7 +272,7 @@ pub async fn run_mafia_round(
         room.say("☀️ Dawn breaks! Everyone survived the night!".green())?;
     }
 
-    let ballots = collect_secret_votes(room, &alive).await?;
+    let ballots = collect_secret_votes(bot, room, &alive).await?;
     let mut tally: HashMap<UserId, usize> = HashMap::new();
     for (_voter, pick_opt) in ballots {
         if let Some(target_user) = pick_opt {

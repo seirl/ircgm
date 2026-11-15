@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,9 +13,9 @@ use tracing::Instrument as _;
 
 use crate::casemap::CaseMap;
 use crate::error::{Error, Result};
-use crate::exclusive_dm::ExclusiveDm;
+use crate::exclusive_dm::{ExclusiveDm, ExclusiveDmGroup};
 use crate::huddle::Huddle;
-use crate::inbox::Inbox;
+use crate::inbox::{Filter, Inbox};
 use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
 use crate::room::Room;
 use crate::state::BotPresence;
@@ -223,7 +223,8 @@ impl TimeLimit {
     }
 }
 
-/// Prompt configuration passed to [`Ask::config`] and [`AskMany::config`].
+/// Prompt configuration passed to [`Ask::config`], [`AskMany::config`], and
+/// [`AskEach::config`].
 #[derive(Clone, Debug)]
 pub struct AskConfig {
     time_limit: TimeLimit,
@@ -396,10 +397,37 @@ impl ExclusiveDm {
         R: IntoAskMatch + 'a,
         R::Output: Send + 'a,
     {
+        let (user, inbox) = self.user_and_inbox_mut();
         Ask::from_endpoint(
-            Endpoint::ExclusiveDm(self),
+            Endpoint::UserDm { user, inbox },
             Location::caller(),
             prompt.into(),
+            matcher,
+        )
+    }
+}
+
+impl ExclusiveDmGroup {
+    /// Runs an independent 1-on-1 DM [`Ask`] concurrently for each member in this group,
+    /// computing each member's prompt with `prompt(&user)` and returning `(User, Answer<T>)` pairs
+    /// in group member order.
+    #[track_caller]
+    pub fn ask_each<'a, P, T, F, R>(
+        &'a mut self,
+        mut prompt: P,
+        matcher: F,
+    ) -> AskEach<'a, F, R>
+    where
+        P: FnMut(&User) -> T + Send + 'a,
+        T: Into<Text>,
+        F: FnMut(&ChatMessage) -> R + Send + 'a,
+        R: IntoAskMatch + 'a,
+        R::Output: Send + 'a,
+    {
+        AskEach::new(
+            self,
+            Location::caller(),
+            Box::new(move |user| prompt(user).into()),
             matcher,
         )
     }
@@ -420,7 +448,10 @@ impl User {
 
 enum Endpoint<'a> {
     Room(&'a Room),
-    ExclusiveDm(&'a mut ExclusiveDm),
+    UserDm {
+        user: &'a User,
+        inbox: &'a mut Inbox,
+    },
     Huddle(&'a mut Huddle),
 }
 
@@ -428,7 +459,7 @@ impl Endpoint<'_> {
     fn say_text(&self, text: Text) -> Result<()> {
         match self {
             Self::Room(r) => r.say(text),
-            Self::ExclusiveDm(dm) => dm.say(text),
+            Self::UserDm { user, .. } => user.say(text),
             Self::Huddle(h) => h.say(text),
         }
     }
@@ -436,7 +467,7 @@ impl Endpoint<'_> {
     fn notice_text(&self, text: Text) -> Result<()> {
         match self {
             Self::Room(r) => r.notice(text),
-            Self::ExclusiveDm(dm) => dm.notice(text),
+            Self::UserDm { user, .. } => user.notice(text),
             Self::Huddle(h) => h.notice(text),
         }
     }
@@ -444,7 +475,7 @@ impl Endpoint<'_> {
     fn target(&self) -> Target {
         match self {
             Self::Room(r) => Target::Channel(r.name().to_owned()),
-            Self::ExclusiveDm(_) | Self::Huddle(_) => Target::Dm,
+            Self::UserDm { .. } | Self::Huddle(_) => Target::Dm,
         }
     }
 
@@ -455,7 +486,7 @@ impl Endpoint<'_> {
     fn participants(&self) -> Option<Vec<User>> {
         match self {
             Self::Room(_) => None,
-            Self::ExclusiveDm(dm) => Some(vec![dm.user().clone()]),
+            Self::UserDm { user, .. } => Some(vec![(*user).clone()]),
             Self::Huddle(h) => Some(h.users()),
         }
     }
@@ -464,14 +495,14 @@ impl Endpoint<'_> {
         match self {
             Self::Room(r) => Some(r.has_user(user)),
             Self::Huddle(h) => Some(h.has_user(user)),
-            Self::ExclusiveDm(_) => None,
+            Self::UserDm { .. } => None,
         }
     }
 
     fn borrowed_inbox(&mut self) -> Option<&mut Inbox> {
         match self {
             Self::Room(_) => None,
-            Self::ExclusiveDm(dm) => Some(dm.inbox()),
+            Self::UserDm { inbox, .. } => Some(*inbox),
             Self::Huddle(h) => Some(h.inbox()),
         }
     }
@@ -886,6 +917,86 @@ where
     }
 }
 
+type PromptFn<'a> = Box<dyn FnMut(&User) -> Text + Send + 'a>;
+
+struct AskEachSpec<'a, F> {
+    group: &'a mut ExclusiveDmGroup,
+    caller: &'static Location<'static>,
+    cfg: AskConfig,
+    prompt_fn: PromptFn<'a>,
+    matcher: F,
+}
+
+impl<F> AskEachSpec<'_, F> {
+    fn make_span(&self) -> tracing::Span {
+        let timeout_ms = match self.cfg.time_limit {
+            TimeLimit::Duration(d) => Some(d.as_millis() as u64),
+            TimeLimit::Deadline(_) | TimeLimit::None => None,
+        };
+        tracing::debug_span!(
+            "ircgm::prompt",
+            kind = "ask_each",
+            target = "DM",
+            members = self.group.len(),
+            timeout_ms
+        )
+    }
+}
+
+type AskEachState<'a, F, O> = LazyState<'a, AskEachSpec<'a, F>, Result<Vec<(User, Answer<O>)>>>;
+
+/// Lazy concurrent per-member DM prompt future returned by [`ExclusiveDmGroup::ask_each`].
+///
+/// Runs an independent 1-on-1 DM [`Ask`] for every member in the group concurrently without
+/// cross-relaying replies or feedback, resolving to `Result<Vec<(User, Answer<T>)>>` in group
+/// member order.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct AskEach<'a, F, R: IntoAskMatch> {
+    state: AskEachState<'a, F, R::Output>,
+}
+
+impl<'a, F, R: IntoAskMatch> AskEach<'a, F, R> {
+    fn new(
+        group: &'a mut ExclusiveDmGroup,
+        caller: &'static Location<'static>,
+        prompt_fn: PromptFn<'a>,
+        matcher: F,
+    ) -> Self {
+        Self {
+            state: LazyState::new(AskEachSpec {
+                group,
+                caller,
+                cfg: AskConfig::default(),
+                prompt_fn,
+                matcher,
+            }),
+        }
+    }
+
+    /// Applies an [`AskConfig`] (by value or `&AskConfig`) to every per-member prompt.
+    pub fn config(mut self, cfg: impl Borrow<AskConfig>) -> Self {
+        let cloned = cfg.borrow().clone();
+        self.state.map_unstarted(|s| s.cfg = cloned);
+        self
+    }
+}
+
+impl<'a, F, R> Future for AskEach<'a, F, R>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    type Output = Result<Vec<(User, Answer<R::Output>)>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().state.poll_with(cx, |spec| {
+            let span = spec.make_span();
+            run_ask_each(spec).instrument(span)
+        })
+    }
+}
+
 fn compute_schedule(
     cfg: &AskConfig,
     sent_at: Instant,
@@ -1007,7 +1118,7 @@ where
                 }
                 Some(ib)
             }
-            Endpoint::ExclusiveDm(_) | Endpoint::Huddle(_) => None,
+            Endpoint::UserDm { .. } | Endpoint::Huddle(_) => None,
         };
         let inbox_core = match &owned {
             Some(ib) => ib.core().cloned(),
@@ -1323,7 +1434,10 @@ where
     let res = match spec.source {
         PromptSource::Endpoint(endpoint) => run_prompt(endpoint, spec.params).await,
         PromptSource::UserDm(user) => match user.exclusive_at(spec.params.caller).await {
-            Ok(mut dm) => run_prompt(Endpoint::ExclusiveDm(&mut dm), spec.params).await,
+            Ok(mut dm) => {
+                let (user, inbox) = dm.user_and_inbox_mut();
+                run_prompt(Endpoint::UserDm { user, inbox }, spec.params).await
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "ask aborted before DM prompt write");
                 return Answer::from_result(Err(e));
@@ -1335,6 +1449,92 @@ where
         Ok(outcome) => Ok(outcome.into_single_answer()),
         Err(e) => Answer::from_result(Err(e)),
     }
+}
+
+struct ClearInboxOnDrop<'a>(&'a mut Inbox);
+
+impl Drop for ClearInboxOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+async fn run_ask_each<'a, F, R>(spec: AskEachSpec<'a, F>) -> Result<Vec<(User, Answer<R::Output>)>>
+where
+    F: FnMut(&ChatMessage) -> R + Send + 'a,
+    R: IntoAskMatch + 'a,
+    R::Output: Send + 'a,
+{
+    let AskEachSpec {
+        group,
+        caller,
+        cfg,
+        mut prompt_fn,
+        matcher,
+    } = spec;
+    let (core, leases, group_inbox) = group.leases_and_inbox_mut();
+    core.check_connected()?;
+
+    if leases.is_empty() {
+        group_inbox.clear();
+        return Ok(Vec::new());
+    }
+
+    let mut prompts = Vec::with_capacity(leases.len());
+    for lease in leases {
+        let p = prompt_fn(lease.user());
+        if p.is_empty() {
+            return Err(Error::InvalidInput("Ask prompt cannot be empty"));
+        }
+        prompts.push(p);
+    }
+
+    group_inbox.clear();
+    let _clear_guard = ClearInboxOnDrop(group_inbox);
+    let shared_matcher = Mutex::new(matcher);
+
+    let futs = leases.iter().zip(prompts).map(|(lease, prompt)| {
+        let user = lease.user();
+        let sub_inbox = core
+            .inboxes
+            .subscribe(
+                Arc::clone(core),
+                Filter::Scoped {
+                    rooms: Vec::new(),
+                    dm_users: vec![user.track_arc()],
+                },
+                caller,
+            )
+            .read_timeout(DEFAULT_REPLY_TIMEOUT);
+        let cfg = cfg.clone();
+        let shared_matcher = &shared_matcher;
+        async move {
+            let mut sub_inbox = sub_inbox;
+            let params = PromptParams {
+                caller,
+                restricted_users: None,
+                cfg,
+                prompt,
+                matcher: |msg: &ChatMessage| (shared_matcher.lock().unwrap())(msg),
+                allow_change: false,
+                stop_pred: Some(Box::new(|answers: &Answers<R::Output>| !answers.is_empty())),
+            };
+            let res = run_prompt(
+                Endpoint::UserDm {
+                    user,
+                    inbox: &mut sub_inbox,
+                },
+                params,
+            )
+            .await;
+            match res {
+                Ok(outcome) => Ok((user.clone(), outcome.into_single_answer())),
+                Err(e) => Answer::from_result(Err(e)).map(|ans| (user.clone(), ans)),
+            }
+        }
+    });
+
+    futures_util::future::try_join_all(futs).await
 }
 
 async fn run_ask_many<'a, F, R>(spec: PromptSpec<'a, F, R::Output>) -> Result<Answers<R::Output>>

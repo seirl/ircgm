@@ -12,7 +12,7 @@ use crate::breakout::{Breakout, BreakoutOptions};
 use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::core::{BotCore, ConnLifecycle};
 use crate::error::{DisconnectReason, Error, Result};
-use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDm};
+use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDmGroup};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox};
 use crate::outbound::{validate_param, validate_target, OutboundSink, RawTransport};
@@ -359,8 +359,8 @@ impl Bot {
         Ok(User::from_parts(Arc::downgrade(core), track))
     }
 
-    /// Acquires multiple independent 1-on-1 [`ExclusiveDm`] locks in canonical [`crate::UserId`]
-    /// order (returning guards in the caller's iteration order).
+    /// Acquires multiple per-user DM prompt locks in canonical [`crate::UserId`] order, returning
+    /// an [`ExclusiveDmGroup`] in the caller's iteration order without cross-relaying member chat.
     ///
     /// Use this instead of acquiring individual [`User::exclusive`] guards across concurrent tasks
     /// when locking multiple players for *private* 1-on-1 exchanges (where [`Bot::huddle`] is
@@ -371,7 +371,7 @@ impl Bot {
     pub fn exclusive_many<I, U>(
         &self,
         users: I,
-    ) -> impl Future<Output = Result<Vec<ExclusiveDm>>> + Send + '_
+    ) -> impl Future<Output = Result<ExclusiveDmGroup>> + Send + '_
     where
         I: IntoIterator<Item = U>,
         U: Borrow<User>,
@@ -380,18 +380,18 @@ impl Bot {
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
             let (leases, _) = acquire_dm_leases(&self.owner.core, collected, true, caller).await?;
-            Ok(self.wrap_exclusive(leases, caller))
+            Ok(self.build_exclusive_group(leases, None, caller))
         }
     }
 
-    /// Drop-out tolerant counterpart to [`Bot::exclusive_many`]: acquires independent 1-on-1
-    /// [`ExclusiveDm`] locks in canonical [`crate::UserId`] order (preventing ABBA deadlocks across
-    /// concurrent tasks) while skipping any user who is offline or quits during lock acquisition.
+    /// Drop-out tolerant counterpart to [`Bot::exclusive_many`]: acquires per-user DM prompt locks
+    /// in canonical [`crate::UserId`] order (preventing ABBA deadlocks across concurrent tasks)
+    /// while skipping any user who is offline or quits during lock acquisition.
     #[track_caller]
     pub fn exclusive_available<I, U>(
         &self,
         users: I,
-    ) -> impl Future<Output = Result<Vec<ExclusiveDm>>> + Send + '_
+    ) -> impl Future<Output = Result<ExclusiveDmGroup>> + Send + '_
     where
         I: IntoIterator<Item = U>,
         U: Borrow<User>,
@@ -399,21 +399,24 @@ impl Bot {
         let caller = Location::caller();
         let collected: Vec<User> = users.into_iter().map(|u| u.borrow().clone()).collect();
         async move {
-            let (leases, _) = acquire_dm_leases(&self.owner.core, collected, false, caller).await?;
-            Ok(self.wrap_exclusive(leases, caller))
+            let (leases, initial_offline) =
+                acquire_dm_leases(&self.owner.core, collected, false, caller).await?;
+            Ok(self.build_exclusive_group(leases, initial_offline, caller))
         }
     }
 
-    fn wrap_exclusive(
+    fn build_exclusive_group(
         &self,
         leases: Vec<DmLease>,
+        initial_offline: Option<(String, Option<String>)>,
         caller: &'static Location<'static>,
-    ) -> Vec<ExclusiveDm> {
-        let core = &self.owner.core;
-        leases
-            .into_iter()
-            .map(|lease| ExclusiveDm::from_lease(Arc::clone(core), lease, caller))
-            .collect()
+    ) -> ExclusiveDmGroup {
+        ExclusiveDmGroup::new(
+            Arc::clone(&self.owner.core),
+            leases,
+            initial_offline,
+            caller,
+        )
     }
 
     /// Strict channel-free group DM deliberation guard (`[<name>] <<nick>> <msg>`).

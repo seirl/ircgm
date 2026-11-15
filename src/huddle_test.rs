@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::Error;
 use crate::testing::test_harness;
 
 #[tokio::test]
