@@ -1,16 +1,16 @@
-//! Playable multi-minigame single-lobby IRC bot (`cargo run -p minigames --example game_bot`).
+//! Playable multi-minigame single-lobby IRC bot (`cargo run -p ircgm-minigames --example game_bot`).
 //!
-//! Demonstrates **external supervision**: none of the minigames in [`minigames`] know about
+//! Demonstrates **external supervision**: none of the minigames in [`ircgm_minigames`] know about
 //! admins, `!stop`, `!abort`, or [`Bot::shutdown_requested`]. Instead, [`run_lobby_bot`] wraps
-//! [`minigames::play_by_name`] from the outside with `.until(...)` / `.or_until(...)`, relying on
+//! [`ircgm_minigames::play_by_name`] from the outside with `.until(...)` / `.or_until(...)`, relying on
 //! RAII `Drop` (`Breakout`, `Huddle`, `ExclusiveDm`, `Inbox`) to clean up any cancelled game.
 //!
 //! Run against Libera.Chat (or any IRC server):
 //! ```sh
-//! cargo run -p minigames --example game_bot -- --server irc.libera.chat:6667 --lobby '#ircgm-minigames'
+//! cargo run -p ircgm-minigames --example game_bot -- --server irc.libera.chat:6667 --lobby '#ircgm-minigames'
 //! ```
 //!
-//! Anyone in the lobby can list and start any of the 8 [`minigames`]:
+//! Anyone in the lobby can list and start any of the 8 [`ircgm_minigames`]:
 //! - `!games` / `!help` — list all minigames and lobby commands
 //! - `!play <game>` / `!start <game>` / `!<game>` — start a specific minigame
 //! - `!random` / `!play random` — roll and start a random minigame
@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use futures::FutureExt as _;
 use ircgm::irc::client::data::Config as IrcConfig;
 use ircgm::prelude::*;
-use minigames::{find_game, play_by_name, PlayOutcome, GAMES};
+use ircgm_minigames::{find_game, play_by_name, PlayOutcome, GAMES};
 
 const DEFAULT_SERVER: &str = "127.0.0.1:6667";
 const DEFAULT_LOBBY: &str = "#ircgm-minigames";
@@ -79,7 +79,7 @@ Lobby commands (anyone can use):
 Available minigames:
 {games_lines}\
 Example:
-  cargo run -p minigames --example game_bot -- --server irc.libera.chat:6667 --lobby '#ircgm-minigames'",
+  cargo run -p ircgm-minigames --example game_bot -- --server irc.libera.chat:6667 --lobby '#ircgm-minigames'",
         count = GAMES.len(),
     )
 }
