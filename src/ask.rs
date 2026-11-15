@@ -215,7 +215,7 @@ pub struct TimeoutCtx<'a> {
     pub user: Option<&'a User>,
 }
 
-const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug)]
 enum TimeLimit {

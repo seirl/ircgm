@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use irc::proto::Message;
 use tokio::sync::mpsc;
@@ -353,6 +354,7 @@ impl InboxRegistry {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
+            read_timeout: None,
             latched_departure: None,
             last_user_departure: None,
             departed_users,
@@ -616,6 +618,7 @@ pub struct Inbox {
     lag_policy: LagPolicy,
     pub(crate) ignore_commands: bool,
     pub(crate) accept_notices: bool,
+    read_timeout: Option<Duration>,
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
@@ -656,6 +659,7 @@ impl Inbox {
             lag_policy: LagPolicy::Strict,
             ignore_commands: false,
             accept_notices: false,
+            read_timeout: None,
             latched_departure: None,
             last_user_departure: None,
             departed_users: HashSet::new(),
@@ -728,6 +732,26 @@ impl Inbox {
         self.accept_notices = accept;
     }
 
+    /// Sets a per-read timeout (`Err(Error::TimedOut)`) applied to async `wait_*` / `next_*` calls
+    /// on this inbox (`None` by default; `Some(300s)` on [`crate::ExclusiveDm`] and
+    /// [`crate::Huddle`] inboxes so AFK bouncer clients cannot hold a DM lock forever).
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables any per-read timeout on this inbox.
+    pub fn no_read_timeout(mut self) -> Self {
+        self.read_timeout = None;
+        self
+    }
+
+    /// In-place form of [`Inbox::read_timeout`] / [`Inbox::no_read_timeout`], usable on a borrowed
+    /// inbox (`dm.inbox().set_read_timeout(None)` disables the default 300s lock-safety timeout).
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
     pub fn lossy(mut self) -> Self {
         self.lag_policy = LagPolicy::Lossy;
         self
@@ -752,6 +776,21 @@ impl Inbox {
 
     async fn next_wire(&mut self) -> Result<Arc<WireEvent>> {
         poll_fn(|cx| self.poll_next_wire(cx)).await
+    }
+
+    async fn run_read<Fut, T>(timeout: Option<Duration>, fut: Fut) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        match timeout {
+            None => fut.await,
+            Some(dur) => {
+                match tokio::time::timeout_at(crate::future::deadline_after(dur), fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(Error::TimedOut),
+                }
+            }
+        }
     }
 
     /// Cancel-safe core reply/chat loop shared by [`Inbox::wait_map`], [`Inbox::wait_cmd`], and
@@ -793,8 +832,12 @@ impl Inbox {
     where
         F: FnMut(&ChatMessage) -> Option<T>,
     {
-        self.wait_reply_map_inner(self.ignore_commands, self.accept_notices, f)
-            .await
+        let timeout = self.read_timeout;
+        Self::run_read(
+            timeout,
+            self.wait_reply_map_inner(self.ignore_commands, self.accept_notices, f),
+        )
+        .await
     }
 
     pub async fn wait_for<P>(&mut self, mut pred: P) -> Result<ChatMessage>
@@ -807,17 +850,25 @@ impl Inbox {
     /// Waits for a word-boundary command `cmd` (ASCII case-insensitive), ignoring
     /// `self.ignore_commands` so explicit command waits never deadlock on command-skipping inboxes.
     pub async fn wait_cmd(&mut self, cmd: &str) -> Result<ChatMessage> {
-        self.wait_reply_map_inner(false, self.accept_notices, |m| {
-            m.is_cmd(cmd).then(|| m.clone())
-        })
+        let timeout = self.read_timeout;
+        Self::run_read(
+            timeout,
+            self.wait_reply_map_inner(false, self.accept_notices, |m| {
+                m.is_cmd(cmd).then(|| m.clone())
+            }),
+        )
         .await
     }
 
     /// Waits for `cmd` followed by non-empty arguments, returning `(msg, trimmed_arg_string)`.
     pub async fn wait_cmd_arg(&mut self, cmd: &str) -> Result<(ChatMessage, String)> {
-        self.wait_reply_map_inner(false, self.accept_notices, |m| {
-            m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned()))
-        })
+        let timeout = self.read_timeout;
+        Self::run_read(
+            timeout,
+            self.wait_reply_map_inner(false, self.accept_notices, |m| {
+                m.cmd_arg(cmd).map(|arg| (m.clone(), arg.to_owned()))
+            }),
+        )
         .await
     }
 
@@ -878,6 +929,7 @@ impl Inbox {
         F: FnMut(&ChatMessage) -> Option<T>,
     {
         self.lag_policy = LagPolicy::Lossy;
+        self.read_timeout = None;
         match self
             .wait_reply_map_inner(self.ignore_commands, self.accept_notices, f)
             .await
@@ -902,18 +954,23 @@ impl Inbox {
     where
         F: FnMut(&Event) -> Option<T>,
     {
-        loop {
-            let wire = self.next_wire().await?;
-            if let Some(ev) = wire.to_public_event() {
-                if let Some(val) = f(&ev) {
-                    return Ok(val);
+        let timeout = self.read_timeout;
+        Self::run_read(timeout, async {
+            loop {
+                let wire = self.next_wire().await?;
+                if let Some(ev) = wire.to_public_event() {
+                    if let Some(val) = f(&ev) {
+                        return Ok(val);
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 
     pub async fn next_raw(&mut self) -> Result<Arc<Message>> {
-        let wire = self.next_wire().await?;
+        let timeout = self.read_timeout;
+        let wire = Self::run_read(timeout, self.next_wire()).await?;
         Ok(Arc::clone(&wire.raw))
     }
 
@@ -926,12 +983,16 @@ impl Inbox {
     where
         F: FnMut(&Message) -> Option<T>,
     {
-        loop {
-            let wire = self.next_wire().await?;
-            if let Some(val) = f(&wire.raw) {
-                return Ok(val);
+        let timeout = self.read_timeout;
+        Self::run_read(timeout, async {
+            loop {
+                let wire = self.next_wire().await?;
+                if let Some(val) = f(&wire.raw) {
+                    return Ok(val);
+                }
             }
-        }
+        })
+        .await
     }
 
     fn pre_recv_check(&mut self) -> Result<()> {

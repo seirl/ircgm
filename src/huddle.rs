@@ -63,15 +63,18 @@ impl Huddle {
                 }
             }
         });
-        let inbox = core.inboxes.subscribe_with_on_chat(
-            Arc::clone(&core),
-            Filter::Scoped {
-                rooms: Vec::new(),
-                dm_users,
-            },
-            caller,
-            Some(on_chat),
-        );
+        let inbox = core
+            .inboxes
+            .subscribe_with_on_chat(
+                Arc::clone(&core),
+                Filter::Scoped {
+                    rooms: Vec::new(),
+                    dm_users,
+                },
+                caller,
+                Some(on_chat),
+            )
+            .read_timeout(crate::ask::DEFAULT_REPLY_TIMEOUT);
         Self {
             core,
             name,

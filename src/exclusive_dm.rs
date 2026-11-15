@@ -68,14 +68,17 @@ impl ExclusiveDm {
         lease: DmLease,
         caller: &'static Location<'static>,
     ) -> Self {
-        let inbox = core.inboxes.subscribe(
-            Arc::clone(&core),
-            Filter::Scoped {
-                rooms: Vec::new(),
-                dm_users: vec![lease.user().track_arc()],
-            },
-            caller,
-        );
+        let inbox = core
+            .inboxes
+            .subscribe(
+                Arc::clone(&core),
+                Filter::Scoped {
+                    rooms: Vec::new(),
+                    dm_users: vec![lease.user().track_arc()],
+                },
+                caller,
+            )
+            .read_timeout(crate::ask::DEFAULT_REPLY_TIMEOUT);
         Self { lease, inbox }
     }
 

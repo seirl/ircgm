@@ -288,11 +288,12 @@ async fn exclusive_many_available_and_huddle_semantics() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn unconfigured_dm_ask_uses_300s_default_reply_timeout_while_raw_inbox_reads_do_not() {
+async fn locked_dm_inboxes_default_to_300s_read_timeout_while_unlocked_inboxes_do_not() {
     let (bot, mut server) = test_harness("GM");
     server.complete_join("#lobby", &["BouncerUser"]);
     server.settle().await;
 
+    let lobby = bot.room("#lobby").unwrap();
     let bouncer = bot.user("BouncerUser").unwrap();
 
     // 1. Unconfigured `Ask` uses `AskConfig::default()` (300s reply timeout):
@@ -308,17 +309,31 @@ async fn unconfigured_dm_ask_uses_300s_default_reply_timeout_while_raw_inbox_rea
         assert_eq!(start.elapsed(), Duration::from_secs(300));
     }
 
-    // 2. Raw `dm.inbox()` reads do not implicitly time out unless wrapped with `with_timeout`:
+    // 2. Raw `ExclusiveDm` / `Huddle` `inbox()` reads also default to a 300s safety timeout so an
+    // AFK bouncer cannot hold `dm_mutex` forever, unless explicitly disabled:
     {
+        let start = tokio::time::Instant::now();
         let mut dm = bouncer.exclusive().await.unwrap();
+        assert!(matches!(dm.inbox().next_chat().await, Err(Error::TimedOut)));
+        assert_eq!(start.elapsed(), Duration::from_secs(300));
+
+        dm.inbox().set_read_timeout(None);
         let wait_fut = async {
             tokio::time::sleep(Duration::from_secs(600)).await;
             server.dm("BouncerUser", "back from dinner");
         };
         let (msg, ()) = tokio::join!(dm.inbox().next_chat(), wait_fut);
         assert_eq!(msg.unwrap().text, "back from dinner");
+    }
 
-        let timed = dm.inbox().next_chat().with_timeout(Duration::from_secs(12)).await;
-        assert!(matches!(timed, Err(Error::TimedOut)));
+    // 3. Unlocked `Room::inbox()` reads have no default timeout:
+    {
+        let wait_fut = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            server.chat("BouncerUser", "#lobby", "morning");
+        };
+        let mut inbox = lobby.inbox();
+        let (msg, ()) = tokio::join!(inbox.next_chat(), wait_fut);
+        assert_eq!(msg.unwrap().text, "morning");
     }
 }
