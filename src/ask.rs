@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::panic::Location;
@@ -285,21 +285,6 @@ impl AskConfig {
         Self::default()
     }
 
-    /// Shorthand for `AskConfig::new().reply_timeout(duration)`.
-    pub fn timeout(duration: Duration) -> Self {
-        Self::new().reply_timeout(duration)
-    }
-
-    /// Shorthand for `AskConfig::new().reply_deadline(instant)`.
-    pub fn deadline(instant: Instant) -> Self {
-        Self::new().reply_deadline(instant)
-    }
-
-    /// Shorthand for `AskConfig::new().no_reply_timeout()`.
-    pub fn untimed() -> Self {
-        Self::new().no_reply_timeout()
-    }
-
     pub fn reply_timeout(mut self, duration: Duration) -> Self {
         self.time_limit = TimeLimit::Duration(duration);
         self
@@ -479,35 +464,12 @@ impl User {
     }
 }
 
-trait ChatDyn: Send + Sync {
+trait PromptEndpoint: Send + Sync {
     fn say_text(&self, text: Text) -> Result<()>;
     fn notice_text(&self, text: Text) -> Result<()>;
     fn target(&self) -> Target;
     fn participants(&self) -> Option<Vec<User>>;
     fn inbox(&mut self) -> InboxRef<'_>;
-}
-
-impl<C: Chat + ?Sized> ChatDyn for C {
-    fn say_text(&self, text: Text) -> Result<()> {
-        self.say(text)
-    }
-    fn notice_text(&self, text: Text) -> Result<()> {
-        self.notice(text)
-    }
-    fn target(&self) -> Target {
-        Chat::target(self)
-    }
-    fn participants(&self) -> Option<Vec<User>> {
-        Chat::participants(self)
-    }
-    fn inbox(&mut self) -> InboxRef<'_> {
-        Chat::inbox(self)
-    }
-}
-
-trait PromptEndpoint: Send + Sync {
-    fn chat(&self) -> &dyn ChatDyn;
-    fn chat_mut(&mut self) -> &mut dyn ChatDyn;
     fn is_group(&self) -> bool {
         false
     }
@@ -515,30 +477,40 @@ trait PromptEndpoint: Send + Sync {
         None
     }
     fn inbox_for(&mut self, _users: Option<&[User]>) -> InboxRef<'_> {
-        self.chat_mut().inbox()
+        self.inbox()
     }
+}
+
+macro_rules! impl_endpoint_base {
+    () => {
+        fn say_text(&self, text: Text) -> Result<()> {
+            self.0.say(text)
+        }
+        fn notice_text(&self, text: Text) -> Result<()> {
+            self.0.notice(text)
+        }
+        fn target(&self) -> Target {
+            self.0.target()
+        }
+        fn participants(&self) -> Option<Vec<User>> {
+            self.0.participants()
+        }
+        fn inbox(&mut self) -> InboxRef<'_> {
+            self.0.inbox()
+        }
+    };
 }
 
 struct ChatEndpoint<C>(C);
 
 impl<C: Chat> PromptEndpoint for ChatEndpoint<C> {
-    fn chat(&self) -> &dyn ChatDyn {
-        &self.0
-    }
-    fn chat_mut(&mut self) -> &mut dyn ChatDyn {
-        &mut self.0
-    }
+    impl_endpoint_base!();
 }
 
 struct GroupEndpoint<G>(G);
 
 impl<G: GroupChat> PromptEndpoint for GroupEndpoint<G> {
-    fn chat(&self) -> &dyn ChatDyn {
-        &self.0
-    }
-    fn chat_mut(&mut self) -> &mut dyn ChatDyn {
-        &mut self.0
-    }
+    impl_endpoint_base!();
     fn is_group(&self) -> bool {
         true
     }
@@ -742,7 +714,6 @@ where
 #[derive(Clone, Debug)]
 pub struct Answers<T> {
     entries: Vec<(User, Option<Answer<T>>)>,
-    index_by_id: HashMap<UserId, usize>,
 }
 
 impl<T> Default for Answers<T> {
@@ -755,39 +726,30 @@ impl<T> Answers<T> {
     fn new_open() -> Self {
         Self {
             entries: Vec::new(),
-            index_by_id: HashMap::new(),
         }
     }
 
     fn new_closed(voters: Vec<User>) -> Self {
-        let mut entries = Vec::with_capacity(voters.len());
-        let mut index_by_id = HashMap::with_capacity(voters.len());
-        for u in voters {
-            if let std::collections::hash_map::Entry::Vacant(e) = index_by_id.entry(u.id()) {
-                e.insert(entries.len());
-                entries.push((u, None));
-            }
-        }
         Self {
-            entries,
-            index_by_id,
+            entries: dedup_users(voters).into_iter().map(|u| (u, None)).collect(),
         }
     }
 
+    fn find_idx(&self, uid: UserId) -> Option<usize> {
+        self.entries.iter().position(|(u, _)| u.id() == uid)
+    }
+
     fn record_answer(&mut self, user: &User, val: T) {
-        if let Some(&idx) = self.index_by_id.get(&user.id()) {
+        if let Some(idx) = self.find_idx(user.id()) {
             self.entries[idx].1 = Some(Answer::Ok(val));
         } else {
-            let idx = self.entries.len();
-            self.index_by_id.insert(user.id(), idx);
             self.entries.push((user.clone(), Some(Answer::Ok(val))));
         }
     }
 
     fn has_answered(&self, uid: UserId) -> bool {
-        self.index_by_id
-            .get(&uid)
-            .is_some_and(|&idx| matches!(self.entries[idx].1, Some(Answer::Ok(_))))
+        self.find_idx(uid)
+            .is_some_and(|idx| matches!(self.entries[idx].1, Some(Answer::Ok(_))))
     }
 
     fn record_left_if_pending(
@@ -829,13 +791,10 @@ impl<T> Answers<T> {
     }
 
     fn evict_open(&mut self, uid: UserId) -> bool {
-        let Some(removed_idx) = self.index_by_id.remove(&uid) else {
+        let Some(idx) = self.find_idx(uid) else {
             return false;
         };
-        self.entries.remove(removed_idx);
-        for (new_idx, (u, _)) in self.entries.iter().enumerate().skip(removed_idx) {
-            self.index_by_id.insert(u.id(), new_idx);
-        }
+        self.entries.remove(idx);
         true
     }
 
@@ -862,7 +821,7 @@ impl<T> Answers<T> {
 
     /// Borrows `user`'s accepted answer, if any.
     pub fn get(&self, user: &User) -> Option<&T> {
-        let &idx = self.index_by_id.get(&user.id())?;
+        let idx = self.find_idx(user.id())?;
         self.entries[idx].1.as_ref()?.as_ok()
     }
 
@@ -884,7 +843,7 @@ impl<T> Answers<T> {
     /// Borrows `user`'s full [`Answer`] outcome (`Ok`, `TimedOut`, `Left`, or `Unreachable`) when
     /// `user` was part of this prompt's roster or submitted an answer.
     pub fn answer_for(&self, user: &User) -> Option<Answer<&T>> {
-        let &idx = self.index_by_id.get(&user.id())?;
+        let idx = self.find_idx(user.id())?;
         Some(match &self.entries[idx].1 {
             Some(Answer::Ok(val)) => Answer::Ok(val),
             None | Some(Answer::TimedOut) => Answer::TimedOut,
@@ -1075,7 +1034,7 @@ where
                 TimeLimit::Duration(d) => Some(d.as_millis() as u64),
                 TimeLimit::Deadline(_) | TimeLimit::None => None,
             };
-            let target = u.endpoint.chat().target();
+            let target = u.endpoint.target();
             let span = tracing::debug_span!(
                 "ircgm::ask_many",
                 target = %target_span_label(&target),
@@ -1105,10 +1064,10 @@ fn make_ask_span(cfg: &AskConfig, source: &AskSource<'_>) -> tracing::Span {
             restricted_users,
             ..
         } => {
-            let target = endpoint.chat().target();
+            let target = endpoint.target();
             let single_nick = match restricted_users.as_deref() {
                 Some([only]) => Some(only.nick()),
-                None => match endpoint.chat().participants().as_deref() {
+                None => match endpoint.participants().as_deref() {
                     Some([only]) if !endpoint.is_group() => Some(only.nick()),
                     _ => None,
                 },
@@ -1187,11 +1146,11 @@ fn dedup_users(users: Vec<User>) -> Vec<User> {
     out
 }
 
-fn send_reply_to_msg(chat: &dyn ChatDyn, is_notice: bool, text: Text) {
+fn send_reply_to_msg(endpoint: &dyn PromptEndpoint, is_notice: bool, text: Text) {
     if is_notice {
-        let _ = chat.notice_text(text);
+        let _ = endpoint.notice_text(text);
     } else {
-        let _ = chat.say_text(text);
+        let _ = endpoint.say_text(text);
     }
 }
 
@@ -1249,7 +1208,7 @@ where
         }
     }
 
-    let base_participants = endpoint.chat().participants();
+    let base_participants = endpoint.participants();
     let voters = match restricted_users {
         Some(users) => Some(dedup_users(users)),
         None => base_participants.clone().map(dedup_users),
@@ -1290,7 +1249,7 @@ where
                 }
             }
             core.check_connected()?;
-            if let Target::Channel(ch) = endpoint.chat().target() {
+            if let Target::Channel(ch) = endpoint.target() {
                 core.state
                     .read()
                     .unwrap()
@@ -1309,22 +1268,6 @@ where
             }
         }
 
-        if !is_owned {
-            if snapshot_all_departed(
-                &voters,
-                None,
-                &mut answers,
-                &mut departed,
-                &mut last_terminal,
-            ) {
-                return Ok(PromptRunOutcome {
-                    answers,
-                    last_terminal,
-                    timed_out: false,
-                });
-            }
-            endpoint.chat_mut().inbox().clear();
-        }
         if snapshot_all_departed(
             &voters,
             owned.as_ref(),
@@ -1338,10 +1281,13 @@ where
                 timed_out: false,
             });
         }
+        if !is_owned {
+            endpoint.inbox().clear();
+        }
         (owned, inbox_core)
     };
 
-    match endpoint.chat().say_text(prompt.clone()) {
+    match endpoint.say_text(prompt.clone()) {
         Ok(()) => {}
         Err(Error::UserLeft { nick, reason }) => {
             last_terminal = Some(Answer::Left {
@@ -1367,7 +1313,7 @@ where
 
     let sent_at = Instant::now();
     let (deadline, mut pending_warnings) = compute_schedule(&cfg, sent_at);
-    let endpoint_target = endpoint.chat().target();
+    let endpoint_target = endpoint.target();
     let casemap = inbox_core
         .as_ref()
         .map_or_else(CaseMap::default, |c| c.casemap());
@@ -1399,7 +1345,7 @@ where
             let active_inbox: &mut Inbox = match &mut owned_inbox {
                 Some(inbox) => inbox,
                 None => {
-                    borrowed_inbox = endpoint.chat_mut().inbox();
+                    borrowed_inbox = endpoint.inbox();
                     &mut borrowed_inbox
                 }
             };
@@ -1426,7 +1372,7 @@ where
             LoopStep::Warn => {
                 if let Some((_, warn_msg)) = pending_warnings.pop_front() {
                     if deadline.is_some_and(|dl| Instant::now() < dl) {
-                        let _ = endpoint.chat().say_text(warn_msg);
+                        let _ = endpoint.say_text(warn_msg);
                     }
                 }
             }
@@ -1455,7 +1401,7 @@ where
                             target: &endpoint_target,
                             user: single_user,
                         };
-                        let _ = endpoint.chat().say_text(handler.render(&ctx));
+                        let _ = endpoint.say_text(handler.render(&ctx));
                     }
                 }
                 break;
@@ -1507,11 +1453,12 @@ where
                                 });
                             }
                         }
-                        let pool = base_participants.as_deref().or(voters.as_deref());
-                        if let (Some(pool), Some(tid)) = (pool, wire.bounce_user_id()) {
-                            if let Some(member) = pool.iter().find(|u| u.track_id() == tid) {
-                                if let Some(&idx) = answers.index_by_id.get(&member.id()) {
-                                    departed.insert(member.id());
+                        if voters.is_some() {
+                            if let Some(tid) = wire.bounce_user_id() {
+                                if let Some(idx) =
+                                    answers.entries.iter().position(|(u, _)| u.track_id() == tid)
+                                {
+                                    departed.insert(answers.entries[idx].0.id());
                                     answers.record_unreachable_if_pending(
                                         idx,
                                         target.clone(),
@@ -1600,7 +1547,7 @@ where
                             continue;
                         }
                         if voters.is_some()
-                            && (!answers.index_by_id.contains_key(&msg.sender.id())
+                            && (answers.find_idx(msg.sender.id()).is_none()
                                 || departed.contains(&msg.sender.id()))
                         {
                             continue;
@@ -1619,7 +1566,7 @@ where
                             // `PRIVMSG` (RFC 2812 §3.3.2).
                             AskMatchInner::Accept(val, ack) => {
                                 if let Some(ack_msg) = ack {
-                                    send_reply_to_msg(endpoint.chat(), msg.is_notice(), ack_msg);
+                                    send_reply_to_msg(endpoint, msg.is_notice(), ack_msg);
                                 }
                                 answers.record_answer(&msg.sender, val);
                                 if let Some(ref mut pred) = stop_pred {
@@ -1632,7 +1579,7 @@ where
                                 }
                             }
                             AskMatchInner::Reject(feedback) => {
-                                send_reply_to_msg(endpoint.chat(), msg.is_notice(), feedback);
+                                send_reply_to_msg(endpoint, msg.is_notice(), feedback);
                             }
                             AskMatchInner::Ignore => {}
                         }
@@ -1669,7 +1616,7 @@ fn on_user_departure<O>(
         }
         return false;
     };
-    let Some(&idx) = answers.index_by_id.get(&uid) else {
+    let Some(idx) = answers.find_idx(uid) else {
         return false;
     };
     departed.insert(uid);
@@ -1772,7 +1719,7 @@ where
     if invalid_max_zero {
         return Err(Error::InvalidInput("AskMany::max_answers requires max >= 1"));
     }
-    let is_open_group = endpoint.chat().participants().is_none() && restricted_users.is_none();
+    let is_open_group = endpoint.participants().is_none() && restricted_users.is_none();
     if matches!(cfg.time_limit, TimeLimit::None) && stop_pred.is_none() {
         if allow_change {
             return Err(Error::InvalidInput(

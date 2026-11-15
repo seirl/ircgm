@@ -74,12 +74,12 @@ pub async fn run_round_with_shoe(
     players: &[User],
     mut shoe: VecDeque<u8>,
 ) -> Result<()> {
-    let turn_cfg = AskConfig::timeout(Duration::from_secs(30)).timeout_message_fn(|ctx| {
-        match ctx.user {
+    let turn_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(30))
+        .timeout_message_fn(|ctx| match ctx.user {
             Some(u) => irc_format!("{}: ⏳ too slow, auto-standing!", u.nick().bold().yellow()),
             None => "⏳ Time's up!".yellow(),
-        }
-    });
+        });
 
     room.ask(
         "Seated players: anyone type `!deal` to cut the deck!",

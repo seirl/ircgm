@@ -1,8 +1,8 @@
 //! Direct-style `async`/`await` IRC game master and interactive bot library.
 //!
 //! `ircgm` replaces state-machine enums and callback spaghetti with structured direct-style futures:
-//! - [`Bot`] manages the IRC connection pump, registration barrier, priority outbound flood scheduler,
-//!   and session-scoped [`Room`], [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
+//! - [`Bot`] manages the IRC connection pump, registration barrier, and session-scoped [`Room`],
+//!   [`User`], [`ExclusiveDm`], [`Huddle`], [`Breakout`], and [`Inbox`] handles.
 //! - [`Ask`], [`AskMany`], and [`AskConfig`] provide ergonomic prompts with reply clocks,
 //!   inline [`AskMatch::reject`] validation, [`AskMatch::accept_say`] confirmations, countdown
 //!   warnings, per-player timeout callouts, and explicit [`Answer`] outcomes by default.
@@ -41,7 +41,7 @@
 //!                     _ => AskMatch::reject("Enter a number between 1 and 5!".yellow()),
 //!                 },
 //!             )
-//!             .config(AskConfig::timeout(Duration::from_secs(15)))
+//!             .config(AskConfig::new().reply_timeout(Duration::from_secs(15)))
 //!             .await?
 //!         {
 //!             Answer::Ok(3) => room.say("🎉 Spot on!".green().bold())?,

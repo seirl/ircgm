@@ -7,12 +7,7 @@ use crate::state::parse_irc_message;
 
 fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
     let casemap = AtomicCaseMap::default();
-    let (outbound, _task) = OutboundSink::new(
-        RawTransport::test_only(out_tx),
-        usize::MAX,
-        Duration::from_secs(8),
-        casemap.clone(),
-    );
+    let outbound = OutboundSink::new(RawTransport::test_only(out_tx));
     BotCore::new(
         "gm".into(),
         casemap,

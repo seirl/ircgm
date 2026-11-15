@@ -104,15 +104,6 @@ impl Huddle {
         self.leases.iter().map(|l| l.user().clone()).collect()
     }
 
-    pub fn online_users(&self) -> Vec<User> {
-        self.leases
-            .iter()
-            .map(DmLease::user)
-            .filter(|u| u.is_online())
-            .cloned()
-            .collect()
-    }
-
     /// Returns `true` if `user` is a member of this `Huddle`.
     pub fn has_user(&self, user: &User) -> bool {
         user.belongs_to(&self.core) && self.leases.iter().any(|l| l.user() == user)

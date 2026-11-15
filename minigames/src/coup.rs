@@ -228,7 +228,8 @@ pub async fn resolve_steal_attempt(
             },
         )
         .config(
-            AskConfig::timeout(Duration::from_secs(20))
+            AskConfig::new()
+                .reply_timeout(Duration::from_secs(20))
                 .ignore_commands()
                 .warn_remaining(Duration::from_secs(5), "⏳ 5s left to block!".yellow()),
         )

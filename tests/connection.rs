@@ -5,7 +5,7 @@ use std::time::Duration;
 use irc::proto::Command;
 use ircgm::fmt::{Color, ColorValue};
 use ircgm::prelude::*;
-use ircgm::testing::{test_harness, test_harness_with};
+use ircgm::testing::test_harness;
 use ircgm::{race_all, BotConfig, BreakoutOptions, CaseMap, DisconnectReason};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -355,14 +355,8 @@ async fn priority_scheduling_supervision_and_bot_quit_drain() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn crlf_split_pacing_warn_396_cloak_wrapping_and_inbound_formatting() {
-    let (logs, _guard) = common::capture_warns();
-    let cfg = BotConfig {
-        outbound_burst: 2,
-        outbound_window: Duration::from_secs(8),
-        ..BotConfig::default()
-    };
-    let (bot, mut server) = test_harness_with("GM", cfg);
+async fn crlf_split_396_cloak_wrapping_and_inbound_formatting() {
+    let (bot, mut server) = test_harness("GM");
     server.welcome("Welcome to IRC GM!~gamemaster@127.0.0.1");
     server.complete_join("#room", &["Alice"]);
     server.settle().await;
@@ -370,7 +364,7 @@ async fn crlf_split_pacing_warn_396_cloak_wrapping_and_inbound_formatting() {
     let room = bot.room("#room").unwrap();
 
     room.say("hello\r\nQUIT :injected").unwrap();
-    room.say("paced third line").unwrap();
+    room.say("third line").unwrap();
 
     assert_eq!(
         server.recv_sent().await.unwrap(),
@@ -380,15 +374,9 @@ async fn crlf_split_pacing_warn_396_cloak_wrapping_and_inbound_formatting() {
         server.recv_sent().await.unwrap(),
         Command::PRIVMSG("#room".into(), "QUIT :injected".into())
     );
-    assert!(server.try_recv_sent().is_none());
-    assert!(logs
-        .text()
-        .contains("outbound IRC rate limit reached; pacing queued commands"));
-
-    tokio::time::advance(Duration::from_secs(8)).await;
     assert_eq!(
         server.recv_sent().await.unwrap(),
-        Command::PRIVMSG("#room".into(), "paced third line".into())
+        Command::PRIVMSG("#room".into(), "third line".into())
     );
 
     let (bot2, mut server2) = test_harness("GM");

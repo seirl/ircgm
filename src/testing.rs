@@ -20,18 +20,12 @@ use crate::outbound::{OutboundSink, RawTransport};
 use crate::pump::{run_pump, PumpInput, PumpSource, RegistrationTracker};
 use crate::state::parse_irc_message;
 
-/// Creates an in-memory `(Bot, TestServer)` pair with zero sockets and unthrottled outbound writes
-/// (`outbound_burst = usize::MAX`) for fast, deterministic unit tests.
+/// Creates an in-memory `(Bot, TestServer)` pair with zero sockets for fast, deterministic tests.
 pub fn test_harness(initial_nick: impl Into<String>) -> (Bot, TestServer) {
-    let cfg = BotConfig {
-        outbound_burst: usize::MAX,
-        ..BotConfig::default()
-    };
-    test_harness_with(initial_nick, cfg)
+    test_harness_with(initial_nick, BotConfig::default())
 }
 
-/// Creates an in-memory `(Bot, TestServer)` pair honoring custom [`BotConfig`] settings
-/// (including `outbound_burst` / `outbound_window` pacing tests).
+/// Creates an in-memory `(Bot, TestServer)` pair honoring custom [`BotConfig`] settings.
 pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> (Bot, TestServer) {
     let initial_nick = initial_nick.into();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -39,17 +33,12 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
 
     let casemap = AtomicCaseMap::default();
     let eof_tx = inbound_tx.clone();
-    let (outbound, outbound_task) = OutboundSink::new(
-        RawTransport::Test {
-            outbound_tx,
-            on_quit: Some(Box::new(move || {
-                let _ = eof_tx.send(PumpInput::Eof);
-            })),
-        },
-        config.outbound_burst,
-        config.outbound_window,
-        casemap.clone(),
-    );
+    let outbound = OutboundSink::new(RawTransport::Test {
+        outbound_tx,
+        on_quit: Some(Box::new(move || {
+            let _ = eof_tx.send(PumpInput::Eof);
+        })),
+    });
     let core = BotCore::new(
         initial_nick.clone(),
         casemap,
@@ -74,7 +63,6 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
     let owner = Arc::new(BotOwner {
         core,
         pump_task,
-        outbound_task,
         _live_client: Mutex::new(None),
     });
 

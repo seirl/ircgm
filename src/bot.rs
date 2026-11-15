@@ -15,9 +15,7 @@ use crate::error::{DisconnectReason, Error, Result};
 use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDm};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox};
-use crate::outbound::{
-     validate_param, validate_target, OutboundSink, Priority, RawTransport,
-};
+use crate::outbound::{validate_param, validate_target, OutboundSink, RawTransport};
 use crate::pump::{run_pump, PumpSource, RegistrationTracker};
 use crate::room::Room;
 use crate::state::JoinOutcome;
@@ -98,14 +96,10 @@ pub struct BotConfig {
     pub request_caps: Vec<String>,
     /// Command prefixes skipped when `.ignore_commands()` is opted into (default: `["!"]`).
     pub command_prefixes: Vec<String>,
-    /// Default timeout for protocol handshakes like `JOIN`/`NAMES`, `Breakout`, and `quit` drain (default: `15s`).
+    /// Default timeout for protocol handshakes like `JOIN`/`NAMES`, `Breakout`, and `quit` (default: `15s`).
     pub handshake_timeout: Duration,
     /// Upper ceiling on payload bytes per outbound `PRIVMSG`/`NOTICE` passed to `Text::wrap` (default: `450`).
     pub max_payload_bytes: usize,
-    /// Outbound scheduler burst allowance (default: `15` lines per `8s` on live connections).
-    pub outbound_burst: usize,
-    /// Outbound scheduler rolling window (default: `8s`).
-    pub outbound_window: Duration,
 }
 
 impl Default for BotConfig {
@@ -129,8 +123,6 @@ impl BotConfig {
             command_prefixes: vec!["!".into()],
             handshake_timeout: Duration::from_secs(15),
             max_payload_bytes: 450,
-            outbound_burst: 15,
-            outbound_window: Duration::from_secs(8),
         }
     }
 
@@ -154,7 +146,6 @@ impl BotConfig {
 pub(crate) struct BotOwner {
     pub(crate) core: Arc<BotCore>,
     pub(crate) pump_task: JoinHandle<()>,
-    pub(crate) outbound_task: Option<JoinHandle<()>>,
     /// Keeps `irc::client::Client` alive for the lifetime of live TCP/TLS sessions so its
     /// background outgoing writer task does not drop prematurely.
     pub(crate) _live_client: Mutex<Option<irc::client::Client>>,
@@ -172,9 +163,6 @@ impl Drop for BotOwner {
     fn drop(&mut self) {
         self.core.mark_disconnected(DisconnectReason::BotDropped);
         self.pump_task.abort();
-        if let Some(ref handle) = self.outbound_task {
-            handle.abort();
-        }
 
         self.core.state.write().unwrap().clear();
         self.core.users.clear();
@@ -203,7 +191,6 @@ impl Bot {
     /// `376 RPL_ENDOFMOTD` / `422 ERR_NOMOTD` (with `handshake_timeout` fallback), and joins
     /// any initial channels configured in `config.irc.channels`.
     pub async fn connect_with(mut config: BotConfig) -> Result<Self> {
-        config.irc.max_messages_in_burst = Some(u32::MAX);
         let initial_channels = std::mem::take(&mut config.irc.channels);
         let channel_keys = std::mem::take(&mut config.irc.channel_keys);
 
@@ -221,12 +208,7 @@ impl Bot {
         let sender = client.sender();
 
         let casemap = AtomicCaseMap::default();
-        let (outbound, outbound_task) = OutboundSink::new(
-            RawTransport::Irc(sender),
-            config.outbound_burst,
-            config.outbound_window,
-            casemap.clone(),
-        );
+        let outbound = OutboundSink::new(RawTransport::Irc(sender));
         let core = BotCore::new(
             nick.clone(),
             casemap,
@@ -252,7 +234,6 @@ impl Bot {
             owner: Arc::new(BotOwner {
                 core: Arc::clone(&core),
                 pump_task,
-                outbound_task,
                 _live_client: Mutex::new(Some(client)),
             }),
         };
@@ -273,9 +254,7 @@ impl Bot {
         }
         init_cmds.push(Command::NICK(nick));
         init_cmds.push(Command::USER(username, "0".into(), realname));
-        let _ = core
-            .outbound
-            .enqueue_batch(Priority::Interactive, init_cmds);
+        core.outbound.enqueue_batch(init_cmds);
 
         bot.wait_for_registration().await?;
 
@@ -327,10 +306,12 @@ impl Bot {
                             tracing::warn!(
                                 "registration barrier timed out waiting for CAP/376/422 after 001 welcome; proceeding"
                             );
-                            let _ = core.outbound.enqueue_one(
-                                Priority::Interactive,
-                                Command::CAP(None, CapSubCommand::END, None, None),
-                            );
+                            core.outbound.enqueue_one(Command::CAP(
+                                None,
+                                CapSubCommand::END,
+                                None,
+                                None,
+                            ));
                             core.mark_registered();
                             return Ok(());
                         }
@@ -532,10 +513,11 @@ impl Bot {
         };
 
         if send_join {
-            let _ = core.outbound.enqueue_one(
-                Priority::Interactive,
-                Command::JOIN(channel.to_owned(), key.map(str::to_owned), None),
-            );
+            core.outbound.enqueue_one(Command::JOIN(
+                channel.to_owned(),
+                key.map(str::to_owned),
+                None,
+            ));
         }
 
         let outcome = tokio::select! {
@@ -591,8 +573,7 @@ impl Bot {
                 if let Some(ch) = self.channel.take() {
                     if self.core.check_connected().is_ok() {
                         let part = Command::PART(ch.clone(), None);
-                        self.core
-                            .enqueue_part(&ch, Priority::Background, vec![part], true);
+                        self.core.enqueue_part(&ch, vec![part], true);
                     }
                 }
             }
@@ -652,9 +633,7 @@ impl Bot {
     pub fn send_raw(&self, cmd: impl Into<Command>) -> Result<()> {
         let core = &self.owner.core;
         core.check_connected()?;
-        let _ = core
-            .outbound
-            .enqueue_one(Priority::Interactive, cmd.into());
+        core.outbound.enqueue_one(cmd.into());
         Ok(())
     }
 
@@ -749,19 +728,10 @@ impl Bot {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        // 2. Drain both Interactive and Background queues followed by QUIT:
+        // 2. Send `QUIT` and best-effort wait (within `handshake_timeout`) for the peer to close
+        // the connection so live TCP sockets flush `QUIT` cleanly:
         let deadline = crate::future::deadline_after(core.handshake_timeout);
-        if let Some(quit_rx) = core.outbound.enqueue_quit(reason) {
-            if tokio::time::timeout_at(deadline, quit_rx).await.is_err() {
-                core.finalize_quit();
-                return Err(Error::HandshakeTimeout {
-                    operation: "quit outbound drain",
-                });
-            }
-        }
-
-        // Best-effort wait (within the remaining `handshake_timeout` budget) for the peer to close
-        // the connection after receiving `QUIT` so live TCP sockets flush `QUIT` cleanly:
+        core.outbound.send_quit(reason);
         let _ = tokio::time::timeout_at(deadline, core.wait_disconnected()).await;
         core.finalize_quit();
         Ok(())

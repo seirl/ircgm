@@ -155,39 +155,21 @@ async fn user_ids_are_globally_unique_and_cross_bot_inbox_scope_is_rejected() {
 }
 
 #[tokio::test]
-async fn socket_eof_aborts_throttled_outbound_write_receipt_immediately() {
-    let cfg = BotConfig {
-        outbound_burst: 1,
-        outbound_window: Duration::from_secs(3600),
-        ..BotConfig::default()
-    };
-    let (bot, mut server) = test_harness_with("gm", cfg);
+async fn socket_eof_aborts_active_ask_immediately() {
+    let (bot, mut server) = test_harness("gm");
     server.complete_join("#lobby", &["alice"]);
     server.settle().await;
     let room = bot.room("#lobby").unwrap();
 
-    // Consume the single burst slot so the next outbound send is throttled for 3600s:
-    room.say("first line consumes burst").unwrap();
-    assert_eq!(
-        server.recv_sent().await,
-        Some(Command::PRIVMSG(
-            "#lobby".into(),
-            "first line consumes burst".into()
-        ))
-    );
-
-    // Spawn an `Ask` whose prompt is throttled in `OutboundSink`:
     let ask_task = tokio::spawn(async move {
-        room.ask("throttled prompt", |m| Some(m.text.clone())).await
+        room.ask("waiting prompt", |m| Some(m.text.clone())).await
     });
-    tokio::task::yield_now().await;
-    assert!(server.try_recv_sent().is_none());
+    assert_eq!(server.recv_message_to("#lobby").await, "waiting prompt");
 
-    // Socket EOF aborts `OutboundSink` and closes the inbox so the `Ask` unblocks immediately:
     server.disconnect();
     let res = tokio::time::timeout(Duration::from_secs(1), ask_task)
         .await
-        .expect("throttled Ask stalled after EOF")
+        .expect("Ask stalled after EOF")
         .unwrap();
     assert!(matches!(
         res,

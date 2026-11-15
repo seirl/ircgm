@@ -12,7 +12,6 @@ use crate::error::DisconnectReason;
 use crate::message::{
     parse_privmsg_body, ChatMessage, Event, MessageKind, Target, WireEvent, WireKind, WireMeta,
 };
-use crate::outbound::Priority;
 use crate::user::{normalize_account, User};
 
 /// Inbound feed of the in-memory [`crate::testing::TestServer`] transport.
@@ -177,10 +176,8 @@ fn process_message(
             let is_multiline_cont = arg3.as_deref() == Some("*");
             if reg.cap_pending && !is_multiline_cont {
                 reg.cap_pending = false;
-                core.outbound.enqueue_one(
-                    Priority::Interactive,
-                    Command::CAP(None, CapSubCommand::END, None, None),
-                );
+                core.outbound
+                    .enqueue_one(Command::CAP(None, CapSubCommand::END, None, None));
                 if reg.is_ready() {
                     core.mark_registered();
                 }

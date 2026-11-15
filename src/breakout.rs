@@ -13,7 +13,7 @@ use irc_colors::Text;
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
 use crate::message::{Event, WireKind};
-use crate::outbound::{sanitize_reason, sanitize_text, Priority};
+use crate::outbound::{sanitize_reason, sanitize_text};
 use crate::room::Room;
 use crate::user::{User, UserStatus};
 
@@ -160,7 +160,7 @@ impl Drop for Breakout {
             let cmds = self.build_teardown_commands();
             self.room
                 .core()
-                .enqueue_part(self.room.name(), Priority::Background, cmds, true);
+                .enqueue_part(self.room.name(), cmds, true);
         }
     }
 }
@@ -219,11 +219,6 @@ impl Breakout {
     /// Borrows the underlying [`Room`] without moving or disarming `Breakout`.
     pub fn room(&self) -> &Room {
         &self.room
-    }
-
-    /// Clones the underlying [`Room`] view without moving or disarming `Breakout`.
-    pub fn to_room(&self) -> Room {
-        self.room.clone()
     }
 
     /// Strict all-or-nothing invite handshake.
@@ -315,8 +310,7 @@ impl Breakout {
         }
 
         if !invite_cmds.is_empty() {
-            core.outbound
-                .enqueue_batch(Priority::Interactive, invite_cmds);
+            core.outbound.enqueue_batch(invite_cmds);
         }
 
         if joined_ids.len() + gone_ids.len() >= tracked_users.len() {
@@ -477,7 +471,7 @@ impl Breakout {
         );
 
         let cmds = self.build_teardown_commands();
-        core.enqueue_part(self.room.name(), Priority::Interactive, cmds, true);
+        core.enqueue_part(self.room.name(), cmds, true);
 
         // If the channel wasn't even joined in WorldState anymore, return immediately:
         if core

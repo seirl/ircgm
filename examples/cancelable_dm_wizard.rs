@@ -35,7 +35,9 @@ pub async fn pick_loadout_or_cancel(player: &User) -> Result<Option<[String; 3]>
 }
 
 pub async fn resolve_simultaneous_triggers(player: &User) -> Result<(bool, Option<usize>)> {
-    let prompt_cfg = AskConfig::timeout(Duration::from_secs(20)).ignore_commands();
+    let prompt_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(20))
+        .ignore_commands();
 
     let (ans_block, ans_card) = tokio::try_join!(
         player

@@ -8,9 +8,7 @@ use tokio::sync::watch;
 use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::inbox::InboxRegistry;
-use crate::outbound::{
-    build_chat_commands, validate_target, OutboundChatKind, OutboundSink, Priority,
-};
+use crate::outbound::{build_chat_commands, validate_target, OutboundChatKind, OutboundSink};
 use crate::state::WorldState;
 use crate::user::UserRegistry;
 
@@ -187,13 +185,12 @@ impl BotCore {
     pub(crate) fn enqueue_part(
         &self,
         channel: &str,
-        priority: Priority,
         cmds: Vec<Command>,
         evict_on_leave: bool,
     ) {
         let mut ws = self.state.write().unwrap();
         ws.mark_parting(channel, evict_on_leave);
-        self.outbound.enqueue_batch(priority, cmds);
+        self.outbound.enqueue_batch(cmds);
     }
 
     /// Enqueues a validated, line-wrapped outbound chat message.
@@ -208,7 +205,7 @@ impl BotCore {
         let ws = self.state.read().unwrap();
         let cmds = build_chat_commands(kind, target, text, &ws, self.max_payload_bytes);
         drop(ws);
-        self.outbound.enqueue_batch(Priority::Interactive, cmds);
+        self.outbound.enqueue_batch(cmds);
         Ok(())
     }
 }

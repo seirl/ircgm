@@ -24,7 +24,7 @@ async fn exclusive_serialization_and_15s_holder_location_warning() {
     let interrupt_task = tokio::spawn(async move {
         alice_bg
             .ask("Interrupt?", |m| Some(m.text.clone()))
-            .config(AskConfig::timeout(Duration::from_secs(30)))
+            .config(AskConfig::new().reply_timeout(Duration::from_secs(30)))
             .await
     });
     tokio::task::yield_now().await;
@@ -144,7 +144,7 @@ async fn stale_inbox_cleared_between_exclusive_dm_asks() {
 
     let res1 = dm
         .ask("Question 1?", |m| Some(m.text.clone()))
-        .config(AskConfig::timeout(Duration::from_secs(5)))
+        .config(AskConfig::new().reply_timeout(Duration::from_secs(5)))
         .await
         .unwrap()
         .ok();

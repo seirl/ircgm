@@ -89,7 +89,7 @@ async fn build_teardown_commands_honors_kick_on_drop_and_targmax_kick() {
     // Disarm so `Drop` doesn't enqueue duplicate commands, then check `kick_on_drop(false)`:
     br.armed = false;
     let br_no_kick = Breakout {
-        room: br.to_room(),
+        room: br.room().clone(),
         opts: BreakoutOptions::exact("#vault").kick_on_drop(false),
         armed: false,
     };

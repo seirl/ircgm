@@ -86,13 +86,16 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
     assert!(def_warns.is_empty());
 
     // TimeLimit::None produces no deadline and no warnings even if configured:
-    let none_cfg = AskConfig::untimed().warn_remaining(Duration::from_secs(10), "10s!");
+    let none_cfg = AskConfig::new()
+        .no_reply_timeout()
+        .warn_remaining(Duration::from_secs(10), "10s!");
     let (dl, warns) = compute_schedule(&none_cfg, now);
     assert!(dl.is_none());
     assert!(warns.is_empty());
 
     // TimeLimit::Duration filters out rem == 0 and rem >= dur, and sorts chronologically:
-    let dur_cfg = AskConfig::timeout(Duration::from_secs(30))
+    let dur_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(30))
         .warn_remaining(Duration::from_secs(5), "5s left")
         .warn_remaining(Duration::ZERO, "zero ignored")
         .warn_remaining(Duration::from_secs(30), "equal to timeout ignored")
@@ -110,7 +113,8 @@ fn compute_schedule_filters_and_sorts_countdown_warnings() {
 
     // TimeLimit::Deadline computes budget relative to sent_at:
     let target_dl = now + Duration::from_secs(15);
-    let dl_cfg = AskConfig::deadline(target_dl)
+    let dl_cfg = AskConfig::new()
+        .reply_deadline(target_dl)
         .warn_remaining(Duration::from_secs(20), "exceeds budget")
         .warn_remaining(Duration::from_secs(5), "5s left");
     let (dl, warns) = compute_schedule(&dl_cfg, now);
@@ -312,7 +316,8 @@ async fn ask_many_from_users_locks_in_deduplicates_warns_and_finishes_early_on_d
             })
             .from_users(&voters)
             .config(
-                AskConfig::timeout(Duration::from_secs(20))
+                AskConfig::new()
+                    .reply_timeout(Duration::from_secs(20))
                     .warn_remaining(Duration::from_secs(5), "5s left!")
                     .timeout_message("Someone was too slow!"),
             )
@@ -381,7 +386,7 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
     let no_timer_err = room
         .ask_many("Vote:", |_| AskMatch::accept(()))
         .from_users([&alice])
-        .config(AskConfig::untimed())
+        .config(AskConfig::new().no_reply_timeout())
         .allow_change(true)
         .await
         .unwrap_err();
@@ -405,12 +410,12 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
             .from_users(&voters)
             .allow_change(true)
             .config(
-                AskConfig::timeout(Duration::from_secs(10)).timeout_message_fn(|ctx| {
-                    match ctx.user {
+                AskConfig::new()
+                    .reply_timeout(Duration::from_secs(10))
+                    .timeout_message_fn(|ctx| match ctx.user {
                         Some(u) => Text::from(format!("{} didn't vote!", u.nick())),
                         None => Text::from("Multiple non-voters!"),
-                    }
-                }),
+                    }),
             )
             .await
         }
@@ -460,7 +465,7 @@ async fn ask_many_allow_change_and_open_newcomer_recruitment_with_stop_when() {
                 }
             })
             .allow_change(true)
-            .config(AskConfig::untimed())
+            .config(AskConfig::new().no_reply_timeout())
             .stop_when(|a| a.values().filter(|&&yes| yes).count() >= 2)
             .await
         }

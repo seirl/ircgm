@@ -16,7 +16,7 @@
 //!    - Any unguarded victim is eliminated (`-v` devoiced) and non-blockingly invited to a dead-chat
 //!      `#graveyard-xxxxxx` [`Breakout`] via [`Breakout::invite_available`].
 //!    - All surviving players cast a simultaneous secret DM ballot ([`User::ask`] +
-//!      [`AskConfig::deadline`] + [`AskMatch::accept_say`] / [`AskMatch::reject`]). Exiling a
+//!      [`AskConfig::reply_deadline`] + [`AskMatch::accept_say`] / [`AskMatch::reject`]). Exiling a
 //!      Werewolf wins for **Town**; otherwise **Werewolves Win**!
 //!
 //! ## Library Mechanics Showcased
@@ -28,7 +28,7 @@
 //! - **Concurrent `0..=N` DM prompts:** Joins every online bodyguard's `!protect` prompt, so dawn
 //!   comes as soon as each has answered or timed out (immediately when `0` guards are online).
 //! - **Shared-deadline DM ballots:** Combines concurrent [`User::ask`] prompts with
-//!   [`AskConfig::deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
+//!   [`AskConfig::reply_deadline`], [`AskMatch::accept_say`], and [`AskMatch::reject`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -125,7 +125,8 @@ pub async fn werewolf_pack_kill(
             },
         )
         .config(
-            AskConfig::timeout(Duration::from_secs(30))
+            AskConfig::new()
+                .reply_timeout(Duration::from_secs(30))
                 .timeout_message("⏳ Dawn breaks—the pack missed its chance!".yellow()),
         )
         .await?
@@ -172,7 +173,7 @@ pub async fn collect_secret_votes(
                         ),
                     }
                 })
-                .config(AskConfig::deadline(deadline))
+                .config(AskConfig::new().reply_deadline(deadline))
                 .await?
                 .ok();
             Ok::<_, Error>((voter.clone(), pick))
@@ -238,7 +239,7 @@ pub async fn run_mafia_round(
                             }
                         },
                     )
-                    .config(AskConfig::timeout(Duration::from_secs(5)))
+                    .config(AskConfig::new().reply_timeout(Duration::from_secs(5)))
                     .await?
                     .ok();
                 Ok::<_, Error>(pick)

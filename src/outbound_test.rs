@@ -1,4 +1,5 @@
 use super::*;
+use crate::casemap::AtomicCaseMap;
 use crate::fmt::Colorize as _;
 use irc::proto::Response;
 
@@ -103,156 +104,18 @@ async fn crlf_splitting_ctcp_sanitization_and_396_wire_budget() {
     assert_eq!(sanitize_reason("bye\r\nQUIT\0"), "byeQUIT");
 }
 
-#[tokio::test(start_paused = true)]
-async fn priority_scheduling_same_channel_flush_and_quit_drain() {
+#[test]
+fn fifo_outbound_sink_stops_accepting_commands_after_quit_or_abort() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _task) = OutboundSink::new(
-        RawTransport::test_only(tx),
-        2,
-        Duration::from_secs(8),
-        AtomicCaseMap::default(),
-    );
+    let sink = OutboundSink::new(RawTransport::test_only(tx));
 
-    // Consume initial 2-message burst at t = 0:
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
-    );
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
-    );
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::PRIVMSG("#lobby".into(), "m1".into())
-    );
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::PRIVMSG("#lobby".into(), "m2".into())
-    );
+    sink.enqueue_batch(vec![
+        Command::PRIVMSG("#lobby".into(), "a".into()),
+        Command::PRIVMSG("#lobby".into(), "b".into()),
+    ]);
+    sink.send_quit(Some("bye"));
+    sink.enqueue_one(Command::PRIVMSG("#lobby".into(), "ignored".into()));
 
-    // Enqueue Background KICK + PART on #vault and #other, followed by Interactive PRIVMSG and JOIN #VAULT:
-    sink.enqueue_batch(
-        Priority::Background,
-        vec![
-            Command::KICK("#other".into(), "Bob".into(), None),
-            Command::PART("#other".into(), None),
-            Command::KICK("#vault".into(), "Alice".into(), None),
-            Command::PART("#vault".into(), None),
-        ],
-    );
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "urgent_prompt".into())],
-    );
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::JOIN("#VAULT".into(), None, None)],
-    );
-    let r_quit = sink.enqueue_quit(Some("bye")).unwrap();
-
-    assert!(rx.try_recv().is_err());
-
-    // t = 8s -> `urgent_prompt` + same-channel `KICK #vault Alice` pulled ahead of `JOIN #VAULT`:
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::PRIVMSG("#lobby".into(), "urgent_prompt".into())
-    );
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::KICK("#vault".into(), "Alice".into(), None)
-    );
-    assert!(rx.try_recv().is_err());
-
-    // t = 16s -> `PART #vault`, then `JOIN #VAULT`:
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::PART("#vault".into(), None)
-    );
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::JOIN("#VAULT".into(), None, None)
-    );
-
-    // t = 24s -> remaining Background `#other` KICK + PART:
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::KICK("#other".into(), "Bob".into(), None)
-    );
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::PART("#other".into(), None)
-    );
-
-    // t = 32s -> QUIT drains last!
-    tokio::time::advance(Duration::from_secs(8)).await;
-    r_quit.await.unwrap();
-    assert_eq!(rx.try_recv().unwrap(), Command::QUIT(Some("bye".into())));
-}
-
-#[tokio::test(start_paused = true)]
-async fn join_followed_by_later_background_part_preserves_join_before_part() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _task) = OutboundSink::new(
-        RawTransport::test_only(tx),
-        1,
-        Duration::from_secs(8),
-        AtomicCaseMap::default(),
-    );
-
-    // Consume burst = 1 slot at t = 0:
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "warmup".into())],
-    );
-    let _ = rx.try_recv().unwrap();
-
-    // Now rate-limited: enqueue `JOIN #c` (Interactive), THEN `PART #c` (Background):
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::JOIN("#c".into(), None, None)],
-    );
-    sink.enqueue_batch(
-        Priority::Background,
-        vec![Command::PART("#c".into(), None)],
-    );
-
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        Command::JOIN("#c".into(), None, None)
-    );
-
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(rx.try_recv().unwrap(), Command::PART("#c".into(), None));
-}
-
-#[tokio::test(start_paused = true)]
-async fn unthrottled_sink_skips_pacer_and_flushes_synchronously() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, task) = OutboundSink::new(
-        RawTransport::test_only(tx),
-        usize::MAX,
-        Duration::from_secs(8),
-        AtomicCaseMap::default(),
-    );
-    assert!(task.is_none());
-    sink.enqueue_batch(
-        Priority::Interactive,
-        vec![
-            Command::PRIVMSG("#lobby".into(), "a".into()),
-            Command::PRIVMSG("#lobby".into(), "b".into()),
-        ],
-    );
     assert_eq!(
         rx.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "a".into())
@@ -261,37 +124,6 @@ async fn unthrottled_sink_skips_pacer_and_flushes_synchronously() {
         rx.try_recv().unwrap(),
         Command::PRIVMSG("#lobby".into(), "b".into())
     );
-
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let (sink2, task2) = OutboundSink::new(
-        RawTransport::test_only(tx2),
-        1,
-        Duration::from_secs(8),
-        AtomicCaseMap::default(),
-    );
-    assert!(task2.is_some());
-    sink2.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "m1".into())],
-    );
-    sink2.enqueue_batch(
-        Priority::Interactive,
-        vec![Command::PRIVMSG("#lobby".into(), "m2".into())],
-    );
-    sink2.enqueue_one(
-        Priority::Interactive,
-        Command::PRIVMSG("#lobby".into(), "m3".into()),
-    );
-
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        rx2.try_recv().unwrap(),
-        Command::PRIVMSG("#lobby".into(), "m1".into())
-    );
-    assert_eq!(
-        rx2.try_recv().unwrap(),
-        Command::PRIVMSG("#lobby".into(), "m2".into())
-    );
-    assert!(rx2.try_recv().is_err());
+    assert_eq!(rx.try_recv().unwrap(), Command::QUIT(Some("bye".into())));
+    assert!(rx.try_recv().is_err());
 }

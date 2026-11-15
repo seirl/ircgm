@@ -63,7 +63,8 @@ pub async fn collect_quips(
     assignments: &[(User, &str)],
 ) -> Result<Vec<(User, String)>> {
     let total = assignments.len();
-    let cfg = AskConfig::timeout(Duration::from_secs(45))
+    let cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(45))
         .timeout_message("⏳ Pencils down—time's up!".yellow())
         .ignore_commands()
         .warn_remaining(
@@ -161,7 +162,7 @@ pub async fn tiebreaker_buzz_in(
                 AskMatch::reject("Nope — try again! (17 * 6)".yellow())
             }
         })
-        .config(AskConfig::timeout(Duration::from_secs(20)))
+        .config(AskConfig::new().reply_timeout(Duration::from_secs(20)))
         .await?
         .ok())
 }
@@ -227,7 +228,7 @@ pub async fn vote_on_quips(
             }
         })
         .allow_change(true)
-        .config(AskConfig::timeout(Duration::from_secs(20)))
+        .config(AskConfig::new().reply_timeout(Duration::from_secs(20)))
         .await?;
 
     let mut counts = vec![0usize; submissions.len()];

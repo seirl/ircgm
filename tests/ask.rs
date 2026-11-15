@@ -3,8 +3,8 @@ use std::time::Duration;
 use futures::future::try_join_all;
 use irc::proto::Command;
 use ircgm::prelude::*;
-use ircgm::testing::{test_harness, test_harness_with};
-use ircgm::{BotConfig, DisconnectReason, Target};
+use ircgm::testing::test_harness;
+use ircgm::{DisconnectReason, Target};
 
 #[tokio::test(start_paused = true)]
 async fn ask_match_reject_warn_remaining_clear_warnings_and_closure_inference() {
@@ -14,7 +14,8 @@ async fn ask_match_reject_warn_remaining_clear_warnings_and_closure_inference() 
 
     let alice = bot.user("Alice").unwrap();
 
-    let base_cfg = AskConfig::timeout(Duration::from_secs(20))
+    let base_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(20))
         .warn_remaining(Duration::from_secs(10), "10s inherited warn")
         .ignore_commands()
         .timeout_message("Time expired!");
@@ -190,70 +191,7 @@ async fn ask_match_accept_say_preserves_wire_order_across_queued_dm_asks_and_bro
 }
 
 #[tokio::test(start_paused = true)]
-async fn outbound_pacing_single_timer_and_combinator_table() {
-    let cfg = BotConfig {
-        outbound_burst: 2,
-        outbound_window: Duration::from_secs(8),
-        ..BotConfig::default()
-    };
-    let (bot, mut server) = test_harness_with("GM", cfg);
-    server.complete_join("#r", &["P1", "P2", "P3", "P4"]);
-    server.settle().await;
-
-    let p1 = bot.user("P1").unwrap();
-    let p2 = bot.user("P2").unwrap();
-    let p3 = bot.user("P3").unwrap();
-    let p4 = bot.user("P4").unwrap();
-
-    let spawn_ask = |u: User, label: &'static str| {
-        tokio::spawn(async move {
-            let start = tokio::time::Instant::now();
-            let res = u
-                .ask(label, |m| (m.text == "ok").then_some(()))
-                .config(AskConfig::timeout(Duration::from_secs(10)))
-                .await;
-            (res, start.elapsed())
-        })
-    };
-
-    let t1 = spawn_ask(p1, "Prompt 1");
-    let t2 = spawn_ask(p2, "Prompt 2");
-    let t3 = spawn_ask(p3, "Prompt 3");
-    let t4 = spawn_ask(p4, "Prompt 4");
-    tokio::task::yield_now().await;
-
-    assert_eq!(server.take_messages_to("P1"), vec!["Prompt 1"]);
-    assert_eq!(server.take_messages_to("P2"), vec!["Prompt 2"]);
-    assert!(server.take_messages_to("P3").is_empty());
-    assert!(server.take_messages_to("P4").is_empty());
-
-    tokio::time::advance(Duration::from_secs(8)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(server.take_messages_to("P3"), vec!["Prompt 3"]);
-    assert_eq!(server.take_messages_to("P4"), vec!["Prompt 4"]);
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-    server.dm("P4", "ok");
-    server.settle().await;
-    let (r4, e4) = t4.await.unwrap();
-    assert_eq!(r4.unwrap(), Answer::Ok(()));
-    assert_eq!(e4, Duration::from_secs(9));
-    assert!(!t1.is_finished());
-    assert!(!t2.is_finished());
-    assert!(!t3.is_finished());
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-    tokio::task::yield_now().await;
-    let (r1, e1) = t1.await.unwrap();
-    let (r2, e2) = t2.await.unwrap();
-    let (r3, e3) = t3.await.unwrap();
-    assert_eq!(r1.unwrap(), Answer::TimedOut);
-    assert_eq!(r2.unwrap(), Answer::TimedOut);
-    assert_eq!(r3.unwrap(), Answer::TimedOut);
-    assert_eq!(e1, Duration::from_secs(10));
-    assert_eq!(e2, Duration::from_secs(10));
-    assert_eq!(e3, Duration::from_secs(10));
-
+async fn ask_single_timer_and_combinator_table() {
     // Per-prompt `AskConfig` on `ExclusiveDm::ask` + `Answer::required()`:
     let (bot2, server2) = test_harness("GM");
     server2.complete_join("#r", &["Alice"]);
@@ -273,12 +211,12 @@ async fn outbound_pacing_single_timer_and_combinator_table() {
     let asks = async {
         let a1 = dm
             .ask("120s prompt", |m| Some(m.text.clone()))
-            .config(AskConfig::timeout(Duration::from_secs(120)))
+            .config(AskConfig::new().reply_timeout(Duration::from_secs(120)))
             .await?
             .required()?;
         let a2 = dm
             .ask("unbounded prompt", |m| Some(m.text.clone()))
-            .config(AskConfig::untimed())
+            .config(AskConfig::new().no_reply_timeout())
             .await?
             .required()?;
         Ok::<_, Error>((a1, a2))
@@ -294,9 +232,10 @@ async fn outbound_pacing_single_timer_and_combinator_table() {
     server3.complete_join("#tab", &["Alice"]);
     server3.settle().await;
     let room = bot3.room("#tab").unwrap();
-    let msg_cfg =
-        AskConfig::timeout(Duration::from_secs(10)).timeout_message("Timeout fired!");
-    let silent_cfg = AskConfig::timeout(Duration::from_secs(10));
+    let msg_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(10))
+        .timeout_message("Timeout fired!");
+    let silent_cfg = AskConfig::new().reply_timeout(Duration::from_secs(10));
 
     let r = room
         .ask("Q1", |_| Option::<()>::None)
@@ -368,7 +307,9 @@ async fn room_ask_user_nick_tracking_timeout_ctx_and_part_kick_answer() {
     let cara = bot.user("Cara").unwrap();
 
     let room = bot.room("#r").unwrap();
-    let turn_cfg = AskConfig::timeout(Duration::from_secs(30)).timeout_message_fn(|ctx| {
+    let turn_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(30))
+        .timeout_message_fn(|ctx| {
         assert_eq!(ctx.target, &Target::Channel("#r".into()));
         let u = ctx.user.expect("room.ask_user sets TimeoutCtx::user");
         format!("{} took too long (30s)!", u.nick())

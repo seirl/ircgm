@@ -117,7 +117,7 @@ async fn test_server_disconnect_triggers_eof_on_open_inbox() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn bot_quit_closes_test_server_connection_without_timeout_and_fails_when_drain_stalls() {
+async fn bot_quit_closes_test_server_connection_without_timeout() {
     let (bot, mut server) = test_harness("gm");
     bot.quit(Some("goodnight")).await.unwrap();
     assert_eq!(
@@ -127,26 +127,6 @@ async fn bot_quit_closes_test_server_connection_without_timeout_and_fails_when_d
     assert!(matches!(
         bot.inbox().next_event().await,
         Err(Error::Disconnected(DisconnectReason::Quit))
-    ));
-
-    // When throttled outbound backlog exceeds `handshake_timeout`, `quit` surfaces
-    // `HandshakeTimeout { operation: "quit outbound drain" }`:
-    let cfg = BotConfig {
-        outbound_burst: 1,
-        outbound_window: std::time::Duration::from_secs(10),
-        handshake_timeout: std::time::Duration::from_secs(2),
-        ..BotConfig::default()
-    };
-    let (bot2, server2) = test_harness_with("gm", cfg);
-    server2.complete_join("#lobby", &["alice"]);
-    server2.settle().await;
-    bot2.room("#lobby").unwrap().say("fills burst slot").unwrap();
-    let err = bot2.quit(Some("bye")).await.unwrap_err();
-    assert!(matches!(
-        err,
-        Error::HandshakeTimeout {
-            operation: "quit outbound drain"
-        }
     ));
 }
 
@@ -223,7 +203,7 @@ async fn peer_identity_survives_rename_resets_on_quit_and_supports_protocol_help
         async move {
             lobby
                 .ask("Quick!", |_| Some(()))
-                .config(crate::AskConfig::timeout(std::time::Duration::from_secs(5)))
+                .config(crate::AskConfig::new().reply_timeout(std::time::Duration::from_secs(5)))
                 .await
         }
     });

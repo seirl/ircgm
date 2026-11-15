@@ -76,7 +76,9 @@ async fn scaled_alarm(virtual_dur: Duration, rate_rx: &mut watch::Receiver<f64>)
 /// Hacker's 2-step private DM bypass puzzle.
 pub async fn hack_terminal(hacker: &User) -> Result<()> {
     let mut dm = hacker.exclusive().await?;
-    let step_cfg = AskConfig::timeout(Duration::from_secs(30)).ignore_commands();
+    let step_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(30))
+        .ignore_commands();
 
     dm.ask("💻 Step 1/2 — Convert `0x2A` to decimal:", |m| {
         match m.text.trim() {
@@ -105,7 +107,8 @@ pub async fn hack_terminal(hacker: &User) -> Result<()> {
 
 /// Safecracker's 3-step vault channel lockpick sequence.
 pub async fn crack_tumblers(vault: &Room, safecracker: &User) -> Result<()> {
-    let pin_cfg = AskConfig::timeout(Duration::from_secs(20))
+    let pin_cfg = AskConfig::new()
+        .reply_timeout(Duration::from_secs(20))
         .timeout_message("🚨 Too slow on the tumblers!".yellow());
     for (idx, cmd) in ["!tension", "!rake", "!set"].into_iter().enumerate() {
         vault

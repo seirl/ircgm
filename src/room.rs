@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::inbox::{Filter, Inbox};
 use crate::message::{ChatMessage, Target};
 use crate::outbound::{
-    sanitize_reason, sanitize_text, validate_param, validate_target, OutboundChatKind, Priority,
+    sanitize_reason, sanitize_text, validate_param, validate_target, OutboundChatKind,
 };
 use crate::state::BotPresence;
 use crate::user::User;
@@ -106,10 +106,9 @@ impl Room {
         }
         let nick = user.nick();
         validate_target(&nick, "invite target")?;
-        self.core.outbound.enqueue_one(
-            Priority::Interactive,
-            Command::INVITE(nick, self.channel_name.clone()),
-        );
+        self.core
+            .outbound
+            .enqueue_one(Command::INVITE(nick, self.channel_name.clone()));
         Ok(())
     }
 
@@ -118,7 +117,6 @@ impl Room {
         let clean = reason.map(sanitize_reason);
         self.core.enqueue_part(
             &self.channel_name,
-            Priority::Interactive,
             vec![Command::PART(self.channel_name.clone(), clean)],
             false,
         );
@@ -207,10 +205,9 @@ impl Room {
         let nick = user.nick();
         validate_target(&nick, "kick target")?;
         let clean = reason.map(sanitize_reason);
-        self.core.outbound.enqueue_one(
-            Priority::Interactive,
-            Command::KICK(self.channel_name.clone(), nick, clean),
-        );
+        self.core
+            .outbound
+            .enqueue_one(Command::KICK(self.channel_name.clone(), nick, clean));
         Ok(())
     }
 
@@ -228,7 +225,7 @@ impl Room {
         }
         self.core
             .outbound
-            .enqueue_one(Priority::Interactive, Command::Raw("MODE".into(), raw_args));
+            .enqueue_one(Command::Raw("MODE".into(), raw_args));
         Ok(())
     }
 
@@ -295,7 +292,7 @@ impl Room {
             cmds.push(Command::Raw("MODE".into(), raw_args));
         }
 
-        self.core.outbound.enqueue_batch(Priority::Interactive, cmds);
+        self.core.outbound.enqueue_batch(cmds);
         Ok(())
     }
 
@@ -317,10 +314,9 @@ impl Room {
                 chunks.remove(0).to_irc_string()
             }
         };
-        self.core.outbound.enqueue_one(
-            Priority::Interactive,
-            Command::TOPIC(self.channel_name.clone(), Some(wire_topic)),
-        );
+        self.core
+            .outbound
+            .enqueue_one(Command::TOPIC(self.channel_name.clone(), Some(wire_topic)));
         Ok(())
     }
 
