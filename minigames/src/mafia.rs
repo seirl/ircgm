@@ -7,7 +7,7 @@
 //!    - If the bot holds `@` chanop, it updates the topic, sets `+m` (moderated), devoices dead
 //!      players, and voices living players ([`start_mafia_night`]).
 //!    - Werewolves enter a private pack DM [`Huddle`] ([`Bot::huddle_available`]) with `[Wolves]`
-//!      relay, command suppression, [`AskMatch::reject`] target validation, and
+//!      chat relay, [`AskMatch::reject`] target validation, and
 //!      [`AskMatch::accept_say`] pack-wide lock-in confirmation (`!kill <nick>`).
 //!    - Once the pack locks in a target, all `0..=N` online Bodyguards get a `5s` midnight reflex
 //!      prompt (concurrent [`User::ask`]s) to DM `!protect <nick>` — saving the victim if any of

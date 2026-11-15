@@ -1,4 +1,5 @@
 use std::fmt;
+use std::panic::Location;
 use std::sync::Arc;
 
 use irc_colors::{irc_format, Text};
@@ -7,10 +8,10 @@ use crate::chat::{Chat, GroupChat, InboxRef};
 use crate::core::BotCore;
 use crate::error::{Error, Result};
 use crate::exclusive_dm::DmLease;
-use crate::inbox::Inbox;
+use crate::inbox::{Filter, Inbox, OnChatHook};
 use crate::message::{ChatMessage, Target};
 use crate::outbound::OutboundChatKind;
-use crate::user::User;
+use crate::user::{User, UserTrack};
 
 /// RAII channel-free group DM guard (`bot.huddle(name, &users)` / `bot.huddle_available(name, &users)`).
 ///
@@ -40,12 +41,13 @@ impl Huddle {
         name: Text,
         leases: Vec<DmLease>,
         initial_offline: Option<(String, Option<String>)>,
-        mut inbox: Inbox,
+        caller: &'static Location<'static>,
     ) -> Self {
+        let dm_users: Vec<Arc<UserTrack>> = leases.iter().map(|l| l.user().track_arc()).collect();
         let users: Vec<User> = leases.iter().map(|l| l.user().clone()).collect();
         let relay_core = Arc::clone(&core);
         let relay_name = name.clone();
-        inbox.on_chat = Some(Arc::new(move |msg: &ChatMessage| {
+        let on_chat: OnChatHook = Arc::new(move |msg: &ChatMessage| {
             if relay_core.check_connected().is_err() {
                 return;
             }
@@ -60,7 +62,16 @@ impl Huddle {
                     let _ = user.send_chat(OutboundChatKind::Privmsg, rendered.clone());
                 }
             }
-        }));
+        });
+        let inbox = core.inboxes.subscribe_with_on_chat(
+            Arc::clone(&core),
+            Filter::Scoped {
+                rooms: Vec::new(),
+                dm_users,
+            },
+            caller,
+            Some(on_chat),
+        );
         Self {
             core,
             name,

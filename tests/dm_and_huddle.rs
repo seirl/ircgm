@@ -242,6 +242,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
             server.dm("Wolf1", "!status");
             server.dm("Wolf1", "let's get Villager");
             server.dm("Wolf1", "!kill Nobody");
+            server.settle().await;
             server.dm("Wolf2", "!kill Villager");
             server.dm("Wolf1", "!kill Villager");
             server.settle().await;
@@ -263,6 +264,7 @@ async fn exclusive_many_available_and_huddle_semantics() {
                 "[Pack] <Wolf1> let's get Villager",
                 "[Pack] <Wolf1> !kill Nobody",
                 "Invalid target!",
+                "[Pack] <Wolf1> !kill Villager",
             ]
         );
 

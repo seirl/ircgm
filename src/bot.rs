@@ -454,17 +454,13 @@ impl Bot {
         initial_offline: Option<(String, Option<String>)>,
         caller: &'static Location<'static>,
     ) -> Huddle {
-        let core = &self.owner.core;
-        let dm_users: Vec<Arc<UserTrack>> = leases.iter().map(|l| l.user().track_arc()).collect();
-        let inbox = core.inboxes.subscribe(
-            Arc::clone(core),
-            Filter::Scoped {
-                rooms: Vec::new(),
-                dm_users,
-            },
+        Huddle::new(
+            Arc::clone(&self.owner.core),
+            name,
+            leases,
+            initial_offline,
             caller,
-        );
-        Huddle::new(Arc::clone(core), name, leases, initial_offline, inbox)
+        )
     }
 
     pub async fn join(&self, channel: &str) -> Result<Room> {

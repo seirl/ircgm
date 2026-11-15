@@ -115,7 +115,18 @@ async fn tied_quips_trigger_wire_fair_dm_tiebreaker_race() {
     tokio::time::advance(Duration::from_secs(20)).await;
     server.flush().await;
 
-    // Tiebreaker fires (`17 * 6 = 102`); Dan answers before Alice in the same wire burst:
+    // Tiebreaker fires (`17 * 6 = 102`): wrong guesses stay private (no Huddle cross-leak!),
+    // and Dan's `102` before Alice's `102` in the same wire burst wins fairly:
+    let _ = server.take_messages_to("Alice");
+    let _ = server.take_messages_to("Dan");
+    server.dm("Alice", "99");
+    server.settle().await;
+    assert_eq!(
+        server.take_messages_to("Alice"),
+        vec!["Nope — try again! (17 * 6)"]
+    );
+    assert!(server.take_messages_to("Dan").is_empty());
+
     server.dm("Dan", "102");
     server.dm("Alice", "102");
 

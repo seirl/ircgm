@@ -62,6 +62,8 @@ impl Filter {
     }
 }
 
+pub(crate) type OnChatHook = Arc<dyn Fn(&ChatMessage) + Send + Sync>;
+
 struct InboxSlot {
     filter: Filter,
     /// Exact-role buckets this slot is registered in (cached so `unsubscribe` touches only them).
@@ -73,13 +75,15 @@ struct InboxSlot {
     warned_75: Arc<AtomicBool>,
     max_capacity: usize,
     last_dispatched_seq: u64,
+    on_chat: Option<OnChatHook>,
 }
 
 impl InboxSlot {
     /// Delivers `event` once per wire `seq` (a slot can sit in several buckets an event hits).
-    fn offer(&mut self, event: &Arc<WireEvent>) {
+    /// Returns `true` when `event` is newly delivered to a still-open slot.
+    fn offer(&mut self, event: &Arc<WireEvent>) -> bool {
         if self.last_dispatched_seq == event.seq {
-            return;
+            return false;
         }
         self.last_dispatched_seq = event.seq;
         match self.tx.try_send(Arc::clone(event)) {
@@ -98,11 +102,13 @@ impl InboxSlot {
                         "inbox buffer reached >=75% capacity"
                     );
                 }
+                true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::AcqRel);
+                true
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 }
@@ -295,6 +301,16 @@ impl InboxRegistry {
         filter: Filter,
         opened_at: &'static Location<'static>,
     ) -> Inbox {
+        self.subscribe_with_on_chat(core, filter, opened_at, None)
+    }
+
+    pub(crate) fn subscribe_with_on_chat(
+        &self,
+        core: Arc<BotCore>,
+        filter: Filter,
+        opened_at: &'static Location<'static>,
+        on_chat: Option<OnChatHook>,
+    ) -> Inbox {
         let slot_id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
         let cap = core.inbox_capacity.max(1);
         let (tx, rx) = mpsc::channel(cap);
@@ -320,6 +336,7 @@ impl InboxRegistry {
                         warned_75: Arc::clone(&warned_75),
                         max_capacity: cap,
                         last_dispatched_seq: 0,
+                        on_chat,
                     },
                 );
             }
@@ -339,7 +356,6 @@ impl InboxRegistry {
             latched_departure: None,
             last_user_departure: None,
             departed_users,
-            on_chat: None,
         }
     }
 
@@ -396,6 +412,8 @@ impl InboxRegistry {
     /// Routes `event` to exactly the buckets whose role it matches: O(1) bucket lookups plus one
     /// `offer` per interested slot, with no per-event allocation or scan over all slots.
     pub(crate) fn dispatch(&self, event: &Arc<WireEvent>, channel_hint: Option<&str>) {
+        let is_chat = matches!(&event.kind, WireKind::Event(Event::Chat(_)));
+        let mut hooks: Vec<OnChatHook> = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let RegistryInner {
             casemap,
@@ -412,7 +430,11 @@ impl InboxRegistry {
         let mut send = |ids: &[u64]| {
             for id in ids {
                 if let Some(slot) = slots.get_mut(id) {
-                    slot.offer(event);
+                    if slot.offer(event) && is_chat {
+                        if let Some(ref hook) = slot.on_chat {
+                            hooks.push(Arc::clone(hook));
+                        }
+                    }
                 }
             }
         };
@@ -522,6 +544,14 @@ impl InboxRegistry {
                 None => send(all_dms),
             },
         }
+        drop(guard);
+        if !hooks.is_empty() {
+            if let WireKind::Event(Event::Chat(msg)) = &event.kind {
+                for hook in hooks {
+                    hook(msg);
+                }
+            }
+        }
     }
 }
 
@@ -589,7 +619,6 @@ pub struct Inbox {
     latched_departure: Option<Error>,
     last_user_departure: Option<(String, Option<String>)>,
     departed_users: HashSet<u64>,
-    pub(crate) on_chat: Option<Arc<dyn Fn(&ChatMessage) + Send + Sync>>,
 }
 
 impl fmt::Debug for Inbox {
@@ -630,7 +659,6 @@ impl Inbox {
             latched_departure: None,
             last_user_departure: None,
             departed_users: HashSet::new(),
-            on_chat: None,
         }
     }
 
@@ -959,7 +987,7 @@ impl Inbox {
         };
         match rx.try_recv() {
             Ok(wire) => {
-                self.on_wire_received(&wire);
+                self.latch_in_stream_departure(&wire);
                 Ok(Some(wire))
             }
             Err(mpsc::error::TryRecvError::Disconnected) => Err(self.disconnected_error()),
@@ -980,7 +1008,7 @@ impl Inbox {
         };
         match rx.poll_recv(cx) {
             Poll::Ready(Some(wire)) => {
-                self.on_wire_received(&wire);
+                self.latch_in_stream_departure(&wire);
                 Poll::Ready(Ok(wire))
             }
             Poll::Ready(None) => Poll::Ready(Err(self.disconnected_error())),
@@ -989,15 +1017,6 @@ impl Inbox {
                     return Poll::Ready(Err(err));
                 }
                 Poll::Pending
-            }
-        }
-    }
-
-    fn on_wire_received(&mut self, wire: &WireEvent) {
-        self.latch_in_stream_departure(wire);
-        if let WireKind::Event(Event::Chat(msg)) = &wire.kind {
-            if let Some(ref on_chat) = self.on_chat {
-                on_chat(msg);
             }
         }
     }

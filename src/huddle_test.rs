@@ -149,6 +149,7 @@ async fn huddle_ask_from_user_and_ask_many_consensus_with_banter_relay() {
     assert_eq!(server.recv_message_to("wolf3").await, "Vote `!kill <target>` until unanimous:");
 
     server.dm("wolf1", "!kill wolf1"); // broadcast reject to the whole huddle!
+    server.settle().await;
     server.dm("wolf1", "!kill bob");
     server.dm("wolf2", "!kill carol");
     server.dm("wolf1", "wait ok let's do carol"); // relayed banter while already voted!
@@ -175,4 +176,36 @@ async fn huddle_ask_from_user_and_ask_many_consensus_with_banter_relay() {
     assert_eq!(votes.get(&w1), Some(&"carol".to_owned()));
     assert_eq!(votes.get(&w2), Some(&"carol".to_owned()));
     assert_eq!(votes.get(&w3), None);
+}
+
+#[tokio::test]
+async fn huddle_relays_in_real_time_while_idle_and_across_clear() {
+    let (bot, mut server) = test_harness("gm");
+    let w1 = bot.user("wolf1").unwrap();
+    let w2 = bot.user("wolf2").unwrap();
+    let mut pack = bot.huddle("Pack", [&w1, &w2]).await.unwrap();
+
+    // Without anyone polling `pack.inbox()`, DMs are relayed immediately on pump arrival:
+    server.dm("wolf1", "nice work last round");
+    server.settle().await;
+    assert_eq!(
+        server.take_messages_to("wolf2"),
+        vec!["[Pack] <wolf1> nice work last round"]
+    );
+
+    // Starting `pack.ask` clears unread pre-prompt backlog without re-relaying or matching it:
+    let ask_task = tokio::spawn(async move {
+        pack.ask("Ready? (`yes`)", |m| (m.text == "yes").then_some(()))
+            .await
+    });
+    assert_eq!(server.recv_message_to("wolf1").await, "Ready? (`yes`)");
+    assert_eq!(server.recv_message_to("wolf2").await, "Ready? (`yes`)");
+
+    server.dm("wolf2", "yes");
+    server.settle().await;
+    assert_eq!(ask_task.await.unwrap().unwrap(), crate::Answer::Ok(()));
+    assert_eq!(
+        server.take_messages_to("wolf1"),
+        vec!["[Pack] <wolf2> yes"]
+    );
 }
