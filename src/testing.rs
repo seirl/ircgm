@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -474,9 +475,11 @@ impl TestServer {
         }
     }
 
-    /// Advances Tokio's paused virtual clock by `duration` and immediately [`settle`](Self::settle)s
-    /// woken timer tasks, pump events, and outbound writes.
+    /// Settles pending inbound lines and ready tasks first (so newly-triggered timers are armed
+    /// before time moves), advances Tokio's paused virtual clock by `duration`, and settles woken
+    /// timer tasks, pump events, and outbound writes.
     pub async fn advance(&self, duration: Duration) {
+        self.settle().await;
         tokio::time::advance(duration).await;
         self.settle().await;
     }
@@ -582,12 +585,18 @@ impl TestServer {
     }
 
     /// Awaits and removes the first outbound command, in `recv_sent` order, that `pick` maps to
-    /// `Some`, keeping all others queued; panics naming `what` after 5s or if the bot is gone.
+    /// `Some`, keeping all others queued; panics naming `what` after 5 wall-clock seconds or if the
+    /// bot is gone.
+    ///
+    /// Uses a real wall-clock watchdog rather than `tokio::time::timeout` so tests running with
+    /// `#[tokio::test(start_paused = true)]` can auto-advance past `>= 5s` virtual game sleeps
+    /// without prematurely timing out `recv_matching`.
     async fn recv_matching<T>(
         &mut self,
         what: &str,
         mut pick: impl FnMut(&Command, CaseMap) -> Option<T>,
     ) -> T {
+        let mut watchdog: Option<WallWatchdog> = None;
         loop {
             self.drain_ready();
             let (_, cm) = self.current_nick_and_casemap();
@@ -600,14 +609,55 @@ impl TestServer {
                 self.pending_cmds.remove(idx);
                 return val;
             }
-            let next =
-                tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound_rx.recv())
-                    .await
-                    .unwrap_or_else(|_| panic!("TestServer timed out waiting for {what}"))
-                    .unwrap_or_else(|| {
-                        panic!("TestServer saw the outbound channel close before {what}")
-                    });
+            let wd = watchdog.get_or_insert_with(|| WallWatchdog::start(Duration::from_secs(5)));
+            let next = tokio::select! {
+                biased;
+                cmd = self.outbound_rx.recv() => cmd.unwrap_or_else(|| {
+                    panic!("TestServer saw the outbound channel close before {what}")
+                }),
+                _ = &mut wd.rx => {
+                    panic!("TestServer timed out waiting for {what}")
+                }
+            };
             self.pending_cmds.push_back(next);
+        }
+    }
+}
+
+struct WallWatchdog {
+    cancelled: Arc<AtomicBool>,
+    thread: Option<std::thread::Thread>,
+    rx: oneshot::Receiver<()>,
+}
+
+impl WallWatchdog {
+    fn start(timeout: Duration) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_bg = Arc::clone(&cancelled);
+        let (tx, rx) = oneshot::channel();
+        let deadline = std::time::Instant::now() + timeout;
+        let handle = std::thread::spawn(move || {
+            while !cancelled_bg.load(Ordering::Acquire) {
+                let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                    let _ = tx.send(());
+                    return;
+                };
+                std::thread::park_timeout(rem);
+            }
+        });
+        Self {
+            cancelled,
+            thread: Some(handle.thread().clone()),
+            rx,
+        }
+    }
+}
+
+impl Drop for WallWatchdog {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            t.unpark();
         }
     }
 }

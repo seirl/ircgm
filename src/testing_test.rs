@@ -207,7 +207,43 @@ async fn peer_identity_survives_rename_resets_on_quit_and_supports_protocol_help
                 .await
         }
     });
-    server.flush().await;
     server.advance(std::time::Duration::from_secs(5)).await;
     assert_eq!(timed.await.unwrap().unwrap(), crate::Answer::TimedOut);
+}
+
+#[tokio::test(start_paused = true)]
+async fn virtual_clock_advance_settles_inbound_first_and_recv_message_auto_advances_past_5s() {
+    let (bot, mut server) = test_harness("gm");
+    server.complete_join("#onuw", &["alice", "dave"]);
+    server.settle().await;
+
+    let room = bot.room("#onuw").unwrap();
+    let dave = bot.user("dave").unwrap();
+
+    // 1. `server.chat` immediately followed by `server.advance(5s)` (no manual `settle()`) pumps
+    //    `"!go"` and arms the 5s sleep *before* advancing virtual time:
+    let go_task = tokio::spawn({
+        let room = room.clone();
+        async move {
+            let mut inbox = room.inbox();
+            inbox.wait_cmd("!go").await?;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            room.say("5s elapsed!")?;
+            Ok::<_, Error>(())
+        }
+    });
+    server.flush().await;
+    server.chat("alice", "#onuw", "!go");
+    server.advance(std::time::Duration::from_secs(5)).await;
+    go_task.await.unwrap().unwrap();
+    assert_eq!(server.take_messages_to("#onuw"), vec!["5s elapsed!"]);
+
+    // 2. `recv_message_to` uses a real wall-clock watchdog so Tokio's `start_paused = true`
+    //    auto-advances across a 30s virtual sleep (`>= 5s`) without prematurely timing out:
+    let delayed_dm = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        dave.say("Wake up, Dave!").unwrap();
+    });
+    assert_eq!(server.recv_message_to("dave").await, "Wake up, Dave!");
+    delayed_dm.await.unwrap();
 }
