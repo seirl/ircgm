@@ -209,3 +209,81 @@ async fn pre_dispatch_actor_pass_hydrates_tracked_accounts_without_allocating_un
     assert_eq!(oper.account().as_deref(), Some("OperAcct"));
     assert_eq!(victim.account(), None);
 }
+
+#[tokio::test(start_paused = true)]
+async fn keepalive_probes_only_on_idle_clears_on_any_inbound_and_times_out_on_virtual_clock() {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let core = test_core_with_announce(out_tx, false);
+    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<Message, &'static str>>();
+
+    let recv_task = tokio::spawn({
+        let core = Arc::clone(&core);
+        async move {
+            let mut stream = futures_util::stream::poll_fn(|cx| in_rx.poll_recv(cx));
+            let mut ka = Keepalive::new(Duration::from_secs(60), Duration::from_secs(60));
+            let m1 = ka.next_message(&mut stream, &core).await?;
+            let m2 = ka.next_message(&mut stream, &core).await?;
+            let err = ka.next_message(&mut stream, &core).await.unwrap_err();
+            Ok::<_, DisconnectReason>((m1, m2, err))
+        }
+    });
+    tokio::task::yield_now().await;
+
+    // 1. Pre-registration silence (even 180s) neither emits `PING` nor disconnects:
+    tokio::time::advance(Duration::from_secs(180)).await;
+    tokio::task::yield_now().await;
+    assert!(out_rx.try_recv().is_err());
+    assert!(!recv_task.is_finished());
+
+    // Complete registration and deliver an inbound `PRIVMSG` to reset the 60s idle window:
+    core.mark_registered();
+    in_tx
+        .send(Ok(
+            parse_irc_message(":alice!~a@h PRIVMSG #lobby :hi\r\n").unwrap()
+        ))
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // 2. 59s of silence emits nothing; reaching 60s emits `PING ircgm-1`:
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    assert!(out_rx.try_recv().is_err());
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        out_rx.try_recv().ok(),
+        Some(Command::PING("ircgm-1".into(), None))
+    );
+
+    // 3. Non-PONG inbound frame 50s later clears `awaiting_pong` (fakelag safety):
+    tokio::time::advance(Duration::from_secs(50)).await;
+    in_tx
+        .send(Ok(parse_irc_message(
+            ":alice!~a@h PRIVMSG #lobby :still here\r\n",
+        )
+        .unwrap()))
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Advancing 20s (past the original +60s `PING ircgm-1` deadline) keeps the session alive:
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::task::yield_now().await;
+    assert!(out_rx.try_recv().is_err());
+    assert!(!recv_task.is_finished());
+
+    // 4. 40s more (60s total silence) emits `PING ircgm-2`; 60s more with no traffic times out:
+    tokio::time::advance(Duration::from_secs(40)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        out_rx.try_recv().ok(),
+        Some(Command::PING("ircgm-2".into(), None))
+    );
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let (_, _, err) = recv_task.await.unwrap().unwrap();
+    assert!(
+        matches!(&err, DisconnectReason::Transport(msg) if msg.contains("no ping response")),
+        "got: {err:?}"
+    );
+}

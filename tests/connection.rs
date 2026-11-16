@@ -430,129 +430,68 @@ async fn crlf_split_396_cloak_wrapping_and_inbound_formatting() {
 }
 
 #[tokio::test]
-async fn loopback_tcp_idle_keepalive_and_timeout() {
+async fn loopback_tcp_server_ping_auto_replies_pong() {
     async fn recv_line<R: tokio::io::AsyncBufRead + Unpin>(
         lines: &mut tokio::io::Lines<R>,
         step: &'static str,
     ) -> Option<String> {
-        tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        tokio::time::timeout(Duration::from_secs(2), lines.next_line())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for line at {step}"))
             .unwrap()
     }
 
-    async fn complete_handshake(
-        lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-        wr: &mut tokio::net::tcp::OwnedWriteHalf,
-        nick: &str,
-    ) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut lines = BufReader::new(rd).lines();
+
         let mut saw_cap = false;
         let mut saw_nick = false;
         let mut saw_user = false;
         while !(saw_cap && saw_nick && saw_user) {
-            let line = recv_line(lines, "handshake init").await.unwrap();
+            let line = recv_line(&mut lines, "handshake init").await.unwrap();
             saw_cap |= line.starts_with("CAP REQ");
             saw_nick |= line.starts_with("NICK ");
             saw_user |= line.starts_with("USER ");
         }
-        wr.write_all(format!(":mock.irc CAP {nick} ACK :multi-prefix\r\n").as_bytes())
+        wr.write_all(b":mock.irc CAP KeepGM ACK :multi-prefix\r\n")
             .await
             .unwrap();
-        assert_eq!(recv_line(lines, "CAP END").await.unwrap(), "CAP END");
+        assert_eq!(recv_line(&mut lines, "CAP END").await.unwrap(), "CAP END");
         wr.write_all(
-            format!(
-                ":mock.irc 001 {nick} :Welcome\r\n\
-                 :mock.irc 422 {nick} :No MOTD\r\n"
-            )
-            .as_bytes(),
+            b":mock.irc 001 KeepGM :Welcome\r\n\
+              :mock.irc 422 KeepGM :No MOTD\r\n",
         )
         .await
         .unwrap();
-    }
 
-    // 1. Non-PONG inbound traffic clears an in-flight PING (fakelag safety), and server PING gets PONG:
-    let alive = async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_task = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let (rd, mut wr) = sock.into_split();
-            let mut lines = BufReader::new(rd).lines();
-            complete_handshake(&mut lines, &mut wr, "KeepGM").await;
-
-            // Wait for 1s idle PING, then reply with PRIVMSG *instead* of PONG:
-            let ping1 = recv_line(&mut lines, "idle PING 1").await.unwrap();
-            assert!(ping1.ends_with("ircgm-1"), "got: {ping1}");
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            wr.write_all(b":Alice!~a@h PRIVMSG KeepGM :still chatting\r\n")
-                .await
-                .unwrap();
-
-            // Wait 600ms more (past original 1s ping_timeout) -> session stays alive, server PING gets PONG:
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            wr.write_all(b"PING :srv-tok\r\n").await.unwrap();
-            let pong = recv_line(&mut lines, "server PONG").await.unwrap();
-            assert!(pong == "PONG srv-tok" || pong == "PONG :srv-tok", "got: {pong}");
-
-            assert_eq!(recv_line(&mut lines, "QUIT").await.unwrap(), "QUIT");
-        });
-
-        let bot = Bot::connect(irc::client::data::Config {
-            nickname: Some("KeepGM".into()),
-            server: Some("127.0.0.1".into()),
-            port: Some(port),
-            use_tls: Some(false),
-            ping_time: Some(1),
-            ping_timeout: Some(1),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        let mut dms = bot.inbox_dms();
-        assert_eq!(dms.next_chat().await.unwrap().text, "still chatting");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        bot.quit(None).await.unwrap();
-        server_task.await.unwrap();
-    };
-
-    // 2. Blackholed server disconnects after `ping_time + ping_timeout` and closes TCP cleanly:
-    let dead = async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_task = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let (rd, mut wr) = sock.into_split();
-            let mut lines = BufReader::new(rd).lines();
-            complete_handshake(&mut lines, &mut wr, "DeadGM").await;
-
-            let ping = recv_line(&mut lines, "dead PING").await.unwrap();
-            assert!(ping.ends_with("ircgm-1"), "got: {ping}");
-            assert_eq!(recv_line(&mut lines, "TCP EOF").await, None);
-        });
-
-        let bot = Bot::connect(irc::client::data::Config {
-            nickname: Some("DeadGM".into()),
-            server: Some("127.0.0.1".into()),
-            port: Some(port),
-            use_tls: Some(false),
-            ping_time: Some(1),
-            ping_timeout: Some(1),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        let mut inbox = bot.inbox();
-        let err = tokio::time::timeout(Duration::from_secs(4), inbox.next_chat())
-            .await
-            .expect("ping timeout did not fire")
-            .unwrap_err();
+        // Disabling `irc`'s periodic client `Pinger` must preserve automatic inbound PING -> PONG:
+        wr.write_all(b"PING :srv-tok\r\n").await.unwrap();
+        let pong = recv_line(&mut lines, "server PONG").await.unwrap();
         assert!(
-            matches!(&err, Error::Disconnected(DisconnectReason::Transport(m)) if m.contains("no ping response")),
-            "got: {err:?}"
+            pong == "PONG srv-tok" || pong == "PONG :srv-tok",
+            "got: {pong}"
         );
-        server_task.await.unwrap();
-        drop(bot);
-    };
+        wr.write_all(b":Alice!~a@h PRIVMSG KeepGM :done\r\n")
+            .await
+            .unwrap();
 
-    tokio::join!(alive, dead);
+        assert_eq!(recv_line(&mut lines, "QUIT").await.unwrap(), "QUIT");
+    });
+
+    let bot = Bot::connect(irc::client::data::Config {
+        nickname: Some("KeepGM".into()),
+        server: Some("127.0.0.1".into()),
+        port: Some(port),
+        use_tls: Some(false),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(bot.inbox_dms().next_chat().await.unwrap().text, "done");
+    bot.quit(None).await.unwrap();
+    server_task.await.unwrap();
 }

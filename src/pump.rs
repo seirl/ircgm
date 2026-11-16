@@ -48,11 +48,15 @@ impl Keepalive {
         }
     }
 
-    async fn next_message(
+    async fn next_message<S, E>(
         &mut self,
-        stream: &mut irc::client::ClientStream,
+        stream: &mut S,
         core: &BotCore,
-    ) -> Result<Message, DisconnectReason> {
+    ) -> Result<Message, DisconnectReason>
+    where
+        S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+        E: std::fmt::Display,
+    {
         loop {
             let wait = if self.awaiting_pong {
                 self.ping_timeout
