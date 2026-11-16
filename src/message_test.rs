@@ -84,9 +84,10 @@ async fn chat_message_command_matching_style_preservation_and_room_check() {
 }
 
 #[tokio::test]
-async fn wire_event_to_public_event_filters_internal_variants() {
+async fn wire_event_routing_and_public_event_projection() {
     let (bot, _server) = test_harness("gm");
     let alice = bot.user("alice").unwrap();
+    let uid = alice.id().as_u64();
     let raw = Arc::new(parse_irc_message(":srv 401 gm alice :No such nick\r\n").unwrap());
 
     let internal_bot_left = WireEvent::new(
@@ -94,26 +95,36 @@ async fn wire_event_to_public_event_filters_internal_variants() {
         Arc::clone(&raw),
         WireKind::BotLeftRoom {
             channel: "#lobby".into(),
-            reason: None,
+            reason: Some("bye".into()),
         },
     );
     assert!(internal_bot_left.to_public_event().is_none());
+    assert_eq!(
+        internal_bot_left.route(),
+        WireRoute::ChannelMeta { channel: "#lobby" }
+    );
+    assert_eq!(
+        internal_bot_left.bot_left_room(),
+        Some(("#lobby", Some("bye")))
+    );
 
-    let internal_raw = WireEvent::new(2, Arc::clone(&raw), WireKind::RawOnly);
+    let internal_raw = WireEvent::new(2, Arc::clone(&raw), WireKind::Raw { channel: None });
     assert!(internal_raw.to_public_event().is_none());
+    assert_eq!(internal_raw.route(), WireRoute::Dm { user_id: None });
 
-    let send_err = WireEvent {
-        seq: 3,
-        raw: Arc::clone(&raw),
-        kind: WireKind::Event(Event::DeliveryFailed {
-            target: "alice".into(),
-            code: 401,
-            message: "No such nick".into(),
-            raw: Arc::clone(&raw),
-        }),
-        meta: WireMeta::BounceUser(alice.id().as_u64()),
-    };
-    assert_eq!(send_err.bounce_user_id(), Some(alice.id().as_u64()));
+    let send_err = WireEvent::bounce(
+        3,
+        Arc::clone(&raw),
+        "alice".into(),
+        401,
+        "No such nick".into(),
+        BounceScope::User(Some(uid)),
+    );
+    assert_eq!(
+        send_err.route(),
+        WireRoute::UserBounce { user_id: Some(uid) }
+    );
+    assert_eq!(send_err.bounce_user_id(), Some(uid));
     match send_err.to_public_event() {
         Some(Event::DeliveryFailed {
             target,
@@ -128,15 +139,22 @@ async fn wire_event_to_public_event_filters_internal_variants() {
         other => panic!("expected Event::DeliveryFailed, got {other:?}"),
     }
 
-    let quit = WireEvent::new(
+    let quit = WireEvent::event_frame(
         4,
         raw,
-        WireKind::Event(Event::Quit {
+        Event::Quit {
             user: alice,
             nick: "alice".into(),
             channels: vec!["#lobby".into()],
             reason: Some("a.irc b.irc".into()),
-        }),
+        },
+    );
+    assert_eq!(
+        quit.route(),
+        WireRoute::UserPresence {
+            user_id: uid,
+            channels: &["#lobby".to_owned()],
+        }
     );
     match quit.to_public_event() {
         Some(Event::Quit {

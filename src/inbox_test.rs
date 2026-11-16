@@ -213,10 +213,10 @@ async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_a
         crate::state::parse_irc_message(":a!~u@h PRIVMSG #[Room] :before rekey\r\n").unwrap(),
     );
     let make_chat_wire = |seq: u64, chan: &str, text: &str| {
-        Arc::new(WireEvent {
+        Arc::new(WireEvent::event_frame(
             seq,
-            raw: Arc::clone(&raw),
-            kind: WireKind::Event(Event::Chat(ChatMessage {
+            Arc::clone(&raw),
+            Event::Chat(ChatMessage {
                 raw: Arc::clone(&raw),
                 received_at: tokio::time::Instant::now(),
                 sender: sender.clone(),
@@ -224,17 +224,16 @@ async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_a
                 ident: Some("~u".into()),
                 host: Some("h".into()),
                 account: None,
-                target: Target::Channel(chan.to_owned()),
+                target: crate::Target::Channel(chan.to_owned()),
                 text: text.to_owned(),
                 raw_text: text.to_owned(),
                 kind: crate::MessageKind::Privmsg,
-            })),
-            meta: crate::message::WireMeta::None,
-        })
+            }),
+        ))
     };
 
     let w1 = make_chat_wire(1, "#[room]", "before rekey");
-    core.inboxes.dispatch(&w1, Some("#[room]"));
+    core.inboxes.dispatch(&w1);
     assert_eq!(pre_inbox.next_chat().await.unwrap().text, "before rekey");
     assert_eq!(
         mid_window_inbox.next_chat().await.unwrap().text,
@@ -248,8 +247,8 @@ async fn shared_casemap_flip_before_rekey_preserves_channel_inboxes_before_and_a
 
     let w_brace = make_chat_wire(2, "#{room}", "curly");
     let w_bracket = make_chat_wire(3, "#[room]", "after rekey");
-    core.inboxes.dispatch(&w_brace, Some("#{room}"));
-    core.inboxes.dispatch(&w_bracket, Some("#[room]"));
+    core.inboxes.dispatch(&w_brace);
+    core.inboxes.dispatch(&w_bracket);
 
     assert_eq!(pre_inbox.next_chat().await.unwrap().text, "after rekey");
     assert_eq!(

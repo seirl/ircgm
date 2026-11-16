@@ -40,16 +40,7 @@ pub fn test_harness_with(initial_nick: impl Into<String>, config: BotConfig) -> 
             let _ = eof_tx.send(PumpInput::Eof);
         })),
     });
-    let core = BotCore::new(
-        initial_nick.clone(),
-        casemap,
-        outbound,
-        config.inbox_capacity,
-        config.command_prefixes.clone(),
-        config.handshake_timeout,
-        config.max_payload_bytes,
-        config.announce_bot,
-    );
+    let core = BotCore::new(initial_nick.clone(), casemap, outbound, &config);
     core.mark_registered();
     let reg = RegistrationTracker {
         cap_pending: false,

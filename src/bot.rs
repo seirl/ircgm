@@ -252,16 +252,7 @@ impl Bot {
 
         let casemap = AtomicCaseMap::default();
         let outbound = OutboundSink::new(RawTransport::Irc(sender));
-        let core = BotCore::new(
-            nick.clone(),
-            casemap,
-            outbound,
-            config.inbox_capacity,
-            config.command_prefixes.clone(),
-            config.handshake_timeout,
-            config.max_payload_bytes,
-            config.announce_bot,
-        );
+        let core = BotCore::new(nick.clone(), casemap, outbound, &config);
 
         let has_caps = !config.request_caps.is_empty();
         let reg = RegistrationTracker {

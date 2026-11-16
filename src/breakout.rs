@@ -12,7 +12,7 @@ use irc_colors::Text;
 
 use crate::error::{Error, Result};
 use crate::inbox::Filter;
-use crate::message::{Event, WireKind};
+use crate::message::Event;
 use crate::outbound::{sanitize_reason, sanitize_text};
 use crate::room::Room;
 use crate::user::{User, UserStatus};
@@ -340,8 +340,16 @@ impl Breakout {
             match wire_res {
                 Ok(wire) => {
                     let live_cm = core.casemap();
-                    match &wire.kind {
-                        WireKind::Event(Event::Joined { channel, user, .. })
+                    if let Some((channel, reason)) = wire.bot_left_room() {
+                        if live_cm.str_eq(channel, self.room.name()) {
+                            return Err(Error::BotLeftRoom {
+                                channel: channel.to_owned(),
+                                reason: reason.map(str::to_owned),
+                            });
+                        }
+                    }
+                    match wire.event() {
+                        Some(Event::Joined { channel, user, .. })
                             if live_cm.str_eq(channel, self.room.name()) =>
                         {
                             if seen_ids.contains(&user.track_id()) && user.is_online() {
@@ -349,21 +357,20 @@ impl Breakout {
                                 joined_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Event(
+                        Some(
+                            Event::Parted { channel, .. } | Event::Kicked { channel, .. },
+                        ) if !live_cm.str_eq(channel, self.room.name()) => {}
+                        Some(
                             Event::Parted {
-                                channel,
-                                user,
-                                nick,
-                                reason,
+                                user, nick, reason, ..
                             }
                             | Event::Kicked {
-                                channel,
-                                user,
-                                nick,
-                                reason,
-                                ..
+                                user, nick, reason, ..
+                            }
+                            | Event::Quit {
+                                user, nick, reason, ..
                             },
-                        ) if live_cm.str_eq(channel, self.room.name()) => {
+                        ) => {
                             if seen_ids.contains(&user.track_id()) {
                                 joined_ids.remove(&user.track_id());
                                 if strict {
@@ -375,21 +382,7 @@ impl Breakout {
                                 gone_ids.insert(user.track_id());
                             }
                         }
-                        WireKind::Event(Event::Quit {
-                            user, nick, reason, ..
-                        }) => {
-                            if seen_ids.contains(&user.track_id()) {
-                                joined_ids.remove(&user.track_id());
-                                if strict {
-                                    return Err(Error::UserLeft {
-                                        nick: nick.clone(),
-                                        reason: reason.clone(),
-                                    });
-                                }
-                                gone_ids.insert(user.track_id());
-                            }
-                        }
-                        WireKind::Event(Event::DeliveryFailed {
+                        Some(Event::DeliveryFailed {
                             target,
                             code: 401,
                             message,
@@ -406,14 +399,6 @@ impl Breakout {
                                     gone_ids.insert(uid);
                                 }
                             }
-                        }
-                        WireKind::BotLeftRoom { channel, reason }
-                            if live_cm.str_eq(channel, self.room.name()) =>
-                        {
-                            return Err(Error::BotLeftRoom {
-                                channel: channel.clone(),
-                                reason: reason.clone(),
-                            });
                         }
                         _ => {}
                     }
@@ -499,7 +484,7 @@ impl Breakout {
             };
             match res {
                 Ok(wire) => {
-                    if matches!(wire.kind, WireKind::BotLeftRoom { .. }) {
+                    if wire.bot_left_room().is_some() {
                         return Ok(());
                     }
                 }

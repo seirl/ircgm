@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::casemap::{AtomicCaseMap, CaseMap, FoldedStr};
 use crate::core::BotCore;
 use crate::error::{DisconnectReason, Error, Result};
-use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
+use crate::message::{ChatMessage, Event, WireEvent, WireRoute};
 use crate::state::WorldState;
 use crate::user::{UserStatus, UserTrack};
 
@@ -413,8 +413,9 @@ impl InboxRegistry {
 
     /// Routes `event` to exactly the buckets whose role it matches: O(1) bucket lookups plus one
     /// `offer` per interested slot, with no per-event allocation or scan over all slots.
-    pub(crate) fn dispatch(&self, event: &Arc<WireEvent>, channel_hint: Option<&str>) {
-        let is_chat = matches!(&event.kind, WireKind::Event(Event::Chat(_)));
+    pub(crate) fn dispatch(&self, event: &Arc<WireEvent>) {
+        let chat_msg = event.chat_message(false);
+        let is_chat = chat_msg.is_some();
         let mut hooks: Vec<OnChatHook> = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let RegistryInner {
@@ -444,114 +445,52 @@ impl InboxRegistry {
         let user = |uid: u64| users.get(&uid);
 
         send(all);
-        match &event.kind {
-            WireKind::Event(Event::Chat(msg)) => match &msg.target {
-                Target::Channel(ch) => {
-                    if let Some(bucket) = room(ch) {
-                        send(&bucket.all_events);
-                        if let Some(ids) = bucket.by_user.get(&msg.sender.track_id()) {
-                            send(ids);
-                        }
-                    }
-                }
-                Target::Dm => {
-                    send(all_dms);
-                    if let Some(bucket) = user(msg.sender.track_id()) {
-                        send(&bucket.dm);
-                    }
-                }
-            },
-            WireKind::Event(Event::Notice { sender, target, .. }) => match target {
-                Target::Channel(ch) => {
-                    if let Some(bucket) = room(ch) {
-                        send(&bucket.all_events);
-                        if let Some(ids) = sender
-                            .as_ref()
-                            .and_then(|s| bucket.by_user.get(&s.track_id()))
-                        {
-                            send(ids);
-                        }
-                    }
-                }
-                Target::Dm => {
-                    send(all_dms);
-                    if let Some(bucket) = sender.as_ref().and_then(|s| user(s.track_id())) {
-                        send(&bucket.dm);
-                    }
-                }
-            },
-            WireKind::Event(
-                Event::Joined { channel, user: who, .. }
-                | Event::Parted { channel, user: who, .. }
-                | Event::Kicked { channel, user: who, .. },
-            ) => {
+        match event.route() {
+            WireRoute::ChannelUser { channel, user_id } => {
                 if let Some(bucket) = room(channel) {
                     send(&bucket.all_events);
-                    if let Some(ids) = bucket.by_user.get(&who.track_id()) {
+                    if let Some(ids) = user_id.and_then(|uid| bucket.by_user.get(&uid)) {
                         send(ids);
                     }
                 }
             }
-            WireKind::Event(
-                Event::Quit {
-                    user: who,
-                    channels: occupied,
-                    ..
-                }
-                | Event::NickChanged {
-                    user: who,
-                    channels: occupied,
-                    ..
-                },
-            ) => {
-                if let Some(bucket) = user(who.track_id()) {
-                    send(&bucket.dm);
-                    send(&bucket.presence);
-                }
-                for ch in occupied {
-                    if let Some(bucket) = room(ch) {
-                        send(&bucket.all_events);
-                    }
-                }
-            }
-            WireKind::Event(Event::DeliveryFailed { target, .. }) => {
-                if channel_hint.is_some() {
-                    if let Some(bucket) = room(target) {
-                        send(&bucket.all_events);
-                        send(&bucket.room_meta);
-                    }
-                } else {
-                    send(all_dms);
-                    // A user bounce (`401`) also concerns `UsersInRoom` watchers of that user, so
-                    // parked `Room::inbox_user` / `Room::ask_user` wake and see the departure:
-                    if let Some(bucket) = event.bounce_user_id().and_then(user) {
-                        send(&bucket.dm);
-                        send(&bucket.presence);
-                    }
-                }
-            }
-            WireKind::BotLeftRoom { channel, .. } => {
+            WireRoute::ChannelMeta { channel } => {
                 if let Some(bucket) = room(channel) {
                     send(&bucket.all_events);
                     send(&bucket.room_meta);
                 }
             }
-            WireKind::RawOnly => match channel_hint {
-                Some(ch) => {
+            WireRoute::Dm { user_id } => {
+                send(all_dms);
+                if let Some(bucket) = user_id.and_then(user) {
+                    send(&bucket.dm);
+                }
+            }
+            WireRoute::UserPresence { user_id, channels } => {
+                if let Some(bucket) = user(user_id) {
+                    send(&bucket.dm);
+                    send(&bucket.presence);
+                }
+                for ch in channels {
                     if let Some(bucket) = room(ch) {
                         send(&bucket.all_events);
-                        send(&bucket.room_meta);
                     }
                 }
-                None => send(all_dms),
-            },
+            }
+            WireRoute::UserBounce { user_id } => {
+                send(all_dms);
+                // A user bounce (`401`) also concerns `UsersInRoom` watchers of that user, so
+                // parked `Room::inbox_user` / `Room::ask_user` wake and see the departure:
+                if let Some(bucket) = user_id.and_then(user) {
+                    send(&bucket.dm);
+                    send(&bucket.presence);
+                }
+            }
         }
         drop(guard);
-        if !hooks.is_empty() {
-            if let WireKind::Event(Event::Chat(msg)) = &event.kind {
-                for hook in hooks {
-                    hook(msg);
-                }
+        if let Some(msg) = chat_msg {
+            for hook in hooks {
+                hook(msg);
             }
         }
     }
@@ -797,12 +736,7 @@ impl Inbox {
     {
         loop {
             let wire = self.next_wire().await?;
-            let candidate = match &wire.kind {
-                WireKind::Event(Event::Chat(msg)) => Some(msg),
-                WireKind::Event(Event::Notice { .. }) if accept_notices => wire.human_notice(),
-                _ => None,
-            };
-            let Some(msg) = candidate else {
+            let Some(msg) = wire.chat_message(accept_notices) else {
                 continue;
             };
             if ignore_commands
@@ -875,12 +809,7 @@ impl Inbox {
         let ignore_commands = self.ignore_commands;
         let accept_notices = self.accept_notices;
         while let Some(wire) = self.try_next_wire()? {
-            let candidate = match &wire.kind {
-                WireKind::Event(Event::Chat(msg)) => Some(msg),
-                WireKind::Event(Event::Notice { .. }) if accept_notices => wire.human_notice(),
-                _ => None,
-            };
-            let Some(msg) = candidate else {
+            let Some(msg) = wire.chat_message(accept_notices) else {
                 continue;
             };
             if ignore_commands
@@ -1081,88 +1010,90 @@ impl Inbox {
             return;
         };
         let cm = core.casemap();
-        let (trigger, left_room) = match (&self.filter, &wire.kind) {
-            (
-                Filter::UsersInRoom { channel_name: scope, .. },
-                WireKind::BotLeftRoom { channel, reason },
-            ) if cm.str_eq(channel, scope) => (
-                Error::BotLeftRoom {
-                    channel: channel.clone(),
-                    reason: reason.clone(),
-                },
-                Some(channel.as_str()),
-            ),
-            (Filter::Scoped { rooms, .. }, WireKind::BotLeftRoom { channel, reason })
-                if rooms.iter().any(|r| cm.str_eq(r, channel)) =>
-            {
-                (
-                    Error::BotLeftRoom {
-                        channel: channel.clone(),
-                        reason: reason.clone(),
-                    },
-                    Some(channel.as_str()),
-                )
-            }
-            (
+        let (trigger, left_room) = if let Some((channel, reason)) = wire.bot_left_room() {
+            let watched = match &self.filter {
                 Filter::UsersInRoom {
-                    tracks,
                     channel_name: scope,
-                },
-                WireKind::Event(Event::Joined { channel, user, .. }),
-            ) if tracks.iter().any(|t| t.id == user.track_id()) && cm.str_eq(channel, scope) => {
-                self.departed_users.remove(&user.track_id());
+                    ..
+                } => cm.str_eq(channel, scope),
+                Filter::Scoped { rooms, .. } => rooms.iter().any(|r| cm.str_eq(r, channel)),
+                Filter::All | Filter::AllDms => false,
+            };
+            if !watched {
                 return;
             }
             (
-                Filter::UsersInRoom {
-                    tracks,
-                    channel_name: scope,
+                Error::BotLeftRoom {
+                    channel: channel.to_owned(),
+                    reason: reason.map(str::to_owned),
                 },
-                WireKind::Event(
-                    Event::Parted {
-                        channel,
-                        user,
-                        nick,
-                        reason,
-                    }
-                    | Event::Kicked {
-                        channel,
-                        user,
-                        nick,
-                        reason,
-                        ..
-                    },
-                ),
-            ) if tracks.iter().any(|t| t.id == user.track_id()) && cm.str_eq(channel, scope) => {
-                self.departed_users.insert(user.track_id());
-                self.last_user_departure = Some((nick.clone(), reason.clone()));
+                Some(channel),
+            )
+        } else {
+            match (&self.filter, wire.event()) {
                 (
-                    Error::UserLeft {
-                        nick: nick.clone(),
-                        reason: reason.clone(),
+                    Filter::UsersInRoom {
+                        tracks,
+                        channel_name: scope,
                     },
-                    None,
-                )
-            }
-            (
-                Filter::UsersInRoom { tracks, .. } | Filter::Scoped { dm_users: tracks, .. },
-                WireKind::Event(Event::Quit {
-                    user, nick, reason, ..
-                }),
-            ) if tracks.iter().any(|t| t.id == user.track_id()) => {
-                if matches!(self.filter, Filter::UsersInRoom { .. }) {
-                    self.departed_users.insert(user.track_id());
-                    self.last_user_departure = Some((nick.clone(), reason.clone()));
+                    Some(Event::Joined { channel, user, .. }),
+                ) if tracks.iter().any(|t| t.id == user.track_id()) && cm.str_eq(channel, scope) =>
+                {
+                    self.departed_users.remove(&user.track_id());
+                    return;
                 }
                 (
-                    Error::UserLeft {
-                        nick: nick.clone(),
-                        reason: reason.clone(),
+                    Filter::UsersInRoom {
+                        tracks,
+                        channel_name: scope,
                     },
-                    None,
-                )
+                    Some(
+                        Event::Parted {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                        }
+                        | Event::Kicked {
+                            channel,
+                            user,
+                            nick,
+                            reason,
+                            ..
+                        },
+                    ),
+                ) if tracks.iter().any(|t| t.id == user.track_id()) && cm.str_eq(channel, scope) =>
+                {
+                    self.departed_users.insert(user.track_id());
+                    self.last_user_departure = Some((nick.clone(), reason.clone()));
+                    (
+                        Error::UserLeft {
+                            nick: nick.clone(),
+                            reason: reason.clone(),
+                        },
+                        None,
+                    )
+                }
+                (
+                    Filter::UsersInRoom { tracks, .. } | Filter::Scoped { dm_users: tracks, .. },
+                    Some(Event::Quit {
+                        user, nick, reason, ..
+                    }),
+                ) if tracks.iter().any(|t| t.id == user.track_id()) => {
+                    if matches!(self.filter, Filter::UsersInRoom { .. }) {
+                        self.departed_users.insert(user.track_id());
+                        self.last_user_departure = Some((nick.clone(), reason.clone()));
+                    }
+                    (
+                        Error::UserLeft {
+                            nick: nick.clone(),
+                            reason: reason.clone(),
+                        },
+                        None,
+                    )
+                }
+                _ => return,
             }
-            _ => return,
         };
         let ctx = ExhaustCtx {
             seq: Some(wire.seq),
@@ -1279,17 +1210,11 @@ impl Filter {
                 }
                 let mut lost_room = None;
                 for room in rooms {
-                    match room_gone(room) {
-                        Some(err) => lost_room = Some(err),
-                        None => return None,
-                    }
+                    lost_room = Some(room_gone(room)?);
                 }
                 let mut quit_user = None;
                 for track in dm_users {
-                    match quit(track) {
-                        Some(gone) => quit_user = Some(gone),
-                        None => return None,
-                    }
+                    quit_user = Some(quit(track)?);
                 }
                 lost_room.or_else(|| {
                     quit_user.map(|(nick, reason)| Error::UserLeft { nick, reason })

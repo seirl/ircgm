@@ -58,7 +58,8 @@ fn multiline_names_multi_prefix_userhost_and_parameterized_modes() {
 
     let j = parse_msg(":Bot!~bot@initial.host JOIN #c\r\n");
     let bot_track = users.get_or_create("Bot");
-    ws.handle_join("#c", "Bot", bot_track, j.prefix.as_ref());
+    ws.observe_self_prefix(j.prefix.as_ref());
+    ws.handle_join("#c", "Bot", bot_track);
     assert_eq!(ws.self_user_host().as_deref(), Some("~bot@initial.host"));
 
     let n1 = parse_msg(":srv 353 Bot = #c :@Bot!~bot@initial.host @+Alice!~a@a.host\r\n");
@@ -149,8 +150,8 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
 
     let bt = users.get_or_create("Bot");
     let at = users.get_or_create("[Alice]");
-    ws.handle_join("#[Room]", "Bot", bt.clone(), None);
-    ws.handle_join("#[Room]", "[Alice]", at.clone(), None);
+    ws.handle_join("#[Room]", "Bot", bt.clone());
+    ws.handle_join("#[Room]", "[Alice]", at.clone());
     ws.handle_topic("#[Room]", Some("Welcome!".into()));
     assert_eq!(
         ws.channel("#{room}").unwrap().topic.as_deref(),
@@ -179,7 +180,7 @@ fn topic_cloak_396_self_leave_and_dynamic_casemapping_rekey() {
     );
     assert!(ws.active_channel("#[room]").is_none());
     // Rejoin restarts `Joining`:
-    ws.handle_join("#[Room]", "Bot", bt, None);
+    ws.handle_join("#[Room]", "Bot", bt);
     assert!(ws.active_channel("#[room]").is_some());
 }
 
@@ -191,7 +192,8 @@ fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
 
     let bot_track = users.get_or_create("Bot");
     let j = parse_msg(":Bot!~bot@h JOIN #c\r\n");
-    ws.handle_join("#c", "Bot", Arc::clone(&bot_track), j.prefix.as_ref());
+    ws.observe_self_prefix(j.prefix.as_ref());
+    ws.handle_join("#c", "Bot", Arc::clone(&bot_track));
 
     // First 353 batch stages Bot (@), Alice, Bob, Carol:
     let n1 = parse_msg(":srv 353 Bot = #c :@Bot Alice Bob Carol\r\n");
@@ -209,15 +211,15 @@ fn names_staging_tracks_interleaved_nick_join_part_quit_and_modes() {
     // - Alicia receives +v
     let alice_track = users.rename("Alice", "Alicia");
     assert_eq!(
-        ws.handle_nick(alice_track.id, "Alice", "Alicia", None),
+        ws.handle_nick(alice_track.id, "Alice", "Alicia"),
         vec!["#c".to_owned()]
     );
     users.rename("Bot", "Bot2");
-    ws.handle_nick(bot_track.id, "Bot", "Bot2", None);
+    ws.handle_nick(bot_track.id, "Bot", "Bot2");
     assert!(!ws.handle_part_or_kick("#c", "Bob", bob_track.id, None, 20, false));
     assert_eq!(ws.handle_quit(carol_track.id), vec!["#c".to_owned()]);
     let eve_track = users.get_or_create("Eve");
-    ws.handle_join("#c", "Eve", Arc::clone(&eve_track), None);
+    ws.handle_join("#c", "Eve", Arc::clone(&eve_track));
     let mode_msg = parse_msg(":Bot2!~bot@h MODE #c +v Alicia\r\n");
     ws.apply_mode_message(&mode_msg, &users);
 
@@ -252,12 +254,12 @@ fn joining_phase_preserves_join_arrivals_before_first_353() {
     let mut ws = WorldState::new("Bot", casemap);
 
     let bot_track = users.get_or_create("Bot");
-    ws.handle_join("#c", "Bot", Arc::clone(&bot_track), None);
+    ws.handle_join("#c", "Bot", Arc::clone(&bot_track));
     assert!(ws.active_channel("#c").unwrap().members().is_none());
 
     // Eve's `JOIN` races ahead of the server's `353` (which was generated before she joined):
     let eve_track = users.get_or_create("Eve");
-    ws.handle_join("#c", "Eve", Arc::clone(&eve_track), None);
+    ws.handle_join("#c", "Eve", Arc::clone(&eve_track));
     let n = parse_msg(":srv 353 Bot = #c :@Bot Alice\r\n");
     if let Command::Response(Response::RPL_NAMREPLY, args) = &n.command {
         ws.handle_namreply(args, &users);

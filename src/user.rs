@@ -156,6 +156,19 @@ impl UserRegistry {
         track
     }
 
+    /// Resolves `nick` to an online `UserTrack` and applies `raw_account` if present.
+    pub(crate) fn get_or_create_with_account(
+        &self,
+        nick: &str,
+        raw_account: Option<&str>,
+    ) -> Arc<UserTrack> {
+        let track = self.get_or_create(nick);
+        if let Some(raw_acct) = raw_account {
+            track.set_account(normalize_account(raw_acct));
+        }
+        track
+    }
+
     /// Re-keys `old_nick -> new_nick` on `NICK` and updates the track's live nickname.
     /// Returns the affected `Arc<UserTrack>`.
     pub(crate) fn rename(&self, old_nick: &str, new_nick: &str) -> Arc<UserTrack> {

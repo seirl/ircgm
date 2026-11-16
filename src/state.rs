@@ -478,6 +478,18 @@ impl WorldState {
         budget.max(1)
     }
 
+    pub(crate) fn needs_self_prefix_update(&self, prefix: Option<&Prefix>) -> bool {
+        match prefix {
+            Some(Prefix::Nickname(nick, user, host))
+                if self.casemap.str_eq(nick, &self.current_nick) =>
+            {
+                (!user.is_empty() && self.self_ident.as_deref() != Some(user.as_str()))
+                    || (!host.is_empty() && self.self_host.as_deref() != Some(host.as_str()))
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn observe_self_prefix(&mut self, prefix: Option<&Prefix>) {
         if let Some(Prefix::Nickname(nick, user, host)) = prefix {
             if self.casemap.str_eq(nick, &self.current_nick) {
@@ -700,14 +712,7 @@ impl WorldState {
         prefixes.dedup();
     }
 
-    pub(crate) fn handle_join(
-        &mut self,
-        channel: &str,
-        nick: &str,
-        track: Arc<UserTrack>,
-        prefix: Option<&Prefix>,
-    ) {
-        self.observe_self_prefix(prefix);
+    pub(crate) fn handle_join(&mut self, channel: &str, nick: &str, track: Arc<UserTrack>) {
         let chan_key = self.casemap.fold(channel);
         let is_self = self.casemap.str_eq(nick, &self.current_nick);
 
@@ -824,9 +829,7 @@ impl WorldState {
         track_id: u64,
         old_nick: &str,
         new_nick: &str,
-        prefix: Option<&Prefix>,
     ) -> Vec<String> {
-        self.observe_self_prefix(prefix);
         if self.casemap.str_eq(old_nick, &self.current_nick) {
             self.current_nick = new_nick.to_owned();
             self.self_track_id = Some(track_id);

@@ -1,16 +1,18 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use irc::proto::Command;
+use irc::proto::{Command, Prefix};
 use irc_colors::Text;
 use tokio::sync::watch;
 
+use crate::bot::BotConfig;
 use crate::casemap::{AtomicCaseMap, CaseMap};
 use crate::error::{DisconnectReason, Error, Result};
 use crate::inbox::InboxRegistry;
+use crate::message::BounceScope;
 use crate::outbound::{build_chat_commands, validate_target, OutboundChatKind, OutboundSink};
 use crate::state::WorldState;
-use crate::user::UserRegistry;
+use crate::user::{User, UserRegistry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConnLifecycle {
@@ -47,11 +49,7 @@ impl BotCore {
         initial_nick: String,
         casemap: AtomicCaseMap,
         outbound: Arc<OutboundSink>,
-        inbox_capacity: usize,
-        command_prefixes: Vec<String>,
-        handshake_timeout: Duration,
-        max_payload_bytes: usize,
-        announce_bot: bool,
+        config: &BotConfig,
     ) -> Arc<Self> {
         let (lifecycle_tx, _) = watch::channel(ConnLifecycle::Registering { welcomed: false });
         let (shutdown_tx, _) = watch::channel(false);
@@ -63,11 +61,11 @@ impl BotCore {
             outbound,
             lifecycle_tx,
             shutdown_tx,
-            inbox_capacity: inbox_capacity.max(1),
-            command_prefixes,
-            handshake_timeout,
-            max_payload_bytes: max_payload_bytes.max(1),
-            announce_bot,
+            inbox_capacity: config.inbox_capacity.max(1),
+            command_prefixes: config.command_prefixes.clone(),
+            handshake_timeout: config.handshake_timeout,
+            max_payload_bytes: config.max_payload_bytes.max(1),
+            announce_bot: config.announce_bot,
         })
     }
 
@@ -235,5 +233,91 @@ impl BotCore {
         drop(ws);
         self.outbound.enqueue_batch(cmds);
         Ok(())
+    }
+
+    /// Passively updates session-wide actor metadata from an inbound frame's prefix and tags
+    /// before command-specific dispatch:
+    /// - records our own relayed `ident@host` on `WorldState` (taking a write lock only when it
+    ///   changes), and
+    /// - updates `@account` on any already-tracked `UserTrack` without allocating tracks for
+    ///   strangers in unwatched channels.
+    pub(crate) fn observe_inbound_actor(
+        &self,
+        prefix: Option<&Prefix>,
+        raw_account: Option<&str>,
+    ) {
+        if self.state.read().unwrap().needs_self_prefix_update(prefix) {
+            self.state.write().unwrap().observe_self_prefix(prefix);
+        }
+        if let (Some(Prefix::Nickname(nick, _, _)), Some(acct)) = (prefix, raw_account) {
+            self.users.update_account(nick, acct);
+        }
+    }
+
+    /// Resolves `nick` into a live [`User`] handle, applying `raw_account` if present.
+    pub(crate) fn resolve_user(
+        self: &Arc<Self>,
+        nick: &str,
+        raw_account: Option<&str>,
+    ) -> User {
+        let track = self.users.get_or_create_with_account(nick, raw_account);
+        User::from_parts(Arc::downgrade(self), track)
+    }
+
+    /// Applies `005 RPL_ISUPPORT` tokens across `WorldState`, `UserRegistry`, and `InboxRegistry`
+    /// in lockstep, and announces `+B` bot mode if ready.
+    pub(crate) fn apply_isupport(&self, args: &[String]) {
+        let changed_cm = self.state.write().unwrap().apply_isupport(args);
+        if let Some(new_cm) = changed_cm {
+            self.users.rekey_casemap(new_cm);
+            self.inboxes.rekey_casemap(new_cm);
+        }
+        self.maybe_announce_bot();
+    }
+
+    /// Records a channel `PART` or `KICK` across `UserRegistry` and `WorldState`.
+    /// Returns `None` when the bot itself left `channel`, or `Some(departed_user)` when a peer left.
+    pub(crate) fn record_channel_departure(
+        self: &Arc<Self>,
+        channel: &str,
+        target_nick: &str,
+        target_raw_account: Option<&str>,
+        reason: Option<String>,
+        seq: u64,
+    ) -> Option<User> {
+        let track = self
+            .users
+            .get_or_create_with_account(target_nick, target_raw_account);
+        let watched = self.inboxes.has_channel_listener(channel);
+        let self_left = self.state.write().unwrap().handle_part_or_kick(
+            channel,
+            target_nick,
+            track.id,
+            reason,
+            seq,
+            watched,
+        );
+        (!self_left).then(|| User::from_parts(Arc::downgrade(self), track))
+    }
+
+    /// Classifies an outbound send bounce (`401`, `403`, `404`, `486`, `716`, …) and synchronizes
+    /// `401` departures across `UserRegistry` and `WorldState`.
+    pub(crate) fn resolve_bounce(
+        &self,
+        target: &str,
+        code: u16,
+        seq: u64,
+        message: &str,
+    ) -> BounceScope {
+        let is_chan = code == 403 || self.state.read().unwrap().is_channel_name(target);
+        if is_chan {
+            return BounceScope::Channel;
+        }
+        let (target_user_id, quit_track_id) =
+            self.users.resolve_send_error(target, code, seq, message);
+        if let Some(qid) = quit_track_id {
+            self.state.write().unwrap().handle_quit(qid);
+        }
+        BounceScope::User(target_user_id)
     }
 }

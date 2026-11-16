@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use crate::core::BotCore;
 use crate::error::DisconnectReason;
 use crate::message::{
-    parse_privmsg_body, ChatMessage, Event, MessageKind, Target, WireEvent, WireKind, WireMeta,
+    parse_privmsg_body, ChatMessage, Event, MessageKind, Target, WireEvent, WireKind,
 };
 use crate::user::{normalize_account, User};
 
@@ -221,6 +221,7 @@ fn process_message(
     let received_at = Instant::now();
     let raw = Arc::new(msg);
     let tags = extract_tags(&raw);
+    core.observe_inbound_actor(raw.prefix.as_ref(), tags.raw_account.as_deref());
 
     // Handle CAP negotiation (`CAP ACK` / `CAP NAK` -> `CAP END`):
     if let Command::CAP(_, ref sub, ref arg3, _) = raw.command {
@@ -282,11 +283,10 @@ fn process_message(
             handle_account(core, &raw, &args[0], seq);
         }
         Command::TOPIC(channel, topic) => {
-            {
-                let mut ws = core.state.write().unwrap();
-                ws.observe_self_prefix(raw.prefix.as_ref());
-                ws.handle_topic(channel, topic.clone());
-            }
+            core.state
+                .write()
+                .unwrap()
+                .handle_topic(channel, topic.clone());
             dispatch_raw(core, &raw, seq, Some(channel));
         }
         Command::ChannelMODE(chan, _) => {
@@ -296,10 +296,6 @@ fn process_message(
             handle_mode(core, &raw, &args[0], seq);
         }
         _ => {
-            core.state
-                .write()
-                .unwrap()
-                .observe_self_prefix(raw.prefix.as_ref());
             dispatch_raw(core, &raw, seq, None);
         }
     }
@@ -308,20 +304,11 @@ fn process_message(
 fn handle_mode(core: &Arc<BotCore>, raw: &Arc<Message>, chan: &str, seq: u64) {
     let is_chan = {
         let mut ws = core.state.write().unwrap();
-        ws.observe_self_prefix(raw.prefix.as_ref());
         let is_c = ws.is_channel_name(chan);
         ws.apply_mode_message(raw, &core.users);
         is_c
     };
     dispatch_raw(core, raw, seq, is_chan.then_some(chan));
-}
-
-fn resolve_chat_sender(core: &Arc<BotCore>, nick: &str, tags: &ParsedTags) -> User {
-    let track = core.users.get_or_create(nick);
-    if let Some(ref raw_acct) = tags.raw_account {
-        track.set_account(normalize_account(raw_acct));
-    }
-    User::from_parts(Arc::downgrade(core), track)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -346,37 +333,22 @@ fn handle_chat_like(
         _ => None,
     };
 
-    // Check self-echo & unwatched channel under WorldState read lock (upgrading only if self host needs recording):
     let (is_self, is_chan, chan_in_ws) = {
         let ws = core.state.read().unwrap();
         let is_self =
             nick_prefix.is_some_and(|(nick, _, _)| ws.casemap.str_eq(nick, &ws.current_nick));
-        let needs_self_update = is_self && (ws.self_ident.is_none() || ws.self_host.is_none());
         let is_chan = ws.is_channel_name(target);
         let chan_in_ws = is_chan && ws.active_channel(target).is_some();
-        drop(ws);
-        if needs_self_update {
-            core.state
-                .write()
-                .unwrap()
-                .observe_self_prefix(raw.prefix.as_ref());
-        }
         (is_self, is_chan, chan_in_ws)
     };
 
     if is_self {
-        if let (Some((nick, _, _)), Some(raw_acct)) = (nick_prefix, &tags.raw_account) {
-            core.users.update_account(nick, raw_acct);
-        }
         dispatch_raw(core, raw, seq, is_chan.then_some(target));
         return;
     }
 
     if is_chan && !chan_in_ws && !core.inboxes.has_interest_in_channel(target) {
         // Early unwatched-channel skip: zero `UserTrack` / `ChatMessage` allocations!
-        if let (Some((nick, _, _)), Some(raw_acct)) = (nick_prefix, &tags.raw_account) {
-            core.users.update_account(nick, raw_acct);
-        }
         return;
     }
 
@@ -390,12 +362,12 @@ fn handle_chat_like(
         let (nick, user, host) = nick_prefix.unwrap();
         let (kind, raw_text) = parse_privmsg_body(body);
         if kind == MessageKind::Privmsg && body.starts_with('\x01') {
-            // Non-ACTION CTCP request (`\x01VERSION\x01`, etc.) stays `RawOnly`:
+            // Non-ACTION CTCP request (`\x01VERSION\x01`, etc.) stays `Raw`:
             dispatch_raw(core, raw, seq, is_chan.then_some(target));
             return;
         }
 
-        let sender = resolve_chat_sender(core, nick, tags);
+        let sender = core.resolve_user(nick, tags.raw_account.as_deref());
         let account = sender.account();
         let chat = ChatMessage {
             raw: Arc::clone(raw),
@@ -410,27 +382,20 @@ fn handle_chat_like(
             raw_text,
             kind,
         };
-        dispatch_wire(
-            core,
-            raw,
-            seq,
-            WireKind::Event(Event::Chat(chat)),
-            WireMeta::None,
-            is_chan.then_some(target),
-        );
+        dispatch_event(core, raw, seq, Event::Chat(chat));
     } else {
         let plain_text = Text::parse(body).plain();
-        let (sender_opt, nick_opt, meta) = match nick_prefix {
+        let (sender_opt, nick_opt, human_chat) = match nick_prefix {
             Some((nick, user, host)) => {
-                let sender = resolve_chat_sender(core, nick, tags);
+                let sender = core.resolve_user(nick, tags.raw_account.as_deref());
                 let account = sender.account();
                 let is_human_eligible = !user.is_empty()
                     && !host.is_empty()
                     && !tags.is_bot
                     && !is_services_pseudoclient(nick)
                     && !body.starts_with('\x01');
-                let meta = if is_human_eligible {
-                    WireMeta::HumanNotice(Box::new(ChatMessage {
+                let chat = is_human_eligible.then(|| {
+                    Box::new(ChatMessage {
                         raw: Arc::clone(raw),
                         received_at,
                         sender: sender.clone(),
@@ -442,13 +407,11 @@ fn handle_chat_like(
                         text: plain_text.clone(),
                         raw_text: body.to_owned(),
                         kind: MessageKind::Notice,
-                    }))
-                } else {
-                    WireMeta::None
-                };
-                (Some(sender), Some(nick.to_owned()), meta)
+                    })
+                });
+                (Some(sender), Some(nick.to_owned()), chat)
             }
-            None => (None, None, WireMeta::None),
+            None => (None, None, None),
         };
         let event = Event::Notice {
             sender: sender_opt,
@@ -457,14 +420,11 @@ fn handle_chat_like(
             text: plain_text,
             raw: Arc::clone(raw),
         };
-        dispatch_wire(
-            core,
-            raw,
-            seq,
-            WireKind::Event(event),
-            meta,
-            is_chan.then_some(target),
-        );
+        let kind = match human_chat {
+            Some(chat) => WireKind::HumanNotice { event, chat },
+            None => WireKind::Event(event),
+        };
+        dispatch_wire(core, raw, seq, kind);
     }
 }
 
@@ -480,30 +440,24 @@ fn handle_join(
         return;
     };
     let channel = chanlist.split(',').next().unwrap_or(chanlist);
-    let track = core.users.get_or_create(nick);
-    if let Some(acct) = ext_account.or(tags.raw_account.as_deref()) {
-        track.set_account(normalize_account(acct));
-    }
-
+    let track = core
+        .users
+        .get_or_create_with_account(nick, ext_account.or(tags.raw_account.as_deref()));
     core.state
         .write()
         .unwrap()
-        .handle_join(channel, nick, Arc::clone(&track), raw.prefix.as_ref());
-
-    let sender = User::from_parts(Arc::downgrade(core), track);
-    dispatch_wire(
+        .handle_join(channel, nick, Arc::clone(&track));
+    dispatch_event(
         core,
         raw,
         seq,
-        WireKind::Event(Event::Joined {
+        Event::Joined {
             channel: channel.to_owned(),
-            user: sender,
+            user: User::from_parts(Arc::downgrade(core), track),
             nick: nick.clone(),
             ident: (!user.is_empty()).then(|| user.clone()),
             host: (!host.is_empty()).then(|| host.clone()),
-        }),
-        WireMeta::None,
-        Some(channel),
+        },
     );
 }
 
@@ -518,32 +472,25 @@ fn handle_part(
     let Some(Prefix::Nickname(nick, _, _)) = &raw.prefix else {
         return;
     };
-    let track = core.users.get_or_create(nick);
-    if let Some(ref raw_acct) = tags.raw_account {
-        track.set_account(normalize_account(raw_acct));
-    }
-
-    let watched = core.inboxes.has_channel_listener(channel);
-    let self_left = {
-        let mut ws = core.state.write().unwrap();
-        ws.observe_self_prefix(raw.prefix.as_ref());
-        ws.handle_part_or_kick(channel, nick, track.id, reason.clone(), seq, watched)
-    };
-
-    let kind = if self_left {
-        WireKind::BotLeftRoom {
+    let kind = match core.record_channel_departure(
+        channel,
+        nick,
+        tags.raw_account.as_deref(),
+        reason.clone(),
+        seq,
+    ) {
+        Some(user) => WireKind::Event(Event::Parted {
             channel: channel.to_owned(),
-            reason,
-        }
-    } else {
-        WireKind::Event(Event::Parted {
-            channel: channel.to_owned(),
-            user: User::from_parts(Arc::downgrade(core), track),
+            user,
             nick: nick.clone(),
             reason,
-        })
+        }),
+        None => WireKind::BotLeftRoom {
+            channel: channel.to_owned(),
+            reason,
+        },
     };
-    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel));
+    dispatch_wire(core, raw, seq, kind);
 }
 
 fn handle_kick(
@@ -559,30 +506,21 @@ fn handle_kick(
         Some(Prefix::ServerName(s)) => s.clone(),
         None => String::new(),
     };
-    let track = core.users.get_or_create(target_nick);
-
-    let watched = core.inboxes.has_channel_listener(channel);
-    let self_left = {
-        let mut ws = core.state.write().unwrap();
-        ws.observe_self_prefix(raw.prefix.as_ref());
-        ws.handle_part_or_kick(channel, target_nick, track.id, reason.clone(), seq, watched)
-    };
-
-    let kind = if self_left {
-        WireKind::BotLeftRoom {
-            channel: channel.to_owned(),
-            reason,
-        }
-    } else {
-        WireKind::Event(Event::Kicked {
-            channel: channel.to_owned(),
-            user: User::from_parts(Arc::downgrade(core), track),
-            nick: target_nick.to_owned(),
-            by,
-            reason,
-        })
-    };
-    dispatch_wire(core, raw, seq, kind, WireMeta::None, Some(channel));
+    let kind =
+        match core.record_channel_departure(channel, target_nick, None, reason.clone(), seq) {
+            Some(user) => WireKind::Event(Event::Kicked {
+                channel: channel.to_owned(),
+                user,
+                nick: target_nick.to_owned(),
+                by,
+                reason,
+            }),
+            None => WireKind::BotLeftRoom {
+                channel: channel.to_owned(),
+                reason,
+            },
+        };
+    dispatch_wire(core, raw, seq, kind);
 }
 
 fn handle_quit(
@@ -595,32 +533,24 @@ fn handle_quit(
     let Some(Prefix::Nickname(nick, _, _)) = &raw.prefix else {
         return;
     };
-
-    // Ensure a track exists before marking quit so `Event::Quit` carries a valid `User`:
-    let ensured_track = core.users.get_or_create(nick);
-    if let Some(ref raw_acct) = tags.raw_account {
-        ensured_track.set_account(normalize_account(raw_acct));
-    }
-
-    let channels = core.state.write().unwrap().handle_quit(ensured_track.id);
-
+    let ensured = core
+        .users
+        .get_or_create_with_account(nick, tags.raw_account.as_deref());
+    let channels = core.state.write().unwrap().handle_quit(ensured.id);
     let track = core
         .users
         .mark_quit(nick, seq, reason.clone())
-        .unwrap_or(ensured_track);
-
-    dispatch_wire(
+        .unwrap_or(ensured);
+    dispatch_event(
         core,
         raw,
         seq,
-        WireKind::Event(Event::Quit {
+        Event::Quit {
             user: User::from_parts(Arc::downgrade(core), track),
             nick: nick.clone(),
             channels,
             reason,
-        }),
-        WireMeta::None,
-        None,
+        },
     );
 }
 
@@ -634,30 +564,25 @@ fn handle_nick(
     let Some(Prefix::Nickname(old_nick, _, _)) = &raw.prefix else {
         return;
     };
-
     let track = core.users.rename(old_nick, new_nick);
     if let Some(ref raw_acct) = tags.raw_account {
         track.set_account(normalize_account(raw_acct));
     }
-
-    let channels =
-        core.state
-            .write()
-            .unwrap()
-            .handle_nick(track.id, old_nick, new_nick, raw.prefix.as_ref());
-
-    dispatch_wire(
+    let channels = core
+        .state
+        .write()
+        .unwrap()
+        .handle_nick(track.id, old_nick, new_nick);
+    dispatch_event(
         core,
         raw,
         seq,
-        WireKind::Event(Event::NickChanged {
+        Event::NickChanged {
             user: User::from_parts(Arc::downgrade(core), track),
             old_nick: old_nick.clone(),
             new_nick: new_nick.to_owned(),
             channels,
-        }),
-        WireMeta::None,
-        None,
+        },
     );
 }
 
@@ -686,12 +611,7 @@ fn handle_numeric(
         }
         5 => {
             // 005 RPL_ISUPPORT
-            let changed_cm = core.state.write().unwrap().apply_isupport(args);
-            if let Some(new_cm) = changed_cm {
-                core.users.rekey_casemap(new_cm);
-                core.inboxes.rekey_casemap(new_cm);
-            }
-            core.maybe_announce_bot();
+            core.apply_isupport(args);
             dispatch_raw(core, raw, seq, None);
         }
         324 => {
@@ -785,30 +705,16 @@ fn handle_numeric(
                 .last()
                 .cloned()
                 .unwrap_or_else(|| format!("IRC error {code}"));
-
-            let is_chan = code == 403 || core.state.read().unwrap().is_channel_name(&target);
-            let (target_user_id, quit_track_id) = if !is_chan {
-                core.users.resolve_send_error(&target, code, seq, &message)
-            } else {
-                (None, None)
-            };
-
-            if let Some(qid) = quit_track_id {
-                core.state.write().unwrap().handle_quit(qid);
-            }
-
-            let meta = match target_user_id {
-                Some(uid) => WireMeta::BounceUser(uid),
-                None => WireMeta::None,
-            };
-            let chan_hint = is_chan.then_some(target.as_str());
-            let event = Event::DeliveryFailed {
-                target: target.clone(),
+            let scope = core.resolve_bounce(&target, code, seq, &message);
+            let wire = Arc::new(WireEvent::bounce(
+                seq,
+                Arc::clone(raw),
+                target,
                 code,
                 message,
-                raw: Arc::clone(raw),
-            };
-            dispatch_wire(core, raw, seq, WireKind::Event(event), meta, chan_hint);
+                scope,
+            ));
+            core.inboxes.dispatch(&wire);
         }
         _ => {
             dispatch_raw(core, raw, seq, None);
@@ -831,25 +737,24 @@ fn fail_pending_join(core: &Arc<BotCore>, code: u16, args: &[String]) {
         .fail_join(channel, code, message);
 }
 
-fn dispatch_wire(
-    core: &Arc<BotCore>,
-    raw: &Arc<Message>,
-    seq: u64,
-    kind: WireKind,
-    meta: WireMeta,
-    chan_hint: Option<&str>,
-) {
-    let wire = Arc::new(WireEvent {
-        seq,
-        raw: Arc::clone(raw),
-        kind,
-        meta,
-    });
-    core.inboxes.dispatch(&wire, chan_hint);
+fn dispatch_wire(core: &Arc<BotCore>, raw: &Arc<Message>, seq: u64, kind: WireKind) {
+    let wire = Arc::new(WireEvent::new(seq, Arc::clone(raw), kind));
+    core.inboxes.dispatch(&wire);
+}
+
+fn dispatch_event(core: &Arc<BotCore>, raw: &Arc<Message>, seq: u64, event: Event) {
+    dispatch_wire(core, raw, seq, WireKind::Event(event));
 }
 
 fn dispatch_raw(core: &Arc<BotCore>, raw: &Arc<Message>, seq: u64, chan_hint: Option<&str>) {
-    dispatch_wire(core, raw, seq, WireKind::RawOnly, WireMeta::None, chan_hint);
+    dispatch_wire(
+        core,
+        raw,
+        seq,
+        WireKind::Raw {
+            channel: chan_hint.map(str::to_owned),
+        },
+    );
 }
 
 #[cfg(test)]

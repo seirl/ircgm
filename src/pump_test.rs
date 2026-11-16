@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::bot::BotConfig;
 use crate::casemap::AtomicCaseMap;
 use crate::outbound::{OutboundSink, RawTransport};
 use crate::state::parse_irc_message;
@@ -11,16 +12,15 @@ fn test_core_with_announce(
 ) -> Arc<BotCore> {
     let casemap = AtomicCaseMap::default();
     let outbound = OutboundSink::new(RawTransport::test_only(out_tx));
-    BotCore::new(
-        "gm".into(),
-        casemap,
-        outbound,
-        1024,
-        vec!["!".into()],
-        Duration::from_secs(15),
-        450,
+    let cfg = BotConfig {
+        inbox_capacity: 1024,
+        command_prefixes: vec!["!".into()],
+        handshake_timeout: Duration::from_secs(15),
+        max_payload_bytes: 450,
         announce_bot,
-    )
+        ..BotConfig::default()
+    };
+    BotCore::new("gm".into(), casemap, outbound, &cfg)
 }
 
 fn test_core(out_tx: mpsc::UnboundedSender<Command>) -> Arc<BotCore> {
@@ -177,4 +177,35 @@ async fn announce_bot_false_skips_bot_mode() {
 
     assert!(core.is_registered());
     assert!(out_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn pre_dispatch_actor_pass_hydrates_tracked_accounts_without_allocating_unwatched_strangers() {
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let core = test_core(out_tx);
+    let mut reg = RegistrationTracker {
+        cap_pending: false,
+        motd_done: true,
+    };
+
+    // Track `oper` ahead of time, leave `stranger` untracked, and leave `#unwatched` unjoined/unsubscribed:
+    let oper = core.users.get_or_create("oper");
+    assert_eq!(oper.account(), None);
+    assert_eq!(core.users.tracked_map_len(), 1);
+
+    // Unwatched channel PRIVMSG from untracked `stranger` must NOT allocate a `UserTrack`:
+    let stranger_msg =
+        parse_irc_message("@account=StrangerAcct :stranger!~s@h PRIVMSG #unwatched :noise\r\n")
+            .unwrap();
+    process_message(&core, stranger_msg, 1, &mut reg);
+    assert_eq!(core.users.tracked_map_len(), 1);
+    assert!(core.users.get_existing("stranger").is_none());
+
+    // `KICK` from tracked `oper` passively hydrates `oper`'s `@account` without stamping it onto victim:
+    let victim = core.users.get_or_create("victim");
+    let kick =
+        parse_irc_message("@account=OperAcct :oper!~o@h KICK #lobby victim :bye\r\n").unwrap();
+    process_message(&core, kick, 2, &mut reg);
+    assert_eq!(oper.account().as_deref(), Some("OperAcct"));
+    assert_eq!(victim.account(), None);
 }

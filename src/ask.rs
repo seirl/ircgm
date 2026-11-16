@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::exclusive_dm::{ExclusiveDm, ExclusiveDmGroup};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox};
-use crate::message::{ChatMessage, Event, Target, WireEvent, WireKind};
+use crate::message::{ChatMessage, Event, Target, WireEvent};
 use crate::room::Room;
 use crate::state::BotPresence;
 use crate::user::{User, UserId};
@@ -1287,8 +1287,8 @@ where
                     Err(fatal) => return Err(fatal),
                 };
 
-                match &wire.kind {
-                    WireKind::Event(Event::DeliveryFailed {
+                match wire.event() {
+                    Some(Event::DeliveryFailed {
                         target,
                         code,
                         message,
@@ -1318,15 +1318,9 @@ where
                             }
                         }
                     }
-                    WireKind::Event(
-                        Event::Parted {
-                            user, nick, reason, ..
-                        }
-                        | Event::Kicked {
-                            user, nick, reason, ..
-                        },
-                    ) if !matches!(endpoint_target, Target::Channel(_)) => {}
-                    WireKind::Event(
+                    Some(Event::Parted { .. } | Event::Kicked { .. })
+                        if !endpoint_target.is_channel() => {}
+                    Some(
                         Event::Parted {
                             user, nick, reason, ..
                         }
@@ -1360,14 +1354,7 @@ where
                         }
                     },
                     _ => {
-                        let candidate = match &wire.kind {
-                            WireKind::Event(Event::Chat(msg)) => Some(msg),
-                            WireKind::Event(Event::Notice { .. }) if cfg.accept_notices => {
-                                wire.human_notice()
-                            }
-                            _ => None,
-                        };
-                        let Some(msg) = candidate else {
+                        let Some(msg) = wire.chat_message(cfg.accept_notices) else {
                             continue;
                         };
                         if let Some(ref vs) = voters {

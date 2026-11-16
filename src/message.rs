@@ -199,19 +199,39 @@ pub enum Event {
     },
 }
 
-/// Internal wire metadata paired with [`WireEvent`] when an [`Event`] carries internal-only
-/// routing or prompt context alongside its public payload.
-#[derive(Clone, Debug, Default)]
-pub(crate) enum WireMeta {
-    #[default]
-    None,
-    /// Populated on [`Event::Notice`] when the `NOTICE` came from a human `nick!user@host`
-    /// without `@bot` tag or IRC services pseudoclient nickname, allowing `.accept_notices()` to
-    /// yield it as a [`ChatMessage`].
-    HumanNotice(Box<ChatMessage>),
-    /// Resolved `UserId` (`UserTrack::id`) on non-channel [`Event::DeliveryFailed`] bounces
-    /// (`401`, `486`, `716`, etc.).
-    BounceUser(u64),
+/// Resolved destination class of an outbound delivery bounce (`401`, `403`, `404`, `486`, `716`, …).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BounceScope {
+    Channel,
+    User(Option<u64>),
+}
+
+/// Protocol-blind routing target of a [`WireEvent`], decoupling [`crate::inbox::InboxRegistry`]
+/// from IRC [`Event`] variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WireRoute<'a> {
+    /// Channel event from an optional user (`all_events` + optional `by_user[uid]`).
+    ChannelUser {
+        channel: &'a str,
+        user_id: Option<u64>,
+    },
+    /// Channel-wide control/metadata frame (`all_events` + `room_meta`).
+    ChannelMeta {
+        channel: &'a str,
+    },
+    /// Direct message or global raw frame (`all_dms` + optional `user[uid].dm`).
+    Dm {
+        user_id: Option<u64>,
+    },
+    /// Cross-channel user lifecycle (`user[uid].dm` + `presence` + `occupied` `all_events`).
+    UserPresence {
+        user_id: u64,
+        channels: &'a [String],
+    },
+    /// Outbound user delivery bounce (`all_dms` + optional `user[uid].dm` & `presence`).
+    UserBounce {
+        user_id: Option<u64>,
+    },
 }
 
 /// Internal wire frame distributed from the pump to matching [`crate::Inbox`] slots.
@@ -219,49 +239,141 @@ pub(crate) enum WireMeta {
 pub(crate) struct WireEvent {
     pub(crate) seq: u64,
     pub(crate) raw: Arc<Message>,
-    pub(crate) kind: WireKind,
-    pub(crate) meta: WireMeta,
+    kind: WireKind,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum WireKind {
     Event(Event),
+    /// Human-eligible `NOTICE` ([`Event::Notice`] paired with its opt-in [`ChatMessage`] view).
+    HumanNotice {
+        event: Event,
+        chat: Box<ChatMessage>,
+    },
+    /// [`Event::DeliveryFailed`] paired with its resolved channel vs. user bounce scope.
+    Bounce {
+        event: Event,
+        scope: BounceScope,
+    },
     BotLeftRoom {
         channel: String,
         reason: Option<String>,
     },
-    RawOnly,
+    Raw {
+        channel: Option<String>,
+    },
 }
 
 impl WireEvent {
-    #[cfg(test)]
     pub(crate) fn new(seq: u64, raw: Arc<Message>, kind: WireKind) -> Self {
-        Self {
-            seq,
-            raw,
-            kind,
-            meta: WireMeta::None,
+        Self { seq, raw, kind }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_frame(seq: u64, raw: Arc<Message>, event: Event) -> Self {
+        Self::new(seq, raw, WireKind::Event(event))
+    }
+
+    pub(crate) fn bounce(
+        seq: u64,
+        raw: Arc<Message>,
+        target: String,
+        code: u16,
+        message: String,
+        scope: BounceScope,
+    ) -> Self {
+        let event = Event::DeliveryFailed {
+            target,
+            code,
+            message,
+            raw: Arc::clone(&raw),
+        };
+        Self::new(seq, raw, WireKind::Bounce { event, scope })
+    }
+
+    pub(crate) fn route(&self) -> WireRoute<'_> {
+        match &self.kind {
+            WireKind::Event(ev) | WireKind::HumanNotice { event: ev, .. } => match ev {
+                Event::Chat(msg) => match &msg.target {
+                    Target::Channel(ch) => WireRoute::ChannelUser {
+                        channel: ch,
+                        user_id: Some(msg.sender.track_id()),
+                    },
+                    Target::Dm => WireRoute::Dm {
+                        user_id: Some(msg.sender.track_id()),
+                    },
+                },
+                Event::Notice { sender, target, .. } => {
+                    let user_id = sender.as_ref().map(User::track_id);
+                    match target {
+                        Target::Channel(ch) => WireRoute::ChannelUser {
+                            channel: ch,
+                            user_id,
+                        },
+                        Target::Dm => WireRoute::Dm { user_id },
+                    }
+                }
+                Event::Joined { channel, user, .. }
+                | Event::Parted { channel, user, .. }
+                | Event::Kicked { channel, user, .. } => WireRoute::ChannelUser {
+                    channel,
+                    user_id: Some(user.track_id()),
+                },
+                Event::Quit { user, channels, .. }
+                | Event::NickChanged { user, channels, .. } => WireRoute::UserPresence {
+                    user_id: user.track_id(),
+                    channels,
+                },
+                Event::DeliveryFailed { .. } => WireRoute::UserBounce { user_id: None },
+            },
+            WireKind::Bounce { event, scope } => match (scope, event) {
+                (BounceScope::Channel, Event::DeliveryFailed { target, .. }) => {
+                    WireRoute::ChannelMeta { channel: target }
+                }
+                (BounceScope::User(user_id), _) => WireRoute::UserBounce { user_id: *user_id },
+                (BounceScope::Channel, _) => WireRoute::UserBounce { user_id: None },
+            },
+            WireKind::BotLeftRoom { channel, .. } => WireRoute::ChannelMeta { channel },
+            WireKind::Raw { channel: Some(ch) } => WireRoute::ChannelMeta { channel: ch },
+            WireKind::Raw { channel: None } => WireRoute::Dm { user_id: None },
         }
     }
 
-    pub(crate) fn bounce_user_id(&self) -> Option<u64> {
-        match &self.meta {
-            WireMeta::BounceUser(uid) => Some(*uid),
-            WireMeta::None | WireMeta::HumanNotice(_) => None,
-        }
-    }
-
-    pub(crate) fn human_notice(&self) -> Option<&ChatMessage> {
-        match &self.meta {
-            WireMeta::HumanNotice(msg) => Some(msg),
-            WireMeta::None | WireMeta::BounceUser(_) => None,
+    pub(crate) fn event(&self) -> Option<&Event> {
+        match &self.kind {
+            WireKind::Event(ev)
+            | WireKind::HumanNotice { event: ev, .. }
+            | WireKind::Bounce { event: ev, .. } => Some(ev),
+            WireKind::BotLeftRoom { .. } | WireKind::Raw { .. } => None,
         }
     }
 
     pub(crate) fn to_public_event(&self) -> Option<Event> {
+        self.event().cloned()
+    }
+
+    pub(crate) fn chat_message(&self, accept_notices: bool) -> Option<&ChatMessage> {
         match &self.kind {
-            WireKind::Event(ev) => Some(ev.clone()),
-            WireKind::BotLeftRoom { .. } | WireKind::RawOnly => None,
+            WireKind::Event(Event::Chat(msg)) => Some(msg),
+            WireKind::HumanNotice { chat, .. } if accept_notices => Some(chat),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bot_left_room(&self) -> Option<(&str, Option<&str>)> {
+        match &self.kind {
+            WireKind::BotLeftRoom { channel, reason } => Some((channel, reason.as_deref())),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bounce_user_id(&self) -> Option<u64> {
+        match &self.kind {
+            WireKind::Bounce {
+                scope: BounceScope::User(uid),
+                ..
+            } => *uid,
+            _ => None,
         }
     }
 }
