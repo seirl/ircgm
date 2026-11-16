@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use irc::proto::{CapSubCommand, Command, Message, Prefix};
@@ -23,9 +24,63 @@ pub(crate) enum PumpInput {
 }
 
 pub(crate) enum PumpSource {
-    Irc(Box<irc::client::ClientStream>),
+    Irc(Box<irc::client::ClientStream>, Keepalive),
     #[cfg(any(test, feature = "testing"))]
     Test(mpsc::UnboundedReceiver<PumpInput>),
+}
+
+/// Idle-aware liveness tracker for live IRC streams: sends `PING` only after `ping_time` of
+/// inbound silence, and treats any inbound frame within `ping_timeout` as proof of liveness.
+pub(crate) struct Keepalive {
+    ping_time: Duration,
+    ping_timeout: Duration,
+    awaiting_pong: bool,
+    ping_seq: u64,
+}
+
+impl Keepalive {
+    pub(crate) fn new(ping_time: Duration, ping_timeout: Duration) -> Self {
+        Self {
+            ping_time,
+            ping_timeout,
+            awaiting_pong: false,
+            ping_seq: 0,
+        }
+    }
+
+    async fn next_message(
+        &mut self,
+        stream: &mut irc::client::ClientStream,
+        core: &BotCore,
+    ) -> Result<Message, DisconnectReason> {
+        loop {
+            let wait = if self.awaiting_pong {
+                self.ping_timeout
+            } else {
+                self.ping_time
+            };
+            match tokio::time::timeout(wait, stream.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    self.awaiting_pong = false;
+                    return Ok(msg);
+                }
+                Ok(Some(Err(err))) => return Err(DisconnectReason::Transport(err.to_string())),
+                Ok(None) => return Err(DisconnectReason::Eof),
+                Err(_) if !core.is_registered() => {}
+                Err(_) if !self.awaiting_pong => {
+                    self.awaiting_pong = true;
+                    self.ping_seq += 1;
+                    core.outbound
+                        .enqueue_one(Command::PING(format!("ircgm-{}", self.ping_seq), None));
+                }
+                Err(_) => {
+                    return Err(DisconnectReason::Transport(
+                        "connection reset: no ping response".into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct RegistrationTracker {
@@ -104,19 +159,16 @@ pub(crate) async fn run_pump(
         }
 
         match &mut source {
-            PumpSource::Irc(stream) => match stream.next().await {
-                Some(Ok(msg)) => {
-                    consecutive_ready += 1;
-                    seq += 1;
-                    process_message(&core, msg, seq, &mut reg);
+            PumpSource::Irc(stream, keepalive) => {
+                match keepalive.next_message(stream, &core).await {
+                    Ok(msg) => {
+                        consecutive_ready += 1;
+                        seq += 1;
+                        process_message(&core, msg, seq, &mut reg);
+                    }
+                    Err(reason) => break reason,
                 }
-                Some(Err(err)) => {
-                    break DisconnectReason::Transport(err.to_string());
-                }
-                None => {
-                    break DisconnectReason::Eof;
-                }
-            },
+            }
             #[cfg(any(test, feature = "testing"))]
             PumpSource::Test(rx) => {
                 // Check if more items are already queued without blocking to count burst size:

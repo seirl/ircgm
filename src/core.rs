@@ -89,7 +89,6 @@ impl BotCore {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn is_registered(&self) -> bool {
         matches!(*self.lifecycle_tx.borrow(), ConnLifecycle::Active)
     }

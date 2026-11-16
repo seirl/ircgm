@@ -16,7 +16,7 @@ use crate::exclusive_dm::{acquire_dm_leases, DmLease, ExclusiveDmGroup};
 use crate::huddle::Huddle;
 use crate::inbox::{Filter, Inbox};
 use crate::outbound::{validate_param, validate_target, OutboundSink, RawTransport};
-use crate::pump::{run_pump, PumpSource, RegistrationTracker};
+use crate::pump::{run_pump, Keepalive, PumpSource, RegistrationTracker};
 use crate::room::Room;
 use crate::state::JoinOutcome;
 use crate::user::{User, UserTrack};
@@ -32,6 +32,11 @@ const DEFAULT_PING_TIME_SECS: u32 = 60;
 /// Chosen wider than `irc`'s 20s default so transient link stalls (Linux TCP RTO backoff) do not
 /// trigger premature client-side disconnects before TCP retransmission recovers.
 const DEFAULT_PING_TIMEOUT_SECS: u32 = 60;
+
+/// Effectively disables `irc::client`'s fixed wall-clock `Pinger::send_ping` (~10 years) so
+/// `run_pump` can drive idle-aware keepalive probes while keeping `ClientStream`'s automatic
+/// inbound `PING` -> `PONG` responder active.
+const DISABLED_IRC_PING_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 
 fn apply_default_ping_config(irc: &mut irc::client::data::Config) {
     irc.ping_time.get_or_insert(DEFAULT_PING_TIME_SECS);
@@ -233,7 +238,15 @@ impl Bot {
         let password = config.irc.password.clone().filter(|p| !p.is_empty());
 
         apply_default_ping_config(&mut config.irc);
-        let mut client = irc::client::Client::from_config(config.irc.clone()).await?;
+        let keepalive = Keepalive::new(
+            Duration::from_secs(u64::from(config.irc.ping_time().max(1))),
+            Duration::from_secs(u64::from(config.irc.ping_timeout().max(1))),
+        );
+
+        let mut irc_config = config.irc.clone();
+        irc_config.ping_time = Some(DISABLED_IRC_PING_SECS);
+        irc_config.ping_timeout = Some(DISABLED_IRC_PING_SECS);
+        let mut client = irc::client::Client::from_config(irc_config).await?;
         let stream = client.stream()?;
         let sender = client.sender();
 
@@ -258,7 +271,7 @@ impl Bot {
 
         let pump_core = Arc::clone(&core);
         let pump_task = tokio::spawn(async move {
-            run_pump(pump_core, PumpSource::Irc(Box::new(stream)), reg).await;
+            run_pump(pump_core, PumpSource::Irc(Box::new(stream), keepalive), reg).await;
         });
 
         let bot = Self {
