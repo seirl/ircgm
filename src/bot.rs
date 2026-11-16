@@ -21,6 +21,23 @@ use crate::room::Room;
 use crate::state::JoinOutcome;
 use crate::user::{User, UserTrack};
 
+/// Default `ping_time` (in seconds) applied when `config.irc.ping_time` is `None`.
+///
+/// Chosen shorter than `irc`'s 180s default so residential NAT / stateful IPv6 CPE conntrack
+/// entries stay warm across idle channels.
+const DEFAULT_PING_TIME_SECS: u32 = 60;
+
+/// Default `ping_timeout` (in seconds) applied when `config.irc.ping_timeout` is `None`.
+///
+/// Chosen wider than `irc`'s 20s default so transient link stalls (Linux TCP RTO backoff) do not
+/// trigger premature client-side disconnects before TCP retransmission recovers.
+const DEFAULT_PING_TIMEOUT_SECS: u32 = 60;
+
+fn apply_default_ping_config(irc: &mut irc::client::data::Config) {
+    irc.ping_time.get_or_insert(DEFAULT_PING_TIME_SECS);
+    irc.ping_timeout.get_or_insert(DEFAULT_PING_TIMEOUT_SECS);
+}
+
 /// Multi-source filter builder for [`Bot::inbox_scope`] (delivers matching channels
 /// and/or DMs into one wire-ordered [`Inbox`]).
 #[derive(Clone, Debug, Default)]
@@ -89,6 +106,8 @@ enum JoinMode {
 /// Configuration for [`Bot::connect_with`] and [`crate::testing::test_harness_with`].
 #[derive(Clone, Debug)]
 pub struct BotConfig {
+    /// Underlying `irc` client configuration (`ping_time` and `ping_timeout` default to `60s`
+    /// when left `None`).
     pub irc: irc::client::data::Config,
     /// Per-inbox bounded event queue size (default: `1024`).
     pub inbox_capacity: usize,
@@ -112,7 +131,8 @@ impl Default for BotConfig {
 }
 
 impl BotConfig {
-    pub fn new(irc: irc::client::data::Config) -> Self {
+    pub fn new(mut irc: irc::client::data::Config) -> Self {
+        apply_default_ping_config(&mut irc);
         Self {
             irc,
             inbox_capacity: 1024,
@@ -212,6 +232,7 @@ impl Bot {
         let realname = config.irc.realname.clone().unwrap_or_else(|| nick.clone());
         let password = config.irc.password.clone().filter(|p| !p.is_empty());
 
+        apply_default_ping_config(&mut config.irc);
         let mut client = irc::client::Client::from_config(config.irc.clone()).await?;
         let stream = client.stream()?;
         let sender = client.sender();

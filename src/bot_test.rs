@@ -15,6 +15,26 @@ async fn bot_config_custom_command_prefixes_control_is_command_text() {
     assert!(!core.is_command_text("   "));
 }
 
+#[test]
+fn bot_config_defaults_ping_time_and_timeout_to_60s_without_overriding_explicit_values() {
+    let default_cfg = BotConfig::default();
+    assert_eq!(default_cfg.irc.ping_time, Some(60));
+    assert_eq!(default_cfg.irc.ping_timeout, Some(60));
+
+    let custom_cfg = BotConfig::new(irc::client::data::Config {
+        ping_time: Some(30),
+        ping_timeout: Some(90),
+        ..Default::default()
+    });
+    assert_eq!(custom_cfg.irc.ping_time, Some(30));
+    assert_eq!(custom_cfg.irc.ping_timeout, Some(90));
+
+    let mut raw_irc = irc::client::data::Config::default();
+    apply_default_ping_config(&mut raw_irc);
+    assert_eq!(raw_irc.ping_time, Some(60));
+    assert_eq!(raw_irc.ping_timeout, Some(60));
+}
+
 #[tokio::test]
 async fn chat_message_reply_mirrors_kind_and_checks_bot_left_room() {
     let (bot, mut server) = test_harness("gm");
